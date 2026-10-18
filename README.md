@@ -5,6 +5,7 @@
 <h1 align="center">Sec</h1>
 
 <p align="center"><strong>Your gofer. A second you, in a second.</strong></p>
+<p align="center">你的数字孪生小二，随叫随到，迅速响应。</p>
 
 <p align="center">
   <a href="https://pypi.org/project/sec-gofer-agent/"><img src="https://img.shields.io/pypi/v/sec-gofer-agent?color=blue" alt="PyPI version"></a>
