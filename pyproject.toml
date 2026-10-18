@@ -7,6 +7,11 @@ authors = [
     { name = "Colin-zh", email = "colin_zh@outlook.com" }
 ]
 requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+]
 dependencies = [
     "aiosqlite>=0.22.1",
     "anthropic>=1.13.0",

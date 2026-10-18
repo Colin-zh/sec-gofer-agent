@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/sec-gofer-agent/"><img src="https://img.shields.io/pypi/v/sec-gofer-agent?color=blue" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/sec-gofer-agent/"><img src="https://img.shields.io/pypi/pyversions/sec-gofer-agent" alt="Python versions"></a>
+  <a href="https://pypi.org/project/sec-gofer-agent/"><img src="https://img.shields.io/badge/Python-3.12%2B-blue" alt="Python 3.12 and newer"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/graphs/contributors"><img src="https://img.shields.io/github/contributors/Colin-zh/sec-gofer-agent?color=blue"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/stargazers"><img src="https://img.shields.io/github/stars/Colin-zh/sec-gofer-agent.svg?logo=github"></a>
