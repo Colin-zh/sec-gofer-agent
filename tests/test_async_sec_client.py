@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from sec._types.content import TextContent
 from sec._types.messages import AssistantMessage, Message, Usage, UsageCost, UserMessage
-from sec._types.session import MessageEntry
+from sec._types.session import MessageEntry, SessionSummary
 from sec.apis import AsyncSecClient
 from sec.config import ConfigError
 from sec.storage import InMemorySessionStore
@@ -204,7 +204,44 @@ class AsyncSecClientTests(unittest.IsolatedAsyncioTestCase):
                     run = client.run("Hello")
                     with self.assertRaisesRegex(RuntimeError, "active Run"):
                         await client.switch_session()
+                    with self.assertRaisesRegex(RuntimeError, "active Run"):
+                        await client.rename_session(client.session.id, "Busy")
                     await run.result()
+
+    async def test_rename_session_preserves_current_session_and_history(self) -> None:
+        store = InMemorySessionStore()
+        with patch("sec.apis.client.create_provider", return_value=CloseableProvider()):
+            async with AsyncSecClient(
+                "assistant", "Follow the user.", provider="openai",
+                model="test", api_key="test", store=store,
+                session_store_backend="in_memory", env_file=None,
+            ) as client:
+                await client.run("Hello").result()
+                original = client.session
+                history = original.messages
+                await client.switch_session()
+                current = client.session
+                await client.rename_session(original.id, " Renamed ")
+                self.assertIs(client.session, current)
+                snapshot = await store.load(original.id)
+                self.assertEqual(SessionSummary.from_snapshot(snapshot).name, "Renamed")
+                self.assertEqual(snapshot.messages, history)
+                await client.rename_session(current.id, "New session")
+                self.assertEqual(
+                    SessionSummary.from_snapshot(current.snapshot).name, "New session"
+                )
+                from sec.apps.cli import create_chat_commands
+
+                outcome = await create_chat_commands(client).dispatch("/name CLI name")
+                self.assertIn("CLI name", outcome.message)
+                self.assertEqual(
+                    SessionSummary.from_snapshot(current.snapshot).name, "CLI name"
+                )
+                with self.assertRaises(KeyError):
+                    await client.rename_session("missing", "Name")
+                with self.assertRaises(ValueError):
+                    await client.rename_session(current.id, "  ")
+                self.assertIs(client.session, current)
 
 
 if __name__ == "__main__":

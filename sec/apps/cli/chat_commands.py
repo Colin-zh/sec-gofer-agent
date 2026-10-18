@@ -23,6 +23,7 @@ class ChatCommandOutcome:
     should_exit: bool = False
     display_kind: CommandDisplayKind | None = None
     run_prompt: str | None = None
+    display_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class ChatCommandRegistry:
         self._catalog = CommandCatalog()
         self._commands: dict[str, ChatCommand] = {}
         self._resource_commands: dict[str, ChatCommand] = {}
+        self._extension_commands: dict[str, ChatCommand] = {}
 
     def register(self, command: ChatCommand) -> None:
         definition = self._catalog.register(
@@ -67,6 +69,10 @@ class ChatCommandRegistry:
                 (f"/{name}", command.description)
                 for name, command in self._resource_commands.items()
             ),
+            *(
+                (f"/{name}", command.description)
+                for name, command in self._extension_commands.items()
+            ),
         )
 
     def help_text(self) -> str:
@@ -77,6 +83,12 @@ class ChatCommandRegistry:
             text += "".join(
                 f"\n  /{name} — {command.description}"
                 for name, command in self._resource_commands.items()
+            )
+        if self._extension_commands:
+            text += "\n\nExtensions:"
+            text += "".join(
+                f"\n  /{name} — {command.description}"
+                for name, command in self._extension_commands.items()
             )
         return text
 
@@ -95,6 +107,27 @@ class ChatCommandRegistry:
                 raise ValueError(f"resource command {full_name!r} is duplicated")
             registered[full_name] = ChatCommand(full_name, description, handler)
         self._resource_commands = registered
+
+    def replace_extension_commands(
+        self,
+        commands: Sequence[ChatCommand],
+    ) -> None:
+        """Replace commands contributed by currently enabled extensions."""
+        registered: dict[str, ChatCommand] = {}
+        for command in commands:
+            name = CommandCatalog.normalize_name(command.name)
+            if self._catalog.get(name) is not None:
+                raise ValueError(
+                    f"extension command {name!r} conflicts with a built-in command"
+                )
+            if name in registered:
+                raise ValueError(f"extension command {name!r} is duplicated")
+            registered[name] = ChatCommand(
+                name,
+                command.description,
+                command.handler,
+            )
+        self._extension_commands = registered
 
     async def dispatch(self, text: str) -> ChatCommandOutcome | None:
         """执行 slash command；普通对话文本返回 None。"""
@@ -123,13 +156,17 @@ class ChatCommandRegistry:
                 )
             return await _invoke(command, tuple(parts[1:]))
         command_name = self._catalog.canonical_name(entered_name)
-        if command_name is None:
+        command = (
+            self._commands[command_name]
+            if command_name is not None
+            else self._extension_commands.get(entered_name)
+        )
+        if command is None:
             return ChatCommandOutcome(
                 f"Unknown command '/{entered_name}'. Type /help for commands.",
                 display_kind="error",
             )
-
-        return await _invoke(self._commands[command_name], tuple(parts[1:]))
+        return await _invoke(command, tuple(parts[1:]))
 
     @staticmethod
     def _normalize_name(name: str) -> str:
@@ -268,7 +305,7 @@ def create_default_chat_commands(
             "followup",
             "Queue a message after the current assistant turn",
             follow_up,
-            aliases=("follow-up",),
+            aliases=("follow-up", "follow"),
         )
     )
     commands.register(

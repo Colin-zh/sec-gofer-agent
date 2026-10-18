@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+from importlib.metadata import entry_points
 import json
+import shlex
 from pathlib import Path
 import threading
+from typing import Literal
+from time import time
+from uuid import uuid4
 
 from PySide6.QtCore import QObject, Signal
 
 from sec import AsyncSecClient, PermissionModePolicy, SessionSummary
 from sec.apps.cli import create_chat_commands
+from sec.apps.cli.app import _resource_command_specs
 from sec.apps.cli.chat_commands import ChatCommandOutcome, ChatCommandRegistry
 from sec.apps.cli.resources import CliResourceManager
+from sec.apps.cli.session_io import write_session_file
 from sec.agent import Run
 from sec.tools import create_builtin_tools
+from sec.apps.desktop.settings import ExtensionSettings
+from sec.apps.desktop.tool_page import ToolEntry, ToolInventory
+from sec._types.session import CustomMessageEntry, MessageEntry
+from sec._types.json import JSONObject
+from sec._types.events import AgentSettledEvent
+from sec.apps.desktop.trace_store import TraceRecorder, TraceStore
 
 
 class SecRuntime(QObject):
@@ -29,11 +42,16 @@ class SecRuntime(QObject):
     command_completions = Signal(object)
     session_changed = Signal(str)
     session_history = Signal(object)
+    session_timing = Signal(object)
     sessions_updated = Signal(object)
+    resources_updated = Signal(object)
+    configuration_result = Signal(str, str)
     assistant_started = Signal()
     exit_requested = Signal()
     run_finished = Signal()
     run_failed = Signal(str)
+    trace_runs_updated = Signal(object, object, object)
+    trace_run_updated = Signal(str)
 
     def __init__(
         self,
@@ -43,6 +61,9 @@ class SecRuntime(QObject):
     ) -> None:
         super().__init__()
         self.workspace = workspace.expanduser().resolve()
+        self._trace_store = TraceStore(
+            self.workspace / ".sec" / "desktop-traces.sqlite3",
+        )
         self.enabled_extensions = enabled_extensions
         self._thread = threading.Thread(
             target=self._thread_main,
@@ -56,9 +77,66 @@ class SecRuntime(QObject):
         self._commands: ChatCommandRegistry | None = None
         self._policy: PermissionModePolicy | None = None
         self._resources: CliResourceManager | None = None
+        self._extension_settings: ExtensionSettings | None = None
+        self._configuring = False
         self._active_run: Run | None = None
         self._pending_approval_id: str | None = None
         self._approval_future: asyncio.Future[bool] | None = None
+        self._pending_approval_name: str | None = None
+        self._approval_writing = False
+        self._approval_cancelled = False
+        self._queued_resource_inputs: list[tuple[str, str, frozenset[str]]] = []
+        self._prompt_task: asyncio.Task[object] | None = None
+        self._send_lock: asyncio.Lock | None = None
+
+    @property
+    def trace_store(self) -> TraceStore:
+        return self._trace_store
+
+    def _publish_trace_runs(self, preferred_run_id: str | None = None) -> None:
+        try:
+            session_id = self._client.session.id if self._client is not None else None
+            runs = (
+                self._trace_store.list_runs(session_id=session_id)
+                if session_id is not None
+                else []
+            )
+            self.trace_runs_updated.emit(
+                runs,
+                preferred_run_id,
+                session_id,
+            )
+        except Exception as error:
+            self.command_result.emit(
+                f"Trace 列表读取失败（{type(error).__name__}）。",
+                "error",
+            )
+
+    def submit_message(self, text: str, mode: str = "replace") -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._submit_message(text, mode), self._require_loop(),
+        )
+
+    async def _submit_message(self, text: str, mode: str) -> None:
+        try:
+            if mode not in {"replace", "steer", "followup"}:
+                raise ValueError("未知发送模式")
+            if mode != "replace":
+                await self._handle_input(f"/{mode} {shlex.quote(text)}")
+                return
+            if self._send_lock is None:
+                self._send_lock = asyncio.Lock()
+            async with self._send_lock:
+                task = self._prompt_task
+                if task is not None and not task.done():
+                    self._cancel_run()
+                    await asyncio.shield(task)
+                next_task = asyncio.create_task(self._handle_input(text))
+                # Let the new Run acquire its Session before another send can stop it.
+                await asyncio.sleep(0)
+            await next_task
+        except Exception as error:
+            self.command_result.emit(f"发送失败：{error}", "error")
 
     def start(self) -> None:
         self._thread.start()
@@ -70,6 +148,151 @@ class SecRuntime(QObject):
     def cancel_run(self) -> None:
         loop = self._require_loop()
         loop.call_soon_threadsafe(self._cancel_run)
+
+    def configure_resource(self, kind: str, name: str, enabled: bool) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._configure_resource(kind, name, enabled), self._require_loop(),
+        )
+
+    def configure_permission(self, mode: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._configure_permission(mode), self._require_loop(),
+        )
+
+    def _require_configuration_idle(self) -> tuple[AsyncSecClient, ChatCommandRegistry]:
+        client, commands = self._client, self._commands
+        if commands is None or client is None:
+            raise RuntimeError("Sec Client is not ready")
+        if self._configuring:
+            raise RuntimeError("配置正在更新，请稍后重试。")
+        if self._active_run is not None and not self._active_run.done:
+            raise RuntimeError("请先停止或完成当前任务，再修改配置。")
+        return client, commands
+
+    async def _configure_permission(self, mode: str) -> None:
+        try:
+            _client, commands = self._require_configuration_idle()
+            if mode not in {"normal", "plan", "auto"}:
+                raise ValueError("未知权限模式")
+            outcome = await commands.dispatch(f"/mode {mode}")
+            if outcome is None:
+                raise RuntimeError("权限命令不可用")
+            self.configuration_result.emit(outcome.message or "", outcome.display_kind or "info")
+        except Exception as error:
+            self.configuration_result.emit(f"权限配置失败：{error}", "error")
+        finally:
+            self._publish_resources()
+
+    async def _configure_resource(self, kind: str, name: str, enabled: bool) -> None:
+        owns_update = False
+        try:
+            client, commands = self._require_configuration_idle()
+            self._configuring = True
+            owns_update = True
+            if kind in {"skill", "prompt"}:
+                manager = self._resources
+                if manager is None:
+                    raise RuntimeError("资源尚未就绪")
+                resource_kind: Literal["skill", "prompt"] = "skill" if kind == "skill" else "prompt"
+                previous = manager.is_enabled(resource_kind, name)
+                manager.set_enabled(resource_kind, name, enabled)
+                try:
+                    commands.replace_resource_commands(_resource_command_specs(manager))
+                except Exception:
+                    manager.set_enabled(resource_kind, name, previous)
+                    raise
+                self.command_completions.emit(commands.completion_items())
+            elif kind == "extension":
+                previous_extensions = client.enabled_extensions
+                action = "enable" if enabled else "disable"
+                outcome = await commands.dispatch(f"/reload {action} {shlex.quote(name)}")
+                if outcome is None or outcome.display_kind == "error":
+                    raise RuntimeError(outcome.message if outcome else "扩展命令不可用")
+                try:
+                    if self._extension_settings is None:
+                        raise RuntimeError("扩展配置存储尚未就绪")
+                    self._extension_settings.save(name, enabled)
+                except Exception as save_error:
+                    rollback_action = "enable" if name in previous_extensions else "disable"
+                    rollback = await commands.dispatch(
+                        f"/reload {rollback_action} {shlex.quote(name)}"
+                    )
+                    if rollback is None or rollback.display_kind == "error":
+                        raise RuntimeError(
+                            f"保存失败：{save_error}；恢复扩展失败："
+                            f"{rollback.message if rollback else '命令不可用'}"
+                        ) from save_error
+                    raise
+            else:
+                raise ValueError("MCP 尚未接入，不能激活")
+            self.configuration_result.emit(
+                f"{name} 已{'启用' if enabled else '停用'}，配置已保存。", "info",
+            )
+        except Exception as error:
+            self.configuration_result.emit(f"资源配置失败：{error}", "error")
+        finally:
+            if owns_update:
+                self._configuring = False
+            self._publish_resources()
+
+    def rename_session(self, session_id: str, name: str) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._rename_session(session_id, name), self._require_loop()
+        )
+
+    def submit_control(self, command: str, text: str) -> None:
+        if command not in {"steer", "followup"}:
+            raise ValueError("unsupported Run control command")
+        self.submit_input(f"/{command} {shlex.quote(text)}")
+
+    def refresh_sessions(self) -> None:
+        asyncio.run_coroutine_threadsafe(self._refresh_sessions(), self._require_loop())
+
+    def session_action(
+        self, action: str, session_id: str, path: str | None = None,
+    ) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._session_action(action, session_id, path), self._require_loop()
+        )
+
+    async def _session_action(
+        self, action: str, session_id: str, path: str | None = None,
+    ) -> None:
+        try:
+            client = self._client
+            if client is None:
+                raise RuntimeError("Sec Client is not ready")
+            if action == "open":
+                await client.switch_session(session_id)
+            elif action == "fork":
+                await client.fork_session(session_id)
+            elif action == "clone":
+                await client.clone_session(session_id)
+            elif action == "delete":
+                await client.delete_session(session_id)
+            elif action == "export":
+                if not path:
+                    raise ValueError("export path must not be empty")
+                snapshot = await client.get_session_snapshot(session_id)
+                written = await asyncio.to_thread(write_session_file, snapshot, Path(path))
+                self.command_result.emit(f"会话已导出：{written}", "info")
+            else:
+                raise ValueError(f"unsupported Session action: {action}")
+            if action != "export":
+                self._on_session_changed(client.session.id)
+            await self._refresh_sessions()
+        except Exception as error:
+            self.command_result.emit(f"会话操作失败：{error}", "error")
+
+    async def _rename_session(self, session_id: str, name: str) -> None:
+        try:
+            if self._client is None:
+                raise RuntimeError("Sec Client is not ready")
+            await self._client.rename_session(session_id, name)
+        except Exception as error:
+            self.command_result.emit(f"重命名会话失败：{error}", "error")
+            return
+        await self._refresh_sessions()
 
     def resolve_approval(self, tool_call_id: str, approved: bool) -> None:
         loop = self._require_loop()
@@ -121,14 +344,19 @@ class SecRuntime(QObject):
             "normal",
             workspace_root=self.workspace,
         )
-        self._resources = CliResourceManager(self.workspace)
+        self._resources = CliResourceManager(
+            self.workspace, activation_path=self.workspace / ".sec" / "desktop-resources.json",
+        )
         self._resources.reload()
+        self._extension_settings = ExtensionSettings(
+            self.workspace / ".sec" / "desktop-extensions.json",
+        )
         async with AsyncSecClient(
             "sec-desktop",
             "You are Sec, a helpful desktop assistant. Be concise and transparent.",
             tools=create_builtin_tools(self.workspace),
             policy=self._policy,
-            enabled_extensions=self.enabled_extensions,
+            enabled_extensions=self._extension_settings.resolve(self.enabled_extensions),
         ) as client:
             self._client = client
             self._commands = create_chat_commands(
@@ -140,9 +368,11 @@ class SecRuntime(QObject):
                 refresh_completions=self.command_completions.emit,
             )
             self.command_completions.emit(self._commands.completion_items())
+            self._publish_resources()
             self.session_changed.emit(client.session.id)
             self._publish_session_history()
             await self._refresh_sessions()
+            self._publish_trace_runs()
             self.ready.emit(str(self.workspace))
             if self._shutdown_requested.is_set():
                 return
@@ -153,8 +383,12 @@ class SecRuntime(QObject):
         self._commands = None
 
     async def _handle_input(self, text: str) -> None:
+        if self._configuring:
+            self.command_result.emit("配置正在更新，请完成后重新发送。", "error")
+            return
         commands = self._commands
         if commands is not None and text.lstrip().startswith("/"):
+            previous_session_id = self._client.session.id if self._client is not None else None
             try:
                 outcome = await commands.dispatch(text)
             except Exception as error:
@@ -162,6 +396,14 @@ class SecRuntime(QObject):
                 return
             if outcome is not None:
                 await self._handle_command_outcome(outcome)
+                if (
+                    self._client is not None
+                    and self._client.session.id != previous_session_id
+                    and not self._client.session.messages
+                    and outcome.display_kind != "error"
+                ):
+                    self._publish_session_history()
+                self._publish_resources()
                 await self._refresh_sessions()
                 return
 
@@ -199,8 +441,29 @@ class SecRuntime(QObject):
                         "The active Run no longer accepts follow-up input.",
                         "error",
                     )
+                elif outcome.display_prompt is not None and self._client is not None:
+                    self._queued_resource_inputs.append((
+                        outcome.run_prompt, outcome.display_prompt,
+                        frozenset(entry.id for entry in self._client.session.entries),
+                    ))
             else:
+                if outcome.display_prompt is not None:
+                    try:
+                        await self._record_display_prompt(outcome.run_prompt, outcome.display_prompt)
+                    except Exception as error:
+                        self.command_result.emit(f"保存资源输入记录失败，未启动任务：{error}", "error")
+                        return
                 await self._run_prompt(outcome.run_prompt)
+
+    async def _record_display_prompt(self, prompt: str, display: str) -> None:
+        if self._client is None:
+            raise RuntimeError("Sec Client is not ready")
+        session = self._client.session
+        await session.append_entry(CustomMessageEntry(
+            id=uuid4().hex, parent_id=session.active_leaf_id, timestamp=time(),
+            custom_type="sec.desktop.resource_input", content=display, display=False,
+            details={"prompt": prompt},
+        ))
 
     async def _run_prompt(self, prompt: str) -> None:
         client = self._client
@@ -213,14 +476,42 @@ class SecRuntime(QObject):
 
         run = client.run(prompt)
         self._active_run = run
-        self.assistant_started.emit()
+        self._prompt_task = asyncio.current_task()
+        recorder: TraceRecorder | None = None
+        trace_status = "failed"
+        try:
+            recorder = TraceRecorder(self._trace_store, run.id, client.session.id)
+        except Exception as error:
+            self.command_result.emit(
+                f"Trace 未能开始记录（{type(error).__name__}）；Run 将继续。",
+                "error",
+            )
+        self.trace_run_updated.emit(run.id)
+        self._publish_trace_runs(run.id)
         self.status_changed.emit("正在运行")
         try:
             async for event in run.events():
+                if recorder is not None:
+                    try:
+                        recorder.record(event)
+                        self.trace_run_updated.emit(run.id)
+                    except Exception as error:
+                        recorder = None
+                        self.command_result.emit(
+                            f"Trace 写入失败（{type(error).__name__}）；后续事件未记录，Run 将继续。",
+                            "error",
+                        )
+                if isinstance(event, AgentSettledEvent):
+                    trace_status = event.status
                 if event.type == "message_update":
                     message_event = event.assistant_message_event
-                    if message_event.type == "text_delta":
+                    if message_event.type == "start":
+                        self._publish_session_history()
+                        self.assistant_started.emit()
+                    elif message_event.type == "text_delta":
                         self.text_delta.emit(message_event.delta)
+                elif event.type == "message_end":
+                    self._publish_session_history()
                 elif event.type == "tool_approval_requested":
                     await self._request_approval(
                         run,
@@ -242,32 +533,233 @@ class SecRuntime(QObject):
                     )
             await run.result()
         except asyncio.CancelledError:
+            trace_status = "cancelled"
             self.status_changed.emit("已停止")
         except Exception as error:
+            trace_status = "failed"
             self.run_failed.emit(str(error))
             self.status_changed.emit("运行失败")
         finally:
+            if not run.done:
+                run.cancel()
+            try:
+                await run.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                self.command_result.emit(f"任务结束：{error}", "error")
+            if self._pending_approval_id is not None:
+                try:
+                    await self._record_approval(
+                        self._pending_approval_id, self._pending_approval_name or "",
+                        "cancelled", "审批已取消，未授权执行。",
+                    )
+                except Exception as error:
+                    self.command_result.emit(f"保存审批取消记录失败：{error}", "error")
+            try:
+                for target_id, display in self._queued_resource_displays().items():
+                    session = client.session
+                    await session.append_entry(CustomMessageEntry(
+                        id=uuid4().hex, parent_id=session.active_leaf_id, timestamp=time(),
+                        custom_type="sec.desktop.resource_input", content=display, display=False,
+                        details={"target_id": target_id},
+                    ))
+            except Exception as error:
+                self.command_result.emit(f"保存资源输入显示记录失败：{error}", "error")
+            if recorder is not None:
+                try:
+                    recorder.finish(trace_status)
+                except Exception as error:
+                    self.command_result.emit(
+                        f"Trace 完成状态写入失败（{type(error).__name__}）。",
+                        "error",
+                    )
+            self._queued_resource_inputs.clear()
             self._active_run = None
+            self._prompt_task = None
             self._pending_approval_id = None
+            self._pending_approval_name = None
             self._approval_future = None
+            self._approval_cancelled = False
             self._publish_session_history()
             await self._refresh_sessions()
+            self.trace_run_updated.emit(run.id)
+            self._publish_trace_runs()
             self.run_finished.emit()
 
     def _on_session_changed(self, session_id: str) -> None:
         self.session_changed.emit(session_id)
         self._publish_session_history()
+        self._publish_trace_runs()
 
     def _publish_session_history(self) -> None:
         client = self._client
         if client is None:
             return
-        messages = tuple(
-            (message.role, message.text)
-            for message in client.session.messages
-            if message.role in {"user", "assistant"} and message.text.strip()
-        )
-        self.session_history.emit(messages)
+        messages: list[tuple[str, str]] = []
+        timestamps: list[float] = []
+
+        def append_record(role: str, text: str, timestamp: float) -> None:
+            messages.append((role, text))
+            timestamps.append(timestamp)
+        display_prompt: tuple[str, str] | None = None
+        resource_displays = self._queued_resource_displays()
+        for entry in client.session.snapshot.active_path:
+            if (
+                isinstance(entry, CustomMessageEntry)
+                and entry.custom_type == "sec.desktop.resource_input"
+                and isinstance(entry.content, str)
+                and isinstance(entry.details, dict)
+                and isinstance(entry.details.get("target_id"), str)
+            ):
+                resource_displays[entry.details["target_id"]] = entry.content
+        completed_calls = {
+            entry.message.tool_call_id
+            for entry in client.session.snapshot.active_path
+            if isinstance(entry, MessageEntry) and entry.message.role == "tool_result"
+        }
+        for entry in client.session.snapshot.active_path:
+            if isinstance(entry, MessageEntry):
+                message = entry.message
+                if message.role in {"user", "assistant"} and message.text.strip():
+                    text = message.text
+                    if message.role == "user":
+                        if entry.id in resource_displays:
+                            text = resource_displays[entry.id]
+                        elif display_prompt is not None and text == display_prompt[0]:
+                            text = display_prompt[1]
+                        else:
+                            text = self._legacy_resource_display(text)
+                        display_prompt = None
+                    append_record(message.role, text, entry.timestamp)
+                if message.role == "assistant":
+                    for tool in message.tool_uses:
+                        append_record(
+                            "activity" if tool.id in completed_calls else "process",
+                            f"调用工具 · {tool.name}\n"
+                            + json.dumps(tool.arguments, ensure_ascii=False, indent=2),
+                            entry.timestamp,
+                        )
+                elif message.role == "tool_result":
+                    append_record(
+                        "activity",
+                        f"工具{'失败' if message.is_error else '完成'} · {message.tool_name}\n{message.text}",
+                        entry.timestamp,
+                    )
+            elif (
+                isinstance(entry, CustomMessageEntry)
+                and entry.custom_type == "sec.desktop.resource_input"
+                and isinstance(entry.content, str)
+                and isinstance(entry.details, dict)
+                and isinstance(entry.details.get("prompt"), str)
+            ):
+                display_prompt = (entry.details["prompt"], entry.content)
+            elif (
+                isinstance(entry, CustomMessageEntry)
+                and entry.custom_type == "sec.desktop.approval"
+                and isinstance(entry.content, str)
+            ):
+                details = entry.details if isinstance(entry.details, dict) else {}
+                if details.get("outcome") == "requested":
+                    if details.get("tool_call_id") == self._pending_approval_id:
+                        continue
+                    append_record("activity", entry.content + "\n历史请求，仅供回看，不可重新授权。", entry.timestamp)
+                else:
+                    append_record("activity", entry.content, entry.timestamp)
+        self.session_timing.emit(tuple(timestamps))
+        self.session_history.emit(tuple(messages))
+
+    def _queued_resource_displays(self) -> dict[str, str]:
+        client = self._client
+        result: dict[str, str] = {}
+        if client is None:
+            return result
+        for prompt, display, previous in self._queued_resource_inputs:
+            for entry in client.session.snapshot.active_path:
+                if (
+                    isinstance(entry, MessageEntry) and entry.message.role == "user"
+                    and entry.id not in previous and entry.id not in result
+                    and entry.message.text == prompt
+                ):
+                    result[entry.id] = display
+                    break
+        return result
+
+    def _legacy_resource_display(self, text: str) -> str:
+        manager = self._resources
+        if manager is None:
+            return text
+        snapshot = manager.available_snapshot
+        for resource in (*snapshot.skills, *snapshot.prompts):
+            prefix = resource.content + "\n\nUser request:\n"
+            command = f"/{resource.kind}:{resource.name}"
+            if text.startswith(prefix):
+                return command + " " + text[len(prefix):]
+            if text == resource.content or (
+                resource.kind == "skill"
+                and text == resource.content + "\n\nApply this Skill to the current project."
+            ):
+                return command
+        return text
+
+    async def _record_approval(
+        self, call_id: str, name: str, outcome: str, content: str,
+    ) -> None:
+        client = self._client
+        if client is None:
+            raise RuntimeError("Sec Client is not ready")
+        details: JSONObject = {"tool_call_id": call_id, "tool_name": name, "outcome": outcome}
+        await client.session.append_entry(CustomMessageEntry(
+            id=uuid4().hex, parent_id=client.session.active_leaf_id, timestamp=time(),
+            custom_type="sec.desktop.approval", content=content, display=True, details=details,
+        ))
+
+    def _publish_resources(self) -> None:
+        if self._resources is None:
+            return
+        snapshot = self._resources.available_snapshot
+        entries = [
+            ToolEntry(
+                item.kind, item.name, item.description,
+                f"来源：{item.path}\n\n{item.content}",
+                self._resources.is_enabled(item.kind, item.name),
+            )
+            for item in (*snapshot.prompts, *snapshot.skills)
+        ]
+        if self._client is not None:
+            enabled = self._client.enabled_extensions
+            available = self._client.discover_extensions()
+            installed = {
+                point.name: point for point in entry_points(group="sec.extensions")
+            }
+            for name in sorted(set(available) | set(enabled)):
+                point = installed.get(name)
+                distribution = point.dist if point is not None else None
+                summary = (
+                    distribution.metadata.get("Summary", "SEC 扩展")
+                    if distribution is not None else "SEC 扩展"
+                )
+                source = (
+                    f"安装入口：{point.value}\n" if point is not None
+                    else "安装入口未找到\n"
+                )
+                if distribution is not None:
+                    source += (
+                        f"发行包：{distribution.metadata['Name']}\n"
+                        f"版本：{distribution.version}\n"
+                    )
+                entries.append(ToolEntry(
+                    "extension", name, summary,
+                    source + "\n"
+                    "启用时加载扩展代码及其工具、命令等贡献；停用会卸载贡献。\n"
+                    "预览不会导入未启用的扩展。工具执行仍受全局权限策略控制。",
+                    name in enabled,
+                ))
+        self.resources_updated.emit(ToolInventory(
+            tuple(entries),
+            self._policy.mode_name if self._policy is not None else "normal",
+            self._configuring or (self._active_run is not None and not self._active_run.done),
+        ))
 
     async def _refresh_sessions(self) -> None:
         client = self._client
@@ -301,25 +793,57 @@ class SecRuntime(QObject):
     ) -> None:
         future = asyncio.get_running_loop().create_future()
         self._pending_approval_id = tool_call_id
+        self._pending_approval_name = tool_name
         self._approval_future = future
+        self._approval_cancelled = False
+        arguments = json.dumps(args, ensure_ascii=False, indent=2)
+        self._approval_writing = True
+        try:
+            await self._record_approval(
+                tool_call_id, tool_name, "requested",
+                f"审批请求 · {tool_name}\n{arguments}\n{reason or '需要用户确认'}",
+            )
+        finally:
+            self._approval_writing = False
+        if self._approval_cancelled:
+            run.cancel()
+            return
+        self._publish_session_history()
         self.approval_requested.emit(
             tool_call_id,
             tool_name,
-            json.dumps(args, ensure_ascii=False, indent=2),
+            arguments,
         )
-        if reason:
-            self.status_changed.emit(f"等待工具审批：{reason}")
+        self.status_changed.emit(f"等待工具审批：{reason or tool_name}")
         approved = await future
-        self._pending_approval_id = None
-        self._approval_future = None
+        if run.done or self._approval_cancelled:
+            return
+        self._approval_writing = True
+        try:
+            await self._record_approval(
+                tool_call_id, tool_name, "approved" if approved else "denied",
+                f"审批{'允许' if approved else '拒绝'} · {tool_name}",
+            )
+        finally:
+            self._approval_writing = False
+        if self._approval_cancelled:
+            run.cancel()
+            return
         if approved:
-            run.approve_tool(tool_call_id)
+            accepted = run.approve_tool(tool_call_id)
         else:
-            run.deny_tool(tool_call_id, "The desktop user denied this tool call.")
+            accepted = run.deny_tool(tool_call_id, "The desktop user denied this tool call.")
+        if not accepted:
+            raise RuntimeError("审批请求已失效，未能提交处理结果。")
+        self._pending_approval_id = None
+        self._pending_approval_name = None
+        self._approval_future = None
+        self._publish_session_history()
 
     def _cancel_run(self) -> None:
+        self._approval_cancelled = True
         run = self._active_run
-        if run is not None:
+        if run is not None and not self._approval_writing:
             run.cancel()
         future = self._approval_future
         if future is not None and not future.done():

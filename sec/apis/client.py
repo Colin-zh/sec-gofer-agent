@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -32,7 +33,7 @@ from sec._types.execution import ToolExecutor
 from sec._types.extensions import AfterRunHook, BeforeRunHook, RunEventHook
 from sec._types.policy import PolicyEngine
 from sec._types.providers import ModelProvider, StreamingModelProvider
-from sec._types.session import SessionEntry, SessionSnapshot, SessionSummary
+from sec._types.session import SessionEntry, SessionInfoEntry, SessionSnapshot, SessionSummary
 from sec._types.storage import SessionStoreProtocol
 from sec.storage import Database, SessionStore
 from sec.exceptions import SecUIHandlerError
@@ -258,6 +259,7 @@ class _SecClientCore:
         self._owns_store = False
         self._harness: Harness | None = None
         self._agent: Agent | None = None
+        self._config: Config | None = None
         self._active_run: Run | None = None
         self._session_switching = False
         self._enabled_extensions = tuple(enabled_extensions)
@@ -338,13 +340,6 @@ class _SecClientCore:
                     "context compression requires both context_window_tokens and "
                     "a TokenEstimator"
                 )
-            policy = self._policy
-            if self._policy_name is not None:
-                policy = self._extension_catalog.policies.get(self._policy_name)
-                if policy is None:
-                    raise ConfigError(
-                        f"enabled extensions do not provide policy {self._policy_name!r}"
-                    )
             if self._session is None:
                 if self._store is None:
                     if self._database is None:
@@ -369,22 +364,11 @@ class _SecClientCore:
                     if self._session_id is not None
                     else Session(store=self._store)
                 )
-            self._agent = create_agent(
+            self._agent, self._harness = self._build_run_resources(
                 config,
-                self._name,
-                self._instructions,
-                tools=(*self._tools, *self._extension_catalog.tools),
+                self._extension_catalog,
             )
-            self._harness = create_harness(
-                config,
-                policy=policy,
-                executor=self._executor,
-                token_estimator=self._token_estimator,
-                providers=self._extension_catalog.providers,
-                before_run_hooks=self._extension_catalog.before_run_hooks,
-                after_run_hooks=self._extension_catalog.after_run_hooks,
-                run_event_hooks=self._extension_catalog.run_event_hooks,
-            )
+            self._config = config
         except BaseException as initialization_error:
             try:
                 await self._close()
@@ -433,13 +417,71 @@ class _SecClientCore:
         finally:
             self._session_switching = False
 
-    async def fork_session(self) -> Session:
-        """在新会话中复制当前活动分支。"""
-        return await self._copy_session(include_branches=False)
+    async def rename_session(self, session_id: str, name: str) -> None:
+        """重命名已存储会话，不改变当前会话；活动 Run 期间禁止修改。"""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session ID must not be empty")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("session name must not be empty")
+        self._require_idle_session_switch()
+        store = self._require_session_store()
+        self._session_switching = True
+        try:
+            session = (
+                self.session if session_id == self.session.id
+                else await Session.restore(store, session_id)
+            )
+            if session is not self.session and not session.entries:
+                raise KeyError(f"Session {session_id!r} was not found")
+            await session.append_entry(
+                SessionInfoEntry(
+                    id=uuid4().hex,
+                    parent_id=session.active_leaf_id,
+                    timestamp=time.time(),
+                    name=name.strip(),
+                )
+            )
+        finally:
+            self._session_switching = False
 
-    async def clone_session(self) -> Session:
+    async def get_session_snapshot(self, session_id: str) -> SessionSnapshot:
+        """读取指定会话的快照，不改变当前会话。"""
+        self._require_idle_session_switch()
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session ID must not be empty")
+        snapshot = (
+            self.session.snapshot if session_id == self.session.id
+            else await self._require_session_store().load(session_id)
+        )
+        if not snapshot.entries:
+            raise KeyError(f"Session {session_id!r} was not found")
+        return snapshot
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除指定会话；删除当前会话后创建新的空会话。"""
+        self._require_idle_session_switch()
+        snapshot = await self.get_session_snapshot(session_id)
+        self._require_idle_session_switch()
+        store = self._require_session_store()
+        delete_session = getattr(store, "delete", None)
+        if not callable(delete_session):
+            raise RuntimeError("the configured SessionStore does not support deletion")
+        self._session_switching = True
+        try:
+            await delete_session(session_id, snapshot.version)
+            if self.session.id == session_id:
+                self._session = Session(store=store)
+                self._session_id = self._session.id
+        finally:
+            self._session_switching = False
+
+    async def fork_session(self, session_id: str | None = None) -> Session:
+        """在新会话中复制当前活动分支。"""
+        return await self._copy_session(include_branches=False, session_id=session_id)
+
+    async def clone_session(self, session_id: str | None = None) -> Session:
         """在新会话中复制完整历史树及其活动分支。"""
-        return await self._copy_session(include_branches=True)
+        return await self._copy_session(include_branches=True, session_id=session_id)
 
     async def import_session(self, snapshot: SessionSnapshot) -> Session:
         """将校验后的历史树作为新会话原子导入并切换过去。"""
@@ -463,6 +505,119 @@ class _SecClientCore:
         if self._extension_catalog is None:
             raise RuntimeError("SecClient must be entered before using extensions")
         return self._extension_catalog
+
+    @property
+    def enabled_extensions(self) -> tuple[str, ...]:
+        """Return the extension names currently active for this Client."""
+        if self._harness is None or self._closed:
+            raise RuntimeError("SecClient must be entered before using extensions")
+        return self._extension_manager.enabled
+
+    def discover_extensions(self) -> tuple[str, ...]:
+        """Discover installed extension names without importing their code."""
+        if self._harness is None or self._closed:
+            raise RuntimeError("SecClient must be entered before using extensions")
+        return self._extension_manager.discover()
+
+    async def _set_enabled_extensions(self, enabled: Iterable[str]) -> None:
+        """Replace enabled contributions while idle, preserving the current Session."""
+        self._require_idle_session_switch()
+        if self._config is None or self._extension_catalog is None:
+            raise RuntimeError("SecClient is not fully initialized")
+        desired = tuple(enabled)
+        previous = self._extension_manager.enabled
+        if set(desired) == set(previous) and len(desired) == len(previous):
+            return
+
+        storage_backend = self._config.storage.session_store_backend
+        storage_owner = (
+            self._extension_manager.owner_of("storage backend", storage_backend)
+            if self._owns_store
+            else None
+        )
+        if storage_owner is not None and storage_owner not in desired:
+            raise ConfigError(
+                f"cannot disable extension {storage_owner!r} while its SessionStore "
+                "is in use; restart the Client with a different storage backend"
+            )
+
+        old_harness = self._harness
+        old_agent = self._agent
+        self._session_switching = True
+        self._harness = None
+        try:
+            await old_harness.aclose()
+            try:
+                await self._extension_manager.set_enabled(desired)
+                new_agent, new_harness = self._build_run_resources(
+                    self._config,
+                    self._extension_manager.catalog,
+                )
+            except BaseException as change_error:
+                rollback_errors: list[BaseException] = []
+                try:
+                    await self._extension_manager.set_enabled(previous)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if not rollback_errors:
+                    try:
+                        self._agent, self._harness = self._build_run_resources(
+                            self._config,
+                            self._extension_manager.catalog,
+                        )
+                        self._extension_catalog = self._extension_manager.catalog
+                        self._enabled_extensions = previous
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    self._agent = None
+                    self._harness = None
+                    raise BaseExceptionGroup(
+                        "extension update and runtime rollback failed",
+                        [change_error, *rollback_errors],
+                    ) from change_error
+                raise
+            self._agent = new_agent
+            self._harness = new_harness
+            self._extension_catalog = self._extension_manager.catalog
+            self._enabled_extensions = self._extension_manager.enabled
+        except BaseException:
+            if self._harness is None and self._agent is None:
+                self._agent = old_agent
+            raise
+        finally:
+            self._session_switching = False
+
+    def _build_run_resources(
+        self,
+        config: Config,
+        catalog: ExtensionCatalog,
+    ) -> tuple[Agent, Harness]:
+        """Build an Agent and Harness from one stable extension catalog snapshot."""
+        policy = self._policy
+        if self._policy_name is not None:
+            policy = catalog.policies.get(self._policy_name)
+            if policy is None:
+                raise ConfigError(
+                    f"enabled extensions do not provide policy {self._policy_name!r}"
+                )
+        agent = create_agent(
+            config,
+            self._name,
+            self._instructions,
+            tools=(*self._tools, *catalog.tools),
+        )
+        harness = create_harness(
+            config,
+            policy=policy,
+            executor=self._executor,
+            token_estimator=self._token_estimator,
+            providers=catalog.providers,
+            before_run_hooks=catalog.before_run_hooks,
+            after_run_hooks=catalog.after_run_hooks,
+            run_event_hooks=catalog.run_event_hooks,
+        )
+        return agent, harness
 
     async def _handle_ui_request(
         self,
@@ -507,9 +662,14 @@ class _SecClientCore:
             raise RuntimeError("Session switching requires a SessionStore")
         return self._store
 
-    async def _copy_session(self, *, include_branches: bool) -> Session:
+    async def _copy_session(
+        self, *, include_branches: bool, session_id: str | None = None,
+    ) -> Session:
         self._require_idle_session_switch()
-        source_snapshot = self.session.snapshot
+        source_snapshot = (
+            self.session.snapshot if session_id is None
+            else await self.get_session_snapshot(session_id)
+        )
         source_entries: tuple[SessionEntry, ...] = (
             source_snapshot.entries
             if include_branches
@@ -601,6 +761,10 @@ class AsyncSecClient(_SecClientCore):
         traceback: object | None,
     ) -> None:
         await self._close()
+
+    async def set_enabled_extensions(self, enabled: Iterable[str]) -> None:
+        """Replace active extensions for future Runs; refuse changes during a Run."""
+        await self._set_enabled_extensions(enabled)
 
     def run(self, prompt: str) -> Run:
         """启动一轮对话并返回异步 Run 句柄。"""

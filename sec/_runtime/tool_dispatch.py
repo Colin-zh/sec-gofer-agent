@@ -23,6 +23,7 @@ from sec._runtime.control import RunControl
 from sec._runtime.event_stream import RunEventStream
 from sec._runtime.state import RunState
 from sec.exceptions import (
+    RecoverableToolError,
     RetryableToolError,
     RunLimitExceeded,
     ToolExecutorProtocolError,
@@ -31,6 +32,8 @@ from sec._types.execution import ToolExecutor
 from sec._types.policy import PolicyEngine
 from sec.tools.tool import Tool
 from sec._types.policy import PolicyContext, PolicyDecision
+
+_MAX_MODEL_TOOL_FEEDBACK_CHARS = 2000
 
 
 async def execute_tool_batch(
@@ -59,13 +62,18 @@ async def execute_tool_batch(
                 _error_result(
                     tool_use,
                     "Not executed because an earlier tool call failed.",
+                    error_kind="not_executed",
                 )
             )
             continue
         if control.stop_requested:
             stopped = True
             results.append(
-                _error_result(tool_use, "Not executed because the run was stopped.")
+                _error_result(
+                    tool_use,
+                    "Not executed because the run was stopped.",
+                    error_kind="cancelled",
+                )
             )
             continue
         call_decision = budget.tool_call(
@@ -80,6 +88,7 @@ async def execute_tool_batch(
                 _error_result(
                     tool_use,
                     "Not executed because the tool-call limit was reached.",
+                    error_kind="tool_call_limit",
                 )
             )
             continue
@@ -102,6 +111,7 @@ async def execute_tool_batch(
             result = _error_result(
                 tool_use,
                 f"Tool execution failed ({type(exc).__name__}).",
+                error_kind="executor_failure",
             )
             events.publish(
                 ToolExecutionEndEvent(
@@ -134,14 +144,27 @@ async def _execute_one_tool(
     """校验并授权工具调用，必要时等待审批，再委托 Executor 执行。"""
     registered = tools_by_name.get(tool_use.name)
     if registered is None:
-        return _error_result(tool_use, "Unknown tool."), False
+        return _error_result(
+            tool_use,
+            "Unknown tool.",
+            error_kind="unknown_tool",
+        ), False
     if not isinstance(tool_use.arguments, dict):
         return _error_result(
             tool_use,
             "Tool arguments must be a JSON object.",
+            error_kind="invalid_arguments",
         ), False
 
-    registered.validate_arguments(tool_use.arguments)
+    try:
+        registered.validate_arguments(tool_use.arguments)
+    except TypeError as exc:
+        return _error_result(
+            tool_use,
+            f"Invalid tool arguments: {exc}. This call was not executed; "
+            "correct the arguments and issue a new tool call.",
+            error_kind="invalid_arguments",
+        ), False
     mode_name = getattr(policy, "mode_name", None)
     if mode_name is not None and not isinstance(mode_name, str):
         raise TypeError("policy mode_name must be a string or None")
@@ -161,7 +184,11 @@ async def _execute_one_tool(
     if not isinstance(decision, PolicyDecision):
         raise TypeError("policy decide() must return PolicyDecision")
     if decision.outcome == "deny":
-        return _error_result(tool_use, decision.reason or "Tool call denied."), False
+        return _error_result(
+            tool_use,
+            decision.reason or "Tool call denied.",
+            error_kind="policy_denied",
+        ), False
     if decision.outcome == "ask":
         request = ToolApprovalRequest(
             tool_call_id=tool_use.id,
@@ -178,6 +205,7 @@ async def _execute_one_tool(
             return _error_result(
                 tool_use,
                 "Tool call was not approved because the Run was stopped.",
+                error_kind="cancelled",
             ), True
         events.publish(
             ToolApprovalRequestedEvent(
@@ -201,6 +229,7 @@ async def _execute_one_tool(
             return _error_result(
                 tool_use,
                 "Tool call was not approved because the Run was stopped.",
+                error_kind="cancelled",
             ), True
         if approval.outcome == "denied":
             state.resume_after_approval()
@@ -213,7 +242,11 @@ async def _execute_one_tool(
                     reason=denial_reason,
                 )
             )
-            return _error_result(tool_use, denial_reason), False
+            return _error_result(
+                tool_use,
+                denial_reason,
+                error_kind="approval_denied",
+            ), False
         state.resume_after_approval()
         events.publish(
             ToolApprovalResolvedEvent(
@@ -250,6 +283,24 @@ async def _execute_one_tool(
                     raise ToolExecutorProtocolError(
                         "tool executor result name must match the requested tool"
                     )
+            except RecoverableToolError as exc:
+                if retry_started:
+                    events.publish(
+                        ToolRetryEndEvent(
+                            tool_call_id=tool_use.id,
+                            tool_name=tool_use.name,
+                            success=False,
+                            attempt=attempt,
+                            final_error=str(exc),
+                        )
+                    )
+                    retry_started = False
+                result = _error_result(
+                    tool_use,
+                    _recoverable_feedback(str(exc)),
+                    error_kind="recoverable_failure",
+                )
+                break
             except RetryableToolError as exc:
                 decision = budget.tool_retry(
                     tool=registered,
@@ -258,6 +309,26 @@ async def _execute_one_tool(
                 )
                 will_retry = decision.action == "retry"
                 if not will_retry:
+                    if registered.retry_safe:
+                        if retry_started:
+                            events.publish(
+                                ToolRetryEndEvent(
+                                    tool_call_id=tool_use.id,
+                                    tool_name=tool_use.name,
+                                    success=False,
+                                    attempt=attempt,
+                                    final_error=str(exc),
+                                )
+                            )
+                            retry_started = False
+                        result = _error_result(
+                            tool_use,
+                            _retry_exhausted_feedback(
+                                budget.tool_retries.max_attempts
+                            ),
+                            error_kind="retry_exhausted",
+                        )
+                        break
                     raise
                 delay_seconds = decision.retry_delay_seconds
                 retry_started = True
@@ -310,11 +381,40 @@ async def _execute_one_tool(
     return result, False
 
 
-def _error_result(tool_use: ToolUseContent, content: str) -> ToolResultMessage:
+def _recoverable_feedback(message: str) -> str:
+    """Warn that a reported failure does not prove no side effect occurred."""
+    prefix = "Tool reported a recoverable failure: "
+    suffix = (
+        "\nThe call was not automatically repeated. Its side effects may be uncertain; "
+        "verify the outcome before deciding whether to issue a new call."
+    )
+    available = _MAX_MODEL_TOOL_FEEDBACK_CHARS - len(prefix) - len(suffix)
+    if len(message) > available:
+        marker = "\n[Tool feedback truncated.]"
+        message = message[: available - len(marker)] + marker
+    return f"{prefix}{message}{suffix}"
+
+
+def _retry_exhausted_feedback(max_attempts: int) -> str:
+    """Summarize safe retry exhaustion without permitting further automatic attempts."""
+    return (
+        f"Tool retry limit reached after {max_attempts} safe attempt(s). "
+        "The runtime withheld the executor error details. No more automatic attempts "
+        "will run; verify the outcome before choosing another approach."
+    )
+
+
+def _error_result(
+    tool_use: ToolUseContent,
+    content: str,
+    *,
+    error_kind: str | None = None,
+) -> ToolResultMessage:
     return ToolResultMessage(
         tool_call_id=tool_use.id,
         tool_name=tool_use.name,
         content=[TextContent(text=content)],
         is_error=True,
         timestamp=time(),
+        metadata={} if error_kind is None else {"error_kind": error_kind},
     )

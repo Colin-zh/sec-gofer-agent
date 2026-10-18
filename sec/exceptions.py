@@ -50,6 +50,15 @@ class RetryableToolError(SecError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class RecoverableToolError(SecError):
+    """携带可安全反馈给模型的消息；运行时不得自动重放该调用。"""
+
+    def __init__(self, message: str) -> None:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("recoverable tool feedback must not be empty")
+        super().__init__(message)
+
+
 class ToolExecutorProtocolError(SecError):
     """Executor 未返回与请求匹配的规范化工具结果时抛出。"""
 

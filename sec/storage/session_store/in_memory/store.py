@@ -83,6 +83,18 @@ class InMemorySessionStore(SessionStoreProtocol):
             self._sessions[session_id] = updated
             return updated.version
 
+    async def delete(self, session_id: str, expected_version: int) -> None:
+        """仅删除版本匹配的会话，拒绝覆盖并发修改。"""
+        _validate_session_id(session_id)
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("expected version must be a non-negative integer")
+        async with self._lock:
+            current = self._sessions.get(session_id)
+            version = 0 if current is None else current.version
+            if version != expected_version:
+                raise SessionVersionConflictError(session_id, expected_version, version)
+            self._sessions.pop(session_id, None)
+
 
 def _validate_session_id(session_id: str) -> None:
     if not isinstance(session_id, str) or not session_id.strip():

@@ -38,7 +38,7 @@ Press Ctrl+O for full startup help and loaded resources.
 
 - 普通输入作为 follow-up，在当前 turn 后继续执行。
 - `/steer <message>` 或 Alt+S 将指令加入当前 turn。
-- `/followup <message>` 或 Alt+F 排入下一 turn。
+- `/followup <message>`（也支持 `/follow`、`/follow-up`）或 Alt+F 排入下一 turn。
 - `/stop` 或 Ctrl+C 请求取消当前 Run。
 - `/exit` 或 Ctrl+D 退出；若 Run 仍活动，会先请求取消再退出。
 
@@ -48,12 +48,21 @@ Press Ctrl+O for full startup help and loaded resources.
 
 - Run 控制：`/steer <message>`、`/followup <message>`、`/stop`、`/exit`。
 - Session：`/new`、`/resume`、`/name`、`/session`、`/tree`、`/fork`、`/clone`。
-- 文件与资源：`/import <path>`、`/export [path]`、`/copy`、`/reload`、`/skill:<name> [request]`、`/prompt:<name> [request]`。
+- 文件与资源：`/import <path>`、`/export [path]`、`/copy`、`/reload`、`/reload enable <extension-name...>`、`/reload disable <extension-name...>`、`/skill:<name> [request]`、`/prompt:<name> [request]`。
 - `/mode [plan|normal|auto]` 查看或切换权限模式；`/trust [on|off]` 是本次聊天中的快捷切换，不写入持久配置。
 - `/help` 查看命令；`Ctrl+O` 或 `/help full` 展开完整帮助；Tab 补全命令。
 - `Ctrl+C` 取消当前 Run；`Ctrl+D` 退出；Alt+Enter 输入多行内容。
 
 退出时 CLI 会显示当前 Session ID。更多 Session 操作见[管理 Sessions](04-manage-sessions.md)。
+
+`/reload` 会重新发现 Skills/Prompts，并列出已安装 Extension 及当前启用状态；发现时不会导入
+扩展代码。`/reload enable <name...>` 和 `/reload disable <name...>` 可在当前 Client 中显式
+启停 Extensions，变更仅影响之后启动的 Run，不修改当前对话或磁盘配置。启停需要先结束活动
+Run；当前 SessionStore 所依赖的 Extension 不能在本 Client 生命周期内停用。扩展必须安装在
+运行 Sec 的同一 Python 环境中。
+
+Extension 代码不会在当前进程中热替换；安装或更新扩展代码后需重启 Sec。启用/停用时会执行
+Extension 生命周期钩子，注册冲突、初始化失败或资源关闭失败会明确报告。
 
 ## 工具审批界面
 
@@ -81,4 +90,4 @@ printf '总结这个项目的入口文件\n' | uv run python -m sec
 
 非交互模式没有工具审批界面，因此需要 `ask` 的工具调用会默认拒绝。不要假设管道模式会自动批准工具。
 
-`/reload` 只重新发现 Skills 和 Prompts；当前 Client 的 Extensions 不支持安全热重载。
+管道模式可使用 `/reload` 及其 Extension 启停子命令；启停仍只对本次 Client 生效。

@@ -33,6 +33,7 @@ from sec import (
     LocalToolExecutor,
     PolicyContext,
     PolicyDecision,
+    RecoverableToolError,
     RetryableToolError,
     ToolRetrySettings,
     ToolExecutorProtocolError,
@@ -548,6 +549,150 @@ class PolicyExecutorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry_start.tool_call_id, "lookup-1")
         self.assertEqual(retry_start.error_message, "temporary backend failure")
         self.assertTrue(retry_end.success)
+        self.assertEqual(retry_end.attempt, 2)
+
+    async def test_invalid_arguments_are_returned_to_model_for_correction(self) -> None:
+        registered = tool(lambda value: value, name="lookup")
+        provider = SequenceProvider(
+            _assistant_message(
+                [
+                    ToolUseContent(
+                        id="lookup-invalid",
+                        name="lookup",
+                        arguments={"unexpected": "value"},
+                    )
+                ]
+            ),
+            _assistant_message(
+                [
+                    ToolUseContent(
+                        id="lookup-corrected",
+                        name="lookup",
+                        arguments={"value": "fixed"},
+                    )
+                ]
+            ),
+            _assistant_message([TextContent(text="Done.")]),
+        )
+        executor = RecordingExecutor()
+        run = Harness(
+            provider,
+            policy=AllowListPolicy({"lookup"}),
+            executor=executor,
+        ).run(
+            Agent(name="reader", instructions="", tools=(registered,)),
+            "Look up the value",
+        )
+
+        await run.result()
+
+        feedback = provider.requests[1][0][-1]
+        self.assertTrue(feedback.is_error)
+        self.assertEqual(feedback.metadata["error_kind"], "invalid_arguments")
+        self.assertIn("This call was not executed", feedback.text)
+        self.assertEqual(
+            [tool_use.id for _, tool_use in executor.calls],
+            ["lookup-corrected"],
+        )
+
+    async def test_recoverable_tool_error_is_returned_without_replaying(self) -> None:
+        registered = tool(lambda: "unused", name="lookup")
+
+        class RecoverableExecutor:
+            """抛出明确可恢复错误并记录执行次数。"""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def execute(
+                self,
+                registered_tool: Tool,
+                tool_use: ToolUseContent,
+            ) -> ToolResultMessage:
+                self.calls += 1
+                raise RecoverableToolError("record was not found " + ("x" * 3000))
+
+        executor = RecoverableExecutor()
+        provider = SequenceProvider(
+            _assistant_message(
+                [ToolUseContent(id="lookup-recoverable", name="lookup", arguments={})]
+            ),
+            _assistant_message([TextContent(text="No record was found.")]),
+        )
+        run = Harness(
+            provider,
+            policy=AllowListPolicy({"lookup"}),
+            executor=executor,
+        ).run(
+            Agent(name="reader", instructions="", tools=(registered,)),
+            "Look up the value",
+        )
+
+        await run.result()
+
+        feedback = provider.requests[1][0][-1]
+        self.assertEqual(executor.calls, 1)
+        self.assertTrue(feedback.is_error)
+        self.assertEqual(
+            feedback.metadata["error_kind"],
+            "recoverable_failure",
+        )
+        self.assertIn("record was not found", feedback.text)
+        self.assertIn("side effects may be uncertain", feedback.text)
+        self.assertEqual(len(feedback.text), 2000)
+        self.assertIn("[Tool feedback truncated.]", feedback.text)
+
+    async def test_exhausted_safe_retries_are_returned_to_model(self) -> None:
+        registered = tool(lambda: "unused", name="lookup", retry_safe=True)
+
+        class AlwaysRetryableExecutor:
+            """每次执行均报告暂时性失败。"""
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def execute(
+                self,
+                registered_tool: Tool,
+                tool_use: ToolUseContent,
+            ) -> ToolResultMessage:
+                self.calls += 1
+                raise RetryableToolError("backend still unavailable")
+
+        executor = AlwaysRetryableExecutor()
+        provider = SequenceProvider(
+            _assistant_message(
+                [ToolUseContent(id="lookup-retries", name="lookup", arguments={})]
+            ),
+            _assistant_message([TextContent(text="I will try another approach.")]),
+        )
+        run = Harness(
+            provider,
+            policy=AllowListPolicy({"lookup"}),
+            executor=executor,
+            tool_retry_settings=ToolRetrySettings(
+                max_attempts=2,
+                base_delay_seconds=0,
+                max_delay_seconds=0,
+            ),
+        ).run(
+            Agent(name="reader", instructions="", tools=(registered,)),
+            "Look up the value",
+        )
+
+        await run.result()
+        events = [event async for event in run.events()]
+
+        feedback = provider.requests[1][0][-1]
+        self.assertEqual(executor.calls, 2)
+        self.assertTrue(feedback.is_error)
+        self.assertEqual(feedback.metadata["error_kind"], "retry_exhausted")
+        self.assertIn("retry limit reached after 2", feedback.text)
+        self.assertNotIn("backend still unavailable", feedback.text)
+        retry_end = next(
+            event for event in events if isinstance(event, ToolRetryEndEvent)
+        )
+        self.assertFalse(retry_end.success)
         self.assertEqual(retry_end.attempt, 2)
 
     async def test_unsafe_tool_does_not_retry_even_retryable_error(self) -> None:

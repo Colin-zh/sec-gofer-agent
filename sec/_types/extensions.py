@@ -39,7 +39,12 @@ AfterRunHook = Callable[[RunHookOutcome], Awaitable[None] | None]
 
 
 class Extension(Protocol):
-    """An explicitly enabled extension package entry point."""
+    """An explicitly enabled, reusable extension package entry point.
+
+    A Client may deactivate and reactivate the same instance as its enabled set
+    changes. Implementations must release owned resources on deactivation and
+    support a later activation with a fresh ExtensionAPI.
+    """
 
     name: str
 

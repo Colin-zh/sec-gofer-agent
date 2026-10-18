@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 from typing import Literal
 
 MAX_RESOURCE_BYTES = 256 * 1024
@@ -47,34 +50,132 @@ class CliResourceManager:
         workspace_root: Path,
         *,
         user_root: Path | None = None,
+        activation_path: Path | None = None,
     ) -> None:
         self._roots = (
             ("user", Path.home() / ".sec" if user_root is None else user_root),
             ("workspace", workspace_root / ".sec"),
         )
-        self._snapshot = ResourceSnapshot((), (), ())
+        self._activation_path = activation_path
+        self._activation = self._load_activation()
+        self._available_snapshot = ResourceSnapshot((), (), ())
+
+    @property
+    def available_snapshot(self) -> ResourceSnapshot:
+        """返回完整的已发现资源，包括已禁用的资源。"""
+        return self._available_snapshot
 
     @property
     def snapshot(self) -> ResourceSnapshot:
-        return self._snapshot
+        available = self._available_snapshot
+        return ResourceSnapshot(
+            tuple(item for item in available.skills if self._enabled(item.kind, item.name)),
+            tuple(item for item in available.prompts if self._enabled(item.kind, item.name)),
+            available.issues,
+        )
+
+    def is_enabled(self, kind: Literal["skill", "prompt"], name: str) -> bool:
+        """查询已发现资源的启用状态；无配置时默认启用。"""
+        resource = self._require_resource(kind, name)
+        return self._enabled(kind, resource.name)
+
+    def set_enabled(
+        self, kind: Literal["skill", "prompt"], name: str, enabled: bool
+    ) -> None:
+        """更新状态；配置路径可选，持久化失败时保留原状态。"""
+        resource = self._require_resource(kind, name)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        activation = {key: dict(values) for key, values in self._activation.items()}
+        activation.setdefault(kind, {})[resource.name] = enabled
+        self._save_activation(activation)
+        self._activation = activation
+
+    def _enabled(self, kind: str, name: str) -> bool:
+        return self._activation.get(kind, {}).get(name, True)
+
+    def _require_resource(self, kind: str, name: str) -> CliResource:
+        self._validate_kind(kind)
+        available = self._available_snapshot
+        resources = available.skills if kind == "skill" else available.prompts
+        resource = next((item for item in resources if item.name == name.casefold()), None)
+        if resource is None:
+            raise ValueError(f"unknown {kind} resource: {name}")
+        return resource
+
+    @staticmethod
+    def _validate_kind(kind: str) -> None:
+        if kind not in ("skill", "prompt"):
+            raise ValueError(f"invalid resource kind: {kind!r}")
+
+    def _load_activation(self) -> dict[str, dict[str, bool]]:
+        """读取 JSON：{"skill": {"name": false}, "prompt": {"name": true}}。"""
+        if self._activation_path is None:
+            return {}
+        try:
+            source = self._activation_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read resource activation config {self._activation_path}: {exc}") from exc
+        try:
+            activation = json.loads(source)
+            if not isinstance(activation, dict):
+                raise ValueError("expected an object")
+            for kind, values in activation.items():
+                self._validate_kind(kind)
+                if not isinstance(values, dict):
+                    raise ValueError(f"{kind} settings must be an object")
+                for name, enabled in values.items():
+                    if _RESOURCE_NAME.fullmatch(name) is None:
+                        raise ValueError(f"invalid resource name: {name!r}")
+                    if not isinstance(enabled, bool):
+                        raise ValueError(f"{kind}/{name} state must be a boolean")
+        except ValueError as exc:
+            raise ValueError(f"invalid resource activation config {self._activation_path}: {exc}") from exc
+        return activation
+
+    def _save_activation(self, activation: dict[str, dict[str, bool]]) -> None:
+        path = self._activation_path
+        if path is None:
+            return
+        temporary_path: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+                suffix=".tmp", delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(activation, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary_path.replace(path)
+        except OSError as exc:
+            raise OSError(f"cannot save resource activation config {path}: {exc}") from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def reload(self) -> ResourceSnapshot:
         """重新加载 Skills 与 Prompts，并显式记录格式错误。"""
         skills, skill_issues = self._discover("skill")
         prompts, prompt_issues = self._discover("prompt")
-        self._snapshot = ResourceSnapshot(
+        self._available_snapshot = ResourceSnapshot(
             skills,
             prompts,
             (*skill_issues, *prompt_issues),
         )
-        return self._snapshot
+        return self.snapshot
 
     def get(
         self,
         kind: Literal["skill", "prompt"],
         name: str,
     ) -> CliResource | None:
-        resources = self._snapshot.skills if kind == "skill" else self._snapshot.prompts
+        self._validate_kind(kind)
+        resources = self.snapshot.skills if kind == "skill" else self.snapshot.prompts
         return next((item for item in resources if item.name == name.casefold()), None)
 
     def _discover(

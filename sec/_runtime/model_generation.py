@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from time import time
-from typing import Any
+from copy import deepcopy
+from time import monotonic_ns, time
+from typing import Any, Literal
+from uuid import uuid4
 
 from sec._types.content import TextContent
-from sec._types.messages import AssistantMessage, Message, SystemMessage
+from sec._types.json import JSONObject
+from sec._types.messages import AssistantMessage, Message, SystemMessage, message_to_dict
 from sec._types.events import (
     AutoRetryEndEvent,
     ContentDeltaEvent,
     MessageUpdateEvent,
+    ModelRequestEndEvent,
+    ModelRequestStartEvent,
     RetryStartEvent,
 )
 from sec._runtime.budget import Budget
@@ -35,6 +40,7 @@ async def complete_or_interrupt(
     events: RunEventStream,
     budget: Budget,
     metrics: RunMetricsAccumulator,
+    turn_id: str,
     messages: tuple[Message, ...] | None = None,
     tools: tuple[ToolDefinition, ...] | None = None,
     publish_text: bool = True,
@@ -62,6 +68,8 @@ async def complete_or_interrupt(
         budget=budget,
         metrics=metrics,
         publish_text=publish_text,
+        turn_id=turn_id,
+        purpose="response" if publish_text else "compaction",
     )
     completion_task = asyncio.create_task(
         completion,
@@ -114,11 +122,54 @@ async def _complete_with_retries(
     budget: Budget,
     metrics: RunMetricsAccumulator,
     publish_text: bool,
+    turn_id: str,
+    purpose: Literal["response", "compaction"],
 ) -> AssistantMessage:
     """对单个逻辑模型请求执行有限 attempt，并隔离流式增量。"""
     retry_started = False
+    request_id = uuid4().hex
     for attempt_number in range(1, budget.model_retries.max_attempts + 1):
+        request_input: JSONObject = {
+            "messages": [message_to_dict(message) for message in messages],
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": deepcopy(dict(tool.input_schema)),
+                    "output_schema": deepcopy(dict(tool.output_schema)),
+                }
+                for tool in tools
+            ],
+        }
+        events.publish(ModelRequestStartEvent(
+            request_id=request_id,
+            turn_id=turn_id,
+            attempt=attempt_number,
+            purpose=purpose,
+            started_at=time(),
+            input=request_input,
+        ))
+        started_ns = monotonic_ns()
         metrics.start_model_attempt(retry=attempt_number > 1)
+
+        def publish_end(
+            status: Literal["completed", "failed", "cancelled"],
+            *,
+            response: AssistantMessage | None = None,
+            error: str | None = None,
+        ) -> None:
+            events.publish(ModelRequestEndEvent(
+                request_id=request_id,
+                turn_id=turn_id,
+                attempt=attempt_number,
+                purpose=purpose,
+                ended_at=time(),
+                elapsed_ms=(monotonic_ns() - started_ns) / 1_000_000,
+                status=status,
+                response=deepcopy(response),
+                error=error,
+            ))
+
         try:
             if isinstance(provider, StreamingModelProvider):
                 response = await _collect_streamed_response(
@@ -130,7 +181,18 @@ async def _complete_with_retries(
                 )
             else:
                 response = await provider.complete(messages, tools)
+            if not isinstance(response, AssistantMessage):
+                raise ProviderProtocolError(
+                    "model provider must return an assistant message"
+                )
+            if response.stop_reason not in {
+                "stop", "length", "tool_use", "deferred", "error", "aborted",
+            }:
+                raise ProviderProtocolError(
+                    "model response has an unsupported stop reason"
+                )
         except RetryableProviderError as exc:
+            publish_end("failed", error=str(exc))
             metrics.record_failed_attempt()
             decision = budget.model_retry(
                 attempt=attempt_number,
@@ -170,6 +232,7 @@ async def _complete_with_retries(
                 )
                 raise
         except asyncio.CancelledError:
+            publish_end("cancelled")
             metrics.record_failed_attempt()
             if retry_started:
                 events.publish(
@@ -181,6 +244,7 @@ async def _complete_with_retries(
                 )
             raise
         except Exception as exc:
+            publish_end("failed", error=str(exc))
             metrics.record_failed_attempt()
             if retry_started:
                 events.publish(
@@ -192,6 +256,12 @@ async def _complete_with_retries(
                 )
             raise
         else:
+            status: Literal["completed", "failed", "cancelled"] = (
+                "cancelled" if response.stop_reason == "aborted"
+                else "failed" if response.stop_reason == "error"
+                else "completed"
+            )
+            publish_end(status, response=response, error=response.error_message)
             metrics.record_response(response)
             if retry_started:
                 events.publish(

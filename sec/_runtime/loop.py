@@ -157,6 +157,7 @@ async def run_loop(
                                 events=events,
                                 budget=budget,
                                 metrics=metrics,
+                                turn_id=turn_id,
                                 messages=plan.summary_messages,
                                 tools=(),
                                 publish_text=False,
@@ -255,6 +256,7 @@ async def run_loop(
                     events=events,
                     budget=budget,
                     metrics=metrics,
+                    turn_id=turn_id,
                     messages=(
                         None
                         if prepared_context is None

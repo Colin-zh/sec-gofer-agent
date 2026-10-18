@@ -26,6 +26,7 @@ from sec.exceptions import (
     ContextWindowExceeded,
     ObjectNotFoundError,
     ObjectStoreError,
+    RecoverableToolError,
     RetryableProviderError,
     RetryableToolError,
     SecSubscriptionOverflow,
@@ -50,7 +51,7 @@ from sec._types.approvals import (
     ToolApprovalDecision,
     ToolApprovalRequest,
 )
-from sec._types.events import SessionEvent
+from sec._types.events import ModelRequestEndEvent, ModelRequestStartEvent, SessionEvent
 from sec._types.limits import Limits, validate_timeout
 from sec._types.messages import (
     AgentMessage,
@@ -152,6 +153,7 @@ __all__ = [
     "ObjectNotFoundError",
     "ObjectStore",
     "ObjectStoreError",
+    "RecoverableToolError",
     "PolicyCapabilityType",
     "PolicyContext",
     "PolicyDecision",
@@ -167,6 +169,8 @@ __all__ = [
     "Run",
     "RunUsage",
     "SessionEvent",
+    "ModelRequestStartEvent",
+    "ModelRequestEndEvent",
     "RunResult",
     "RuntimeSettings",
     "Session",

@@ -76,3 +76,11 @@ class SessionStoreProtocol(Protocol):
         调用方传入的可变消息对象引用。
         """
         ...
+
+
+class DeletableSessionStoreProtocol(SessionStoreProtocol, Protocol):
+    """可选删除能力；第三方旧 adapter 不必实现。"""
+
+    async def delete(self, session_id: str, expected_version: int) -> None:
+        """删除匹配版本的会话；版本冲突必须拒绝且不产生部分删除。"""
+        ...

@@ -13,8 +13,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import time
-from uuid import uuid4
 
 from dotenv import dotenv_values
 from rich.console import Console
@@ -25,7 +23,6 @@ from sec import (
     MessageEntry,
     Run,
     SessionEntry,
-    SessionInfoEntry,
     SessionStoreError,
     SessionSummary,
 )
@@ -616,15 +613,7 @@ def create_chat_commands(
         name = " ".join(args).strip()
         if not name:
             return ChatCommandOutcome("Usage: /name [name]", display_kind="error")
-        session = client.session
-        await session.append_entry(
-            SessionInfoEntry(
-                id=uuid4().hex,
-                parent_id=session.active_leaf_id,
-                timestamp=time.time(),
-                name=name,
-            )
-        )
+        await client.rename_session(client.session.id, name)
         return ChatCommandOutcome(f"Session renamed to {name!r}.")
 
     def session_tree(args: tuple[str, ...]) -> ChatCommandOutcome:
@@ -725,9 +714,102 @@ def create_chat_commands(
 
     commands: ChatCommandRegistry
 
-    def reload_resources(args: tuple[str, ...]) -> ChatCommandOutcome:
-        if args:
-            return ChatCommandOutcome("Usage: /reload", display_kind="error")
+    async def reload_resources(args: tuple[str, ...]) -> ChatCommandOutcome:
+        if args and (len(args) < 2 or args[0] not in {"enable", "disable"}):
+            return ChatCommandOutcome(
+                "Usage: /reload [enable|disable <extension-name...>]",
+                display_kind="error",
+            )
+        if args and not args[1:]:
+            return ChatCommandOutcome(
+                f"Usage: /reload {args[0]} <extension-name...>",
+                display_kind="error",
+            )
+        active_run = get_run()
+        if args and active_run is not None and not active_run.done:
+            return ChatCommandOutcome(
+                "Finish or stop the active Run before changing Extensions.",
+                display_kind="error",
+            )
+
+        extension_message: str
+        previous_enabled = client.enabled_extensions
+        try:
+            if args:
+                action, *names = args
+                current = previous_enabled
+                if len(names) != len(set(names)):
+                    return ChatCommandOutcome(
+                        "Extension names must not be repeated.",
+                        display_kind="error",
+                    )
+                if action == "enable":
+                    desired = tuple(dict.fromkeys((*current, *names)))
+                else:
+                    missing = [name for name in names if name not in current]
+                    if missing:
+                        return ChatCommandOutcome(
+                            f"Extension(s) not enabled: {', '.join(missing)}",
+                            display_kind="error",
+                        )
+                    desired = tuple(name for name in current if name not in names)
+                await client.set_enabled_extensions(desired)
+                extension_message = (
+                    f"Enabled {', '.join(names)}."
+                    if action == "enable"
+                    else f"Disabled {', '.join(names)}."
+                )
+            else:
+                available = client.discover_extensions()
+                enabled = set(previous_enabled)
+                all_names = tuple(sorted(set(available) | enabled))
+                extension_message = (
+                    "Installed Extensions:\n"
+                    + (
+                        "\n".join(
+                            f"  {name} ({'enabled' if name in enabled else 'disabled'})"
+                            if name in available
+                            else f"  {name} (enabled, entry point not found)"
+                            for name in all_names
+                        )
+                        if all_names
+                        else "  (none)"
+                    )
+                    + "\nUse /reload enable <name...> or "
+                    "/reload disable <name...>."
+                )
+        except (ConfigError, ExtensionLoadError, ValueError, RuntimeError, ExceptionGroup) as exc:
+            return ChatCommandOutcome(
+                f"Could not reload Extensions: {exc}",
+                display_kind="error",
+            )
+
+        try:
+            commands.replace_extension_commands(_extension_chat_commands(client))
+        except ValueError as command_error:
+            if client.enabled_extensions != previous_enabled:
+                try:
+                    await client.set_enabled_extensions(previous_enabled)
+                    commands.replace_extension_commands(
+                        _extension_chat_commands(client)
+                    )
+                except (
+                    ConfigError,
+                    ExtensionLoadError,
+                    ValueError,
+                    RuntimeError,
+                    ExceptionGroup,
+                ) as rollback_error:
+                    return ChatCommandOutcome(
+                        "Extension command registration failed and the previous "
+                        f"set could not be restored: {command_error}; {rollback_error}",
+                        display_kind="error",
+                    )
+            return ChatCommandOutcome(
+                f"Extension command registration failed: {command_error}",
+                display_kind="error",
+            )
+
         snapshot = resource_manager.reload()
         commands.replace_resource_commands(_resource_command_specs(resource_manager))
         if refresh_completions is not None:
@@ -739,7 +821,7 @@ def create_chat_commands(
         )
         return ChatCommandOutcome(
             f"Reloaded {len(snapshot.skills)} Skill(s) and "
-            f"{len(snapshot.prompts)} Prompt(s).{issues}"
+            f"{len(snapshot.prompts)} Prompt(s). {extension_message}{issues}"
         )
 
     def help_details() -> str:
@@ -774,7 +856,10 @@ def create_chat_commands(
             "clone": clone_session,
         },
         additional_commands={
-            "reload": ("Reload Skills and Prompts", reload_resources),
+            "reload": (
+                "Reload Skills/Prompts and list or change enabled Extensions",
+                reload_resources,
+            ),
             "export": ("Export the current Session to JSON", export_session),
             "import": ("Import a Session from a JSON file", import_session),
             "copy": ("Copy active conversation text to the clipboard", copy_session),
@@ -782,6 +867,13 @@ def create_chat_commands(
         resource_commands=_resource_command_specs(resource_manager),
         help_details=help_details,
     )
+    commands.replace_extension_commands(_extension_chat_commands(client))
+    return commands
+
+
+def _extension_chat_commands(client: AsyncSecClient) -> tuple[ChatCommand, ...]:
+    """Adapt currently enabled extension commands to the interactive registry."""
+    commands: list[ChatCommand] = []
     for extension_command in client.extensions.commands:
         def invoke(
             args: tuple[str, ...],
@@ -803,14 +895,14 @@ def create_chat_commands(
                 display_kind="info" if status == 0 else "error",
             )
 
-        commands.register(
+        commands.append(
             ChatCommand(
                 extension_command.name,
                 extension_command.description,
                 invoke,
             )
         )
-    return commands
+    return tuple(commands)
 
 
 def _default_export_path(session_id: str) -> Path:
@@ -850,6 +942,7 @@ def _resource_command_specs(
             return ChatCommandOutcome(
                 f"Loaded {kind.title()} {name}.",
                 run_prompt=prompt,
+                display_prompt=f"/{kind}:{name}" + (f" {request}" if request else ""),
             )
 
         specs.append(

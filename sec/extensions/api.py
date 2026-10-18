@@ -80,6 +80,10 @@ class ExtensionCatalog:
     def run_event_hooks(self) -> tuple[RunEventHook, ...]:
         return tuple(self._run_events)
 
+    def owner_of(self, category: str, name: str) -> str | None:
+        """Return the extension that registered a named contribution."""
+        return self._owners.get((category, name))
+
     def _claim(self, category: str, name: str, owner: str) -> None:
         key = (category, name)
         previous = self._owners.get(key)

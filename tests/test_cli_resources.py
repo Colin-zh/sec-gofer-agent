@@ -61,6 +61,8 @@ class CliResourceTests(unittest.IsolatedAsyncioTestCase):
             manager.reload()
             client = SimpleNamespace(
                 extensions=SimpleNamespace(commands=()),
+                enabled_extensions=(),
+                discover_extensions=lambda: (),
             )
             commands = _create_commands(client, resource_manager=manager)
 
@@ -76,7 +78,107 @@ class CliResourceTests(unittest.IsolatedAsyncioTestCase):
             reload_result = await commands.dispatch("/reload")
 
             self.assertIn("1 Skill(s) and 1 Prompt(s)", reload_result.message)
+            self.assertIn("Installed Extensions", reload_result.message)
             self.assertIn("/prompt:release-note", {item[0] for item in commands.completion_items()})
+
+    async def test_reload_can_enable_list_and_disable_extensions(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.extensions = SimpleNamespace(commands=())
+                    self._enabled: tuple[str, ...] = ()
+
+                @property
+                def enabled_extensions(self) -> tuple[str, ...]:
+                    return self._enabled
+
+                def discover_extensions(self) -> tuple[str, ...]:
+                    return ("dynamic",)
+
+                async def set_enabled_extensions(self, enabled: tuple[str, ...]) -> None:
+                    self._enabled = enabled
+                    if "dynamic" in enabled:
+                        self.extensions.commands = (
+                            SimpleNamespace(
+                                name="dynamic-command",
+                                description="A dynamically loaded command",
+                                handler=lambda _args: 0,
+                            ),
+                        )
+                    else:
+                        self.extensions.commands = ()
+
+            client = FakeClient()
+            manager = CliResourceManager(workspace, user_root=workspace / "home")
+            commands = _create_commands(client, resource_manager=manager)
+
+            discovered = await commands.dispatch("/reload")
+            self.assertIn("dynamic (disabled)", discovered.message)
+
+            enabled = await commands.dispatch("/reload enable dynamic")
+            self.assertEqual(client.enabled_extensions, ("dynamic",))
+            self.assertIn("/dynamic-command", {
+                item[0] for item in commands.completion_items()
+            })
+            self.assertIn("Enabled dynamic.", enabled.message)
+            self.assertEqual(
+                (await commands.dispatch("/dynamic-command")).display_kind,
+                "info",
+            )
+
+            disabled = await commands.dispatch("/reload disable dynamic")
+            self.assertEqual(client.enabled_extensions, ())
+            self.assertNotIn("/dynamic-command", {
+                item[0] for item in commands.completion_items()
+            })
+            self.assertIn("Disabled dynamic.", disabled.message)
+            self.assertEqual(
+                (await commands.dispatch("/dynamic-command")).display_kind,
+                "error",
+            )
+
+    async def test_reload_restores_previous_set_on_command_name_conflict(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = Path(directory)
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.extensions = SimpleNamespace(commands=())
+                    self._enabled: tuple[str, ...] = ()
+
+                @property
+                def enabled_extensions(self) -> tuple[str, ...]:
+                    return self._enabled
+
+                def discover_extensions(self) -> tuple[str, ...]:
+                    return ("conflict",)
+
+                async def set_enabled_extensions(self, enabled: tuple[str, ...]) -> None:
+                    self._enabled = enabled
+                    self.extensions.commands = (
+                        (
+                            SimpleNamespace(
+                                name="reload",
+                                description="Conflicting command",
+                                handler=lambda _args: 0,
+                            ),
+                        )
+                        if "conflict" in enabled
+                        else ()
+                    )
+
+            client = FakeClient()
+            manager = CliResourceManager(workspace, user_root=workspace / "home")
+            commands = _create_commands(client, resource_manager=manager)
+
+            outcome = await commands.dispatch("/reload enable conflict")
+
+            self.assertEqual(client.enabled_extensions, ())
+            self.assertEqual(client.extensions.commands, ())
+            self.assertEqual(outcome.display_kind, "error")
+            self.assertIn("conflicts with a built-in command", outcome.message)
 
     async def test_ctrl_o_opens_expanded_help_command(self) -> None:
         ui = TerminalUI(force_terminal=False)

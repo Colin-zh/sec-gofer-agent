@@ -6,13 +6,16 @@ import unittest
 from collections.abc import Sequence
 
 from sec._types.content import TextContent
-from sec._types.events import CompactionEndEvent, CompactionStartEvent
+from sec._types.events import (
+    CompactionEndEvent, CompactionStartEvent, ModelRequestStartEvent, ModelRequestEndEvent,
+)
 from sec._types.messages import (
     AssistantMessage,
     Message,
     Usage,
     UsageCost,
     UserMessage,
+    message_to_dict,
 )
 from sec import ContextSettings, SessionStore
 from sec.agent import Agent, Session
@@ -274,6 +277,17 @@ class ContextCompressionLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(compaction_end.aborted)
         self.assertEqual(result.final_message.text, "Final response.")
         self.assertEqual(len(provider.requests), 2)
+        starts = [event for event in events if isinstance(event, ModelRequestStartEvent)]
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual([event.purpose for event in starts], ["compaction", "response"])
+        self.assertEqual([event.purpose for event in ends], ["compaction", "response"])
+        self.assertEqual(len({event.request_id for event in starts}), 2)
+        self.assertEqual(len({event.turn_id for event in starts}), 1)
+        for event, request in zip(starts, provider.requests):
+            self.assertEqual(event.input["messages"], [
+                message_to_dict(message) for message in request
+            ])
+        self.assertEqual(starts[0].input["tools"], [])
         self.assertTrue(
             any(
                 "Persistent conversation memory" in message.text

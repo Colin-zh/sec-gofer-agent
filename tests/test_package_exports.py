@@ -54,6 +54,8 @@ class PackageExportTests(unittest.TestCase):
             "ModelResponseCompleted",
             "ModelStreamEvent",
             "ModelTextDelta",
+            "ModelRequestStartEvent",
+            "ModelRequestEndEvent",
             "RunUsage",
             "PolicyCapabilityType",
             "PolicyContext",

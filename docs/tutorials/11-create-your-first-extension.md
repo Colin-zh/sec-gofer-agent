@@ -57,7 +57,7 @@ class HelloExtension:
 extension = HelloExtension()
 ```
 
-`activate(api)` 注册本次 Client 所需的能力；`deactivate()` 释放扩展拥有的资源。只有成功加载的 Extension 才会激活，关闭时按反向顺序停用。
+`activate(api)` 注册本次 Client 所需的能力；`deactivate()` 释放扩展拥有的资源。只有显式启用的 Extension 才会激活，关闭时按反向顺序停用。交互 CLI 可在 Run 空闲时通过 `/reload enable <name>` 和 `/reload disable <name>` 动态启停扩展；同一实例可能再次收到 `activate(api)`，因此停用后必须可安全重新激活，并只使用本次传入的 API。
 
 ## 安装并启用
 
@@ -74,6 +74,9 @@ uv run python -m sec --extension hello
 uv run python -m sec --extension hello /hello world
 ```
 
-Extension 不会因安装而自动执行；每次启动都必须通过 `--extension` 或 SDK 的 `enabled_extensions=("hello",)` 显式启用。当前 Client 不支持 Extension 热重载。
+Extension 不会因安装而自动执行；每次 Client 启动都可通过 `--extension` 或 SDK 的
+`enabled_extensions=("hello",)` 显式启用，也可在 CLI 交互中明确选择启用。`/reload` 不会
+自动启用发现到的扩展，也不替换当前进程已导入的 Python 模块代码；代码更新后需重启 Sec。
+运行中的启停仅影响后续 Run，当前 SessionStore 所依赖的扩展不能被停用。
 
 > macOS 上 editable 安装若报 `No module named sec_hello`，先查看[排查教程](15-troubleshooting.md)中的 `.pth` 隐藏标记说明。

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -19,6 +20,8 @@ from sec._types.events import (
     ContentDeltaEvent,
     EmptySessionEvent,
     MessageUpdateEvent,
+    ModelRequestEndEvent,
+    ModelRequestStartEvent,
     RetryStartEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
@@ -29,6 +32,7 @@ from sec._types.messages import (
     ToolResultMessage,
     Usage,
     UsageCost,
+    message_to_dict,
 )
 from sec import (
     AllowListPolicy,
@@ -137,7 +141,9 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         harness = Harness(provider, policy=AllowListPolicy({"add"}))
         agent = Agent(name="calculator", instructions="Use tools.", tools=(add,))
 
-        result = await harness.run(agent, "Add one to four").result()
+        run = harness.run(agent, "Add one to four")
+        result = await run.result()
+        events = [event async for event in run.events()]
 
         self.assertEqual(result.final_message.text, "5")
         self.assertEqual((result.model_calls, result.tool_calls), (2, 1))
@@ -154,6 +160,41 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         tool_results = provider.requests[1][0][-1]
         self.assertEqual(tool_results.tool_call_id, "call-1")
         self.assertEqual(tool_results.text, "5")
+        starts = [event for event in events if isinstance(event, ModelRequestStartEvent)]
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(len(ends), 2)
+        for start, request in zip(starts, provider.requests):
+            self.assertEqual(start.input["messages"], [
+                message_to_dict(message) for message in request[0]
+            ])
+            self.assertEqual(start.input["tools"][0]["name"], "add")
+        self.assertEqual(ends[0].response.tool_uses[0].name, "add")
+        self.assertEqual(ends[1].response.text, "5")
+        self.assertNotEqual(starts[0].request_id, starts[1].request_id)
+        self.assertEqual(starts[0].turn_id, starts[1].turn_id)
+
+    async def test_model_attempt_duration_and_snapshots_are_independent_of_mutation(self) -> None:
+        response = assistant_text("original")
+        provider = ScriptedProvider(response)
+        with patch(
+            "sec._runtime.model_generation.monotonic_ns",
+            side_effect=[1_000_000, 13_500_000],
+        ):
+            run = Harness(provider).run(
+                Agent(name="snapshot", instructions="system instructions"), "question",
+            )
+            await run.result()
+        events = [event async for event in run.events()]
+        start = next(event for event in events if isinstance(event, ModelRequestStartEvent))
+        end = next(event for event in events if isinstance(event, ModelRequestEndEvent))
+        self.assertEqual(end.elapsed_ms, 12.5)
+        response.content.clear()
+        provider.requests[0][0][0].content = "mutated system"
+        self.assertEqual(start.input["messages"][0]["content"][0]["text"], "system instructions")
+        self.assertEqual(end.response.text, "original")
+        self.assertEqual(start.request_id, end.request_id)
+        self.assertLess(events.index(start), events.index(end))
 
     async def test_policy_denial_is_returned_without_executing_tool(self) -> None:
         executed = False
@@ -247,6 +288,20 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             2,
         )
         self.assertEqual(events[-1].type, "agent_settled")
+        starts = [event for event in events if isinstance(event, ModelRequestStartEvent)]
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual([event.attempt for event in starts], [1, 2, 3])
+        self.assertEqual([event.status for event in ends], ["failed", "failed", "completed"])
+        self.assertEqual(len({event.request_id for event in starts}), 1)
+        self.assertEqual(
+            [(event.request_id, event.attempt) for event in starts],
+            [(event.request_id, event.attempt) for event in ends],
+        )
+        self.assertEqual(ends[0].error, "temporary failure")
+        self.assertEqual(ends[-1].response.text, "recovered")
+        self.assertTrue(all(event.elapsed_ms >= 0 for event in ends))
+        retry_index = next(i for i, event in enumerate(events) if event.type == "auto_retry_start")
+        self.assertLess(events.index(ends[0]), retry_index)
 
     async def test_model_retry_does_not_replay_a_completed_tool_call(self) -> None:
         executed: list[int] = []
@@ -345,6 +400,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         terminal = remaining_events[-1]
         self.assertIsInstance(terminal, AgentSettledEvent)
         self.assertEqual(terminal.status, "cancelled")
+        replay = [event async for event in run.events()]
+        starts = [event for event in replay if isinstance(event, ModelRequestStartEvent)]
+        ends = [event for event in replay if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual([event.status for event in ends], ["failed"])
 
     async def test_non_retryable_provider_error_is_not_retried(self) -> None:
         class InvalidProvider:
@@ -377,6 +437,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls, 1)
         self.assertIsInstance(events[-1], AgentSettledEvent)
         self.assertEqual(events[-1].status, "failed")
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0].status, "failed")
+        self.assertEqual(ends[0].error, "invalid request")
+        self.assertIsNone(ends[0].response)
 
     async def test_retry_exhaustion_reports_attempt_counts(self) -> None:
         class UnavailableProvider:
@@ -439,13 +504,22 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             executed = True
             return value + 1
 
-        provider = ScriptedProvider(tool_request("add", {"value": "4"}))
+        provider = ScriptedProvider(
+            tool_request("add", {"value": "4"}),
+            assistant_text("The argument must be an integer."),
+        )
         harness = Harness(provider, policy=AllowListPolicy({"add"}))
         agent = Agent(name="typed", instructions="", tools=(add,))
 
-        with self.assertRaisesRegex(TypeError, "JSON type integer"):
-            await harness.run(agent, "Add one").result()
+        run = harness.run(agent, "Add one")
+        result = await run.result()
+        feedback = provider.requests[1][0][-1]
+
         self.assertFalse(executed)
+        self.assertEqual(result.final_message.text, "The argument must be an integer.")
+        self.assertTrue(feedback.is_error)
+        self.assertEqual(feedback.metadata["error_kind"], "invalid_arguments")
+        self.assertIn("must have JSON type integer", feedback.text)
 
     async def test_run_can_cancel_pending_async_provider_call(self) -> None:
         started = asyncio.Event()
@@ -474,6 +548,10 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         events = [event async for event in run.events()]
         self.assertIsInstance(events[-1], AgentSettledEvent)
         self.assertEqual(events[-1].status, "cancelled")
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0].status, "cancelled")
+        self.assertIsNone(ends[0].response)
 
     async def test_steering_interrupts_uncommitted_generation(self) -> None:
         class InterruptibleProvider:
@@ -516,6 +594,11 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             [message.text for message in session.messages if message.role == "assistant"],
             ["Steered response"],
         )
+        events = [event async for event in run.events()]
+        ends = [event for event in events if isinstance(event, ModelRequestEndEvent)]
+        self.assertEqual([event.status for event in ends], ["cancelled", "completed"])
+        self.assertNotEqual(ends[0].request_id, ends[1].request_id)
+        self.assertEqual(ends[0].turn_id, ends[1].turn_id)
 
     async def test_response_completed_during_steering_is_committed_first(self) -> None:
         class CancellationResistantProvider:
@@ -853,10 +936,17 @@ class SessionEventTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(events[-1].assistant_message_event, ContentDeltaEvent)
         self.assertEqual(events[-1].assistant_message_event.delta, "Hello")
         self.assertFalse(run.done)
+        self.assertTrue(any(isinstance(event, ModelRequestStartEvent) for event in events))
+        self.assertFalse(any(isinstance(event, ModelRequestEndEvent) for event in events))
         raw_provider.release.set()
 
         result = await run.result()
         events.extend([event async for event in event_iterator])
+        request_end = next(
+            event for event in events if isinstance(event, ModelRequestEndEvent)
+        )
+        self.assertEqual(request_end.status, "completed")
+        self.assertEqual(request_end.response.text, "Hello world")
         deltas = [
             event.assistant_message_event.delta
             for event in events

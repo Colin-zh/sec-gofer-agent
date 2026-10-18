@@ -63,6 +63,10 @@ Extension Provider 的变量前缀由 Provider 名称生成：转换为大写，
 
 默认不重试工具。只有工具通过 `@tool(retry_safe=True)` 显式声明可安全重试，且调用抛出 `RetryableToolError`，才会按此配置重试。不要为可能产生重复副作用的操作启用安全重试。对应 Client 参数为 `max_tool_attempts`、`tool_retry_base_delay_seconds` 和 `tool_retry_max_delay_seconds`。
 
+工具参数校验失败会作为错误结果交给模型；该调用尚未执行，模型可用新的工具调用 ID 提交修正参数。Executor 可抛出 `RecoverableToolError`，将其安全、面向模型的消息作为错误结果返回；消息最多 2000 个字符，调用方负责避免包含凭据或其他敏感信息。运行时不会自动重放这类调用，并会提示模型副作用状态可能不确定。
+
+安全重试耗尽后，运行时将通用错误结果交给模型，不转发 Executor 的异常详情。未声明 `retry_safe=True` 的工具遇到 `RetryableToolError`、普通 Executor 异常及 Executor 协议错误仍会终止 Run；审批拒绝仍作为错误结果返回，取消仍终止 Run。结果的 `metadata["error_kind"]` 是 sec 内部分类，不会作为 Provider 工具结果内容发送。
+
 ## Agent 预算与事件缓冲
 
 | 变量 | 默认值 | 有效范围与说明 |

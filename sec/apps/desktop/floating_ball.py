@@ -10,7 +10,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QStyle, QWidget
 
 from sec.apps.desktop.appearance import application_icon
 
@@ -91,9 +91,15 @@ class FloatingBall(QWidget):
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:
         menu = QMenu(self)
-        restore = menu.addAction("返回大屏专注")
+        restore = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton),
+            "返回大屏专注",
+        )
         restore.triggered.connect(self.restore_requested.emit)
         menu.addSeparator()
-        quit_action = menu.addAction("退出 Sec")
+        quit_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton),
+            "退出 Sec",
+        )
         quit_action.triggered.connect(self.quit_requested.emit)
         menu.exec(event.globalPos())

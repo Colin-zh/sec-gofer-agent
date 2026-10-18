@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/icon.png" alt="Sec icon" width="96">
+  <img src="https://raw.githubusercontent.com/Colin-zh/sec-gofer-agent/main/docs/images/icon.png" alt="Sec icon" width="96">
 </p>
 
 <h1 align="center">Sec</h1>
@@ -14,7 +14,7 @@
   <a href="https://github.com/Colin-zh/sec-gofer-agent/graphs/contributors"><img src="https://img.shields.io/github/contributors/Colin-zh/sec-gofer-agent?color=blue"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/stargazers"><img src="https://img.shields.io/github/stars/Colin-zh/sec-gofer-agent.svg?logo=github"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/network/members"><img src="https://img.shields.io/github/forks/Colin-zh/sec-gofer-agent.svg?color=blue&logo=github"></a>
-  <a href="https://github.com/Colin-zh/sec-gofer-agent"><img src="docs/images/icon.png" alt="Sec icon" align="right" height="48" width="48"></a>
+  <a href="https://www.python.org/"><img src="https://upload.wikimedia.org/wikipedia/commons/c/c3/Python-logo-notext.svg" align="right" height="48" width="48" ></a>
 </p>
 
 Sec 是一个可编程的 AI Agent SDK，也提供终端聊天 CLI。你可以直接用 CLI 与模型协作，也可以通过 Python Client 将 Sec 集成到自己的应用，或用 Extension 添加工具、命令和运行时能力。
@@ -57,7 +57,10 @@ uv run --no-sync sec-desktop
 ```
 
 支持大屏专注/悬浮球切换、会话恢复、流式回答、工具审批及 CLI 斜杠命令。
-Extension 安装到同一 `.venv` 后，可通过 `--extension <name>` 启用。
+Extension 安装到同一 `.venv` 后，可通过 `--extension <name>` 显式启用；
+交互 CLI 也支持 `/reload` 查看已安装扩展，并用 `/reload enable <name...>` /
+`/reload disable <name...>` 在当前 Client 生命周期内切换启用集合。
+扩展代码更新仍需重启进程，且启停仅影响后续 Run。
 详细说明见[桌面应用](sec/apps/desktop/README.md)。
 
 ## CLI 界面速览
@@ -117,7 +120,7 @@ with SecClient("assistant", "遵循用户指令。") as client:
 - **Skills 与 Prompts**：从 Markdown 文件加载可复用的操作说明和提示模板。
 - **Extensions**：通过 Python entry point 显式启用，可注册工具、Provider、Policy、SessionStore、UI handler、CLI 命令和 Run hooks。
 - **Session 与存储**：进程内或 SQLite SessionStore、会话恢复和分支操作；提供可实现的 ObjectStore 协议。
-- **运行可靠性**：模型及安全声明工具的有限重试、每轮调用预算、用量统计和可选上下文压缩。
+- **运行可靠性**：模型及安全声明工具的有限重试、可控的工具错误反馈、每轮调用预算、用量统计和可选上下文压缩。
 
 ## 安全与支持边界
 

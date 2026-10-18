@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Literal
 
-from sec._types.storage import SessionStoreProtocol
+from sec._types.storage import DeletableSessionStoreProtocol, SessionStoreProtocol
 from sec.storage.resources.database import Database
 from sec.storage.session_store.database import DatabaseSessionStore
 from sec.storage.session_store.in_memory import InMemorySessionStore
@@ -26,7 +26,7 @@ class SessionStore(SessionStoreProtocol):
         if backend == "in_memory":
             if database is not None:
                 raise ValueError("database is only valid for the database backend")
-            self._store: SessionStoreProtocol = InMemorySessionStore()
+            self._store: DeletableSessionStoreProtocol = InMemorySessionStore()
         elif backend == "database":
             if not isinstance(database, Database):
                 raise TypeError("database backend requires a Database instance")
@@ -61,3 +61,7 @@ class SessionStore(SessionStoreProtocol):
             entries,
             active_leaf_id,
         )
+
+    async def delete(self, session_id: str, expected_version: int) -> None:
+        """删除内置 adapter 中版本匹配的会话。"""
+        await self._store.delete(session_id, expected_version)

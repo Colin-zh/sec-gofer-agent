@@ -54,6 +54,20 @@ def _leaf_exceptions(error: BaseException) -> list[BaseException]:
 
 
 class ExtensionManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_discovery_lists_entry_points_without_importing_them(self) -> None:
+        point = _EntryPoint("sample", _Extension("sample"))
+        manager = ExtensionManager()
+
+        with patch(
+            "sec.extensions.manager.entry_points",
+            return_value=[point],
+        ) as discover:
+            self.assertEqual(manager.discover(), ("sample",))
+            discover.assert_called_once_with(group=ENTRY_POINT_GROUP)
+
+        self.assertEqual(point.loads, 0)
+        await manager.aclose()
+
     async def test_only_explicitly_enabled_entry_points_are_loaded(self) -> None:
         registered = []
         extension = _Extension(
@@ -79,6 +93,58 @@ class ExtensionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ignored.loads, 0)
         self.assertEqual(registered, ["sample-tool"])
         self.assertEqual(extension.lifecycle, ["activate", "deactivate"])
+
+    async def test_enabled_extensions_can_be_changed_and_reactivated(self) -> None:
+        first = _Extension("first")
+        second = _Extension("second")
+        points = [_EntryPoint("first", first), _EntryPoint("second", second)]
+        manager = ExtensionManager()
+        with patch("sec.extensions.manager.entry_points", return_value=points):
+            await manager.load(("first",))
+            await manager.set_enabled(("first", "second"))
+            self.assertEqual(manager.enabled, ("first", "second"))
+            await manager.set_enabled(("second",))
+            self.assertEqual(manager.enabled, ("second",))
+            await manager.set_enabled(("first", "second"))
+
+        self.assertEqual(first.lifecycle, ["activate", "deactivate", "activate"])
+        self.assertEqual(second.lifecycle, ["activate"])
+        await manager.aclose()
+
+    async def test_failed_dynamic_enable_rolls_back_new_contributions(self) -> None:
+        first = _Extension(
+            "first",
+            lambda api: api.register_tool(
+                tool(lambda: "first", name="shared", description="First tool.")
+            ),
+        )
+        second = _Extension(
+            "second",
+            lambda api: api.register_tool(
+                tool(lambda: "second", name="shared", description="Second tool.")
+            ),
+        )
+        manager = ExtensionManager()
+        with (
+            patch(
+                "sec.extensions.manager.entry_points",
+                return_value=[
+                    _EntryPoint("first", first),
+                    _EntryPoint("second", second),
+                ],
+            ),
+            self.assertRaisesRegex(ValueError, "conflicts with extension"),
+        ):
+            await manager.load(("first",))
+            await manager.set_enabled(("first", "second"))
+
+        self.assertEqual(manager.enabled, ("first",))
+        self.assertEqual(
+            [registered.definition.name for registered in manager.catalog.tools],
+            ["shared"],
+        )
+        self.assertEqual(second.lifecycle, ["activate", "deactivate"])
+        await manager.aclose()
 
     async def test_empty_enablement_does_not_scan_installed_packages(self) -> None:
         with patch("sec.extensions.manager.entry_points") as discover:
@@ -241,6 +307,120 @@ class ExtensionManagerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("plugin-store", client.extensions.storage_backends)
 
         self.assertEqual(extension.lifecycle, ["activate", "deactivate"])
+
+    async def test_async_client_updates_extension_contributions_while_idle(self) -> None:
+        extension = _Extension(
+            "dynamic",
+            lambda api: api.register_tool(
+                tool(lambda: "ok", name="dynamic-tool", description="Dynamic tool.")
+            ),
+        )
+        client = AsyncSecClient(
+            "assistant",
+            "Instructions.",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            env_file=None,
+        )
+        with patch(
+            "sec.extensions.manager.entry_points",
+            return_value=[_EntryPoint("dynamic", extension)],
+        ):
+            async with client:
+                self.assertEqual(client.discover_extensions(), ("dynamic",))
+                self.assertEqual(client.enabled_extensions, ())
+
+                await client.set_enabled_extensions(("dynamic",))
+                self.assertEqual(client.enabled_extensions, ("dynamic",))
+                self.assertEqual(
+                    tuple(item.definition.name for item in client.agent.tools),
+                    ("dynamic-tool",),
+                )
+
+                await client.set_enabled_extensions(())
+                self.assertEqual(client.enabled_extensions, ())
+                self.assertEqual(client.agent.tools, ())
+
+        self.assertEqual(
+            extension.lifecycle,
+            ["activate", "deactivate"],
+        )
+
+    async def test_async_client_restores_extensions_when_runtime_rebuild_fails(self) -> None:
+        class Provider:
+            async def complete(self, _messages, _tools):
+                raise AssertionError("provider should not be called in this test")
+
+        extension = _Extension(
+            "provider-extension",
+            lambda api: api.register_provider(
+                "plugin-provider",
+                lambda _config: Provider(),
+            ),
+        )
+        client = AsyncSecClient(
+            "assistant",
+            "Instructions.",
+            provider="plugin-provider",
+            model="plugin-model",
+            api_key="test-key",
+            enabled_extensions=("provider-extension",),
+            env_file=None,
+        )
+        with patch(
+            "sec.extensions.manager.entry_points",
+            return_value=[_EntryPoint("provider-extension", extension)],
+        ):
+            async with client:
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "no enabled extension provides model provider",
+                ):
+                    await client.set_enabled_extensions(())
+                self.assertEqual(
+                    client.enabled_extensions,
+                    ("provider-extension",),
+                )
+                self.assertIn("plugin-provider", client.extensions.providers)
+
+        self.assertEqual(
+            extension.lifecycle,
+            ["activate", "deactivate", "activate", "deactivate"],
+        )
+
+    async def test_client_cannot_disable_extension_backing_its_session_store(self) -> None:
+        extension = _Extension(
+            "store-extension",
+            lambda api: api.register_storage_backend(
+                "plugin-store",
+                lambda _config, _database: InMemorySessionStore(),
+            ),
+        )
+        client = AsyncSecClient(
+            "assistant",
+            "Instructions.",
+            provider="openai",
+            model="test-model",
+            api_key="test-key",
+            session_store_backend="plugin-store",
+            enabled_extensions=("store-extension",),
+            env_file=None,
+        )
+        with patch(
+            "sec.extensions.manager.entry_points",
+            return_value=[_EntryPoint("store-extension", extension)],
+        ):
+            async with client:
+                with self.assertRaisesRegex(
+                    ConfigError,
+                    "SessionStore is in use",
+                ):
+                    await client.set_enabled_extensions(())
+                self.assertEqual(
+                    client.enabled_extensions,
+                    ("store-extension",),
+                )
 
     async def test_async_client_reports_all_resource_close_failures(self) -> None:
         class Provider:

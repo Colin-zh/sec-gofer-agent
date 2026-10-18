@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -113,6 +113,40 @@ class DatabaseSessionStore(SessionStoreProtocol):
             reverse=True,
         )
         return tuple(summaries)
+
+    async def delete(self, session_id: str, expected_version: int) -> None:
+        """在同一事务中校验版本并删除会话树。"""
+        _validate_session_id(session_id)
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("expected version must be a non-negative integer")
+        self._require_initialized()
+        async with self._write_lock:
+            try:
+                async with self._database.transaction() as db_session:
+                    locked = await db_session.execute(
+                        update(sessions).where(
+                            sessions.c.session_id == session_id,
+                            sessions.c.version == expected_version,
+                        ).values(version=expected_version + 1)
+                    )
+                    if locked.rowcount != 1:
+                        state = await _read_state(db_session, session_id)
+                        version = 0 if state is None else state[0]
+                        if version != expected_version:
+                            raise SessionVersionConflictError(
+                                session_id, expected_version, version
+                            )
+                        return
+                    await db_session.execute(
+                        delete(entries).where(entries.c.session_id == session_id)
+                    )
+                    await db_session.execute(
+                        delete(sessions).where(sessions.c.session_id == session_id)
+                    )
+            except SessionStoreError:
+                raise
+            except SQLAlchemyError as error:
+                raise SessionStoreError("could not delete Session from database") from error
 
     async def append(
         self,

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
 from .content import ToolUseContent
-from .json import JSONValue
+from .json import JSONObject, JSONValue
 from .messages import AgentMessage, AssistantMessage, ToolResultMessage, Usage
 from .models import ThinkingLevel
 from .session import SessionEntry
@@ -140,6 +140,35 @@ class MessageUpdateEvent:
     type: Literal["message_update"] = field(default="message_update", init=False)
     assistant_message_event: AssistantMessageEvent
     usage: Usage | None = None
+
+
+@dataclass(frozen=True)
+class ModelRequestStartEvent:
+    """Snapshot of one actual Provider attempt, before dispatch (not HTTP wire data)."""
+
+    type: Literal["model_request_start"] = field(default="model_request_start", init=False)
+    request_id: str
+    turn_id: str
+    attempt: int
+    purpose: Literal["response", "compaction"]
+    started_at: float
+    input: JSONObject
+
+
+@dataclass(frozen=True)
+class ModelRequestEndEvent:
+    """Terminal outcome of an attempt; duration excludes retry backoff."""
+
+    type: Literal["model_request_end"] = field(default="model_request_end", init=False)
+    request_id: str
+    turn_id: str
+    attempt: int
+    purpose: Literal["response", "compaction"]
+    ended_at: float
+    elapsed_ms: float
+    status: Literal["completed", "failed", "cancelled"]
+    response: AssistantMessage | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +349,8 @@ SessionEvent: TypeAlias = (
     | TurnEndEvent
     | MessageBoundaryEvent
     | MessageUpdateEvent
+    | ModelRequestStartEvent
+    | ModelRequestEndEvent
     | ToolExecutionStartEvent
     | ToolExecutionUpdateEvent
     | ToolExecutionEndEvent
