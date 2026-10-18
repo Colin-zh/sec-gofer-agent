@@ -14,7 +14,7 @@
   <a href="https://github.com/Colin-zh/sec-gofer-agent/graphs/contributors"><img src="https://img.shields.io/github/contributors/Colin-zh/sec-gofer-agent?color=blue"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/stargazers"><img src="https://img.shields.io/github/stars/Colin-zh/sec-gofer-agent.svg?logo=github"></a>
   <a href="https://github.com/Colin-zh/sec-gofer-agent/network/members"><img src="https://img.shields.io/github/forks/Colin-zh/sec-gofer-agent.svg?color=blue&logo=github"></a>
-  <a href="https://www.python.org/"><img src="https://upload.wikimedia.org/wikipedia/commons/c/c3/Python-logo-notext.svg" align="right" height="48" width="48" ></a>
+  <a href="https://github.com/Colin-zh/sec-gofer-agent"><img src="docs/images/icon.png" alt="Sec icon" align="right" height="48" width="48"></a>
 </p>
 
 Sec 是一个可编程的 AI Agent SDK，也提供终端聊天 CLI。你可以直接用 CLI 与模型协作，也可以通过 Python Client 将 Sec 集成到自己的应用，或用 Extension 添加工具、命令和运行时能力。
