@@ -201,9 +201,14 @@ commands contributed by enabled extensions. Type `/` for completion.
   Its adjustable execution
   tree groups each local Run, turn, observed model response, tool execution,
   approval wait, and retry from the SDK's actual Run events. The searchable tree
-  shows duration and color-coded status, with expand/collapse controls and
-  previous/next navigation through visible nodes. The detail header shows the
-  selected node's status, timestamp, Session, and recorded model/usage metadata.
+  shows duration and color-coded status, with one icon-only expand/collapse toggle and
+  previous/next navigation through visible nodes. The toggle shows a downward
+  triangle while expanded; collapse switches it to a left-pointing triangle with
+  the same active background as pin/sidebar. Clicking again expands the tree.
+  The detail header shows the
+  selected node's status, duration, timestamp, and recorded token/cache counts in
+  separate labeled fields. Session is not repeated inside the current-session
+  trace browser; detailed usage and IDs remain available in the overview/JSON.
   The default preview displays input and output together; structured payloads
   support expandable fields, JSON text, and copying the sanitized payload.
   Separate tabs retain the overview, observed events, and sanitized raw JSON.
@@ -220,7 +225,13 @@ commands contributed by enabled extensions. Type `/` for completion.
   (response or context compaction), and running/completed/failed/cancelled status.
   Request duration is measured at the actual Provider boundary with a monotonic
   clock and excludes retry backoff. Separate input/output bounds preserve request
-  identity and the response when large inputs require an explicit truncated preview.
+  identity and the response when large inputs require truncation. Truncation
+  retains JSON objects/arrays instead of embedding an escaped partial JSON string;
+  `_trace_truncated`, `omitted_items`, and `[TRUNCATED]` mark omitted content.
+  Adjacent plain text fragments in model payloads are merged before trace limits
+  are applied, including fragmented messages from earlier Session history.
+  The OpenAI adapter also assembles streamed text into one final TextContent
+  block at the source; live text delta events are unchanged.
   Existing traces remain readable; their previously unrecorded fields cannot be
   reconstructed and continue to show “未记录”.
   Token and cost values appear only when present in actual Provider usage;

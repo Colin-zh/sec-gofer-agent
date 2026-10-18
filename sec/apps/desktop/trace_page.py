@@ -6,11 +6,12 @@ from datetime import datetime
 import json
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -255,10 +256,13 @@ class TracePage(QWidget):
         self._search.setAccessibleName("搜索执行树")
         self._search.textChanged.connect(self._filter_tree)
         tree_toolbar.addWidget(self._search, 1)
-        self._expand = QPushButton("展开")
-        self._collapse = QPushButton("折叠")
-        tree_toolbar.addWidget(self._expand)
-        tree_toolbar.addWidget(self._collapse)
+        self._tree_toggle = QPushButton()
+        self._tree_toggle.setObjectName("traceTreeToggle")
+        self._tree_toggle.setCheckable(True)
+        self._tree_toggle.setFixedSize(32, 32)
+        self._tree_toggle.setIconSize(QSize(16, 16))
+        self._tree_toggle.clicked.connect(self._toggle_tree)
+        tree_toolbar.addWidget(self._tree_toggle)
         tree_layout.addLayout(tree_toolbar)
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["执行树", "耗时", "状态"])
@@ -269,8 +273,6 @@ class TracePage(QWidget):
         self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._tree.currentItemChanged.connect(self._node_selection_changed)
-        self._expand.clicked.connect(self._tree.expandAll)
-        self._collapse.clicked.connect(self._tree.collapseAll)
         tree_layout.addWidget(self._tree, 1)
         self._tree_hint = QLabel()
         self._tree_hint.setObjectName("traceMuted")
@@ -279,7 +281,8 @@ class TracePage(QWidget):
 
         detail_pane = QWidget()
         detail_layout = QVBoxLayout(detail_pane)
-        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setContentsMargins(12, 0, 0, 0)
+        detail_layout.setSpacing(12)
         detail_header = QHBoxLayout()
         self._node_title = QLabel()
         self._node_title.setObjectName("traceTitle")
@@ -304,13 +307,36 @@ class TracePage(QWidget):
         self._tree.itemExpanded.connect(self._update_navigation)
         self._tree.itemCollapsed.connect(self._update_navigation)
         detail_layout.addLayout(detail_header)
-        self._metadata = QLabel()
-        self._metadata.setObjectName("traceMuted")
-        self._metadata.setTextFormat(Qt.TextFormat.PlainText)
-        self._metadata.setWordWrap(True)
-        self._metadata.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
+        self._metadata = QWidget()
+        self._metadata.setObjectName("traceMetadata")
+        metadata_layout = QGridLayout(self._metadata)
+        metadata_layout.setContentsMargins(12, 10, 12, 10)
+        metadata_layout.setHorizontalSpacing(18)
+        metadata_layout.setVerticalSpacing(8)
+        self._metadata_fields: dict[str, QLabel] = {}
+        self._metadata_captions: dict[str, QLabel] = {}
+        for index, (key, caption) in enumerate((
+            ("status", "状态"), ("duration", "耗时"),
+            ("started", "开始时间"), ("approval", "审批等待"),
+            ("tokens", "Tokens"), ("cache", "缓存"),
+        )):
+            field = QWidget()
+            field_layout = QVBoxLayout(field)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(3)
+            label = QLabel(caption)
+            label.setObjectName("traceMuted")
+            value = QLabel()
+            value.setTextFormat(Qt.TextFormat.PlainText)
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            field_layout.addWidget(label)
+            field_layout.addWidget(value)
+            metadata_layout.addWidget(field, index // 2, index % 2)
+            self._metadata_fields[key] = value
+            self._metadata_captions[key] = label
+        metadata_layout.setColumnStretch(0, 1)
+        metadata_layout.setColumnStretch(1, 1)
         detail_layout.addWidget(self._metadata)
         self._tabs = QTabWidget()
         self._tabs.setMinimumWidth(220)
@@ -347,6 +373,8 @@ class TracePage(QWidget):
             "color: #3b424d; padding: 8px 10px; text-align: center; }"
             "QPushButton:hover { background: #e6e9ed; }"
             "QPushButton:disabled { color: #9299a3; }"
+            "QPushButton#traceTreeToggle { padding: 0; text-align: center; }"
+            "QPushButton#traceTreeToggle:checked { background: #dfe7f2; }"
             "QTreeWidget, QPlainTextEdit { background: white; color: #202124;"
             "border: 1px solid #e1e4e8; border-radius: 10px;"
             "selection-background-color: #dfe7f2; selection-color: #202124; }"
@@ -363,6 +391,7 @@ class TracePage(QWidget):
             "border: 0; padding: 6px; font-size: 11px; }"
             "QLabel#traceTitle { font-size: 14px; font-weight: 600; color: #222831; }"
             "QLabel#traceMuted { color: #8a9099; font-size: 11px; }"
+            "QWidget#traceMetadata { background: #f0f2f5; border-radius: 10px; }"
             "QScrollArea, QWidget#tracePreview { background: transparent; border: 0; }"
             "QLineEdit { background: white; color: #202124; padding: 10px 12px;"
             "border: 1px solid #dfe3ea; border-radius: 8px; }"
@@ -547,11 +576,30 @@ class TracePage(QWidget):
         return visible
 
     def _update_navigation(self, _item: QTreeWidgetItem | None = None) -> None:
+        branches = [item for item in self._items.values() if item.childCount()]
+        collapsed = bool(branches) and not any(item.isExpanded() for item in branches)
+        self._tree_toggle.setChecked(collapsed)
+        self._tree_toggle.setEnabled(bool(branches))
+        self._tree_toggle.setIcon(control_icon(
+            "tree-collapsed" if collapsed else "tree-expanded",
+        ))
+        label = "展开执行树" if collapsed else "折叠执行树"
+        self._tree_toggle.setToolTip(label)
+        self._tree_toggle.setAccessibleName(label)
         items = self._visible_items()
         current = self._tree.currentItem()
         index = items.index(current) if current in items else -1
         self._previous.setEnabled(index > 0)
         self._next.setEnabled(0 <= index < len(items) - 1)
+
+    def _toggle_tree(self, collapsed: bool) -> None:
+        self._tree.blockSignals(True)
+        if collapsed:
+            self._tree.collapseAll()
+        else:
+            self._tree.expandAll()
+        self._tree.blockSignals(False)
+        self._update_navigation()
 
     def _previous_node(self) -> None:
         self._navigate_node(-1)
@@ -586,22 +634,35 @@ class TracePage(QWidget):
         events = self._store.get_node_events(self._selected_run_id or "", node["node_id"])
         event_data = [_event_data(event) for event in events]
         self._node_title.setText(node["label"])
-        run = self._store.get_run(self._selected_run_id or "")
         details = node["details"]
-        metadata = [
-            f"{_KIND_NAMES.get(node['kind'], node['kind'])} · "
-            f"{_STATUS_NAMES.get(node['status'], node['status'])} · "
-            f"耗时 {_duration(node['elapsed_ms'])}",
-            f"开始 {format_wall_time(node['started_at'])}",
-            f"Session: {run['session_id'] if run else _MISSING}",
-        ]
-        if details.get("model"):
-            metadata.append(f"模型: {details['model']}")
-        if details.get("usage") is not None:
-            metadata.append(f"Usage: {json.dumps(details['usage'], ensure_ascii=False)}")
-        if node["approval_wait_ms"] is not None:
-            metadata.append(f"审批等待: {_duration(node['approval_wait_ms'])}")
-        self._metadata.setText("\n".join(metadata))
+        fields = self._metadata_fields
+        fields["status"].setText(_STATUS_NAMES.get(node["status"], node["status"]))
+        fields["status"].setStyleSheet(
+            f"color: {_STATUS_COLORS.get(node['status'], '#687384')}; font-weight: 600;"
+        )
+        fields["duration"].setText(_duration(node["elapsed_ms"]))
+        fields["started"].setText(format_wall_time(node["started_at"]))
+        fields["approval"].setText(_duration(node["approval_wait_ms"]))
+        fields["approval"].parentWidget().setVisible(node["approval_wait_ms"] is not None)
+        usage = details.get("usage")
+        has_usage = isinstance(usage, dict)
+
+        def amount(key: str) -> str:
+            value = usage.get(key) if has_usage else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return f"{value:,.0f}" if float(value).is_integer() else f"{value:g}"
+            return _MISSING
+
+        fields["tokens"].setText(
+            f"输入 {amount('input')} · 输出 {amount('output')}"
+        )
+        fields["tokens"].setToolTip(f"总计 {amount('total_tokens')}")
+        fields["cache"].setText(
+            f"读取 {amount('cache_read')} · 写入 {amount('cache_write')}"
+        )
+        for key in ("tokens", "cache"):
+            fields[key].parentWidget().setVisible(has_usage)
+        self._metadata.setVisible(True)
         self._metadata.setToolTip(f"Run: {node['run_id']}\nNode: {node['node_id']}")
         self._update_navigation()
         overview = [
@@ -654,7 +715,9 @@ class TracePage(QWidget):
         self._items.clear()
         self._loaded_run_id = None
         self._node_title.setText("选择一个 Run 或执行树节点查看详情。")
-        self._metadata.clear()
+        self._metadata.hide()
+        for value in self._metadata_fields.values():
+            value.clear()
         self._tree_hint.setText("尚无本地 Trace")
         self._input_view.set_value(None)
         self._output_view.set_value(None)

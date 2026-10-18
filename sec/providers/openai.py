@@ -163,9 +163,9 @@ class OpenAIProvider:
                 "OpenAI stream ended without a completed choice"
             )
 
-        content: list[TextContent | ToolUseContent] = [
-            TextContent(text=text) for text in text_parts
-        ]
+        content: list[TextContent | ToolUseContent] = (
+            [TextContent(text="".join(text_parts))] if text_parts else []
+        )
         for index in sorted(tool_calls):
             partial = tool_calls[index]
             if not partial.call_id or not partial.name:

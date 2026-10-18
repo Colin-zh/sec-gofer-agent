@@ -49,5 +49,6 @@ dist/
 .agents/
 .vscode/
 PLAN.md
+TODO.md
 ARCHITECTURE.md
 extensions/

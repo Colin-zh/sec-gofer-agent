@@ -109,8 +109,14 @@ class TracePageTests(unittest.TestCase):
         self.page._tree.setCurrentItem(item)
 
         self.assertEqual(self.page._node_title.text(), "工具 · read_file")
-        self.assertIn("session-a", self.page._metadata.text())
-        self.assertIn("1.30 s", self.page._metadata.text())
+        fields = self.page._metadata_fields
+        self.assertEqual(fields["status"].text(), "已完成")
+        self.assertEqual(fields["duration"].text(), "1.30 s")
+        self.assertTrue(fields["tokens"].parentWidget().isHidden())
+        self.assertTrue(fields["approval"].parentWidget().isHidden())
+        self.assertNotIn("Session", " ".join(
+            label.text() for label in self.page._metadata_captions.values()
+        ))
         self.assertEqual(item.text(1), "1.30 s")
         self.assertEqual(item.text(2), "已完成")
         self.assertEqual(item.toolTip(2), "completed")
@@ -181,9 +187,9 @@ class TracePageTests(unittest.TestCase):
         self.page._search.clear()
         self.assertFalse(self.page._find_tree_item(other).isHidden())
         self.page._tree.setCurrentItem(self.page._tree.topLevelItem(0))
-        self.page._collapse.click()
+        self.page._tree_toggle.click()
         self.assertFalse(self.page._next.isEnabled())
-        self.page._expand.click()
+        self.page._tree_toggle.click()
         self.assertTrue(self.page._next.isEnabled())
         self.page._search.setText("已完成")
         self.assertFalse(self.page._find_tree_item(tool).isHidden())
@@ -198,10 +204,50 @@ class TracePageTests(unittest.TestCase):
         self.page.refresh_runs([])
         self.assertIsNone(self.page._selected_run_id)
         self.assertEqual(self.page._tree.topLevelItemCount(), 0)
-        self.assertEqual(self.page._metadata.text(), "")
+        self.assertTrue(self.page._metadata.isHidden())
+        self.assertTrue(all(
+            label.text() == "" for label in self.page._metadata_fields.values()
+        ))
         self.assertEqual(self.page._input_view._editor.toPlainText(), "未记录")
         self.assertFalse(self.page._next.isEnabled())
         self.assertEqual(self.page._detail_tabs[2].toPlainText(), "未记录")
+
+    def test_tree_toggle_icons_checked_background_and_refresh_state(self) -> None:
+        from sec.apps.desktop.appearance import control_icon
+
+        self.assertFalse(self.page._tree_toggle.isEnabled())
+        turn, _tool = self._add_tool()
+        button = self.page._tree_toggle
+        self.assertEqual(button.text(), "")
+        self.assertFalse(button.isChecked())
+        self.assertEqual(button.accessibleName(), "折叠执行树")
+        self.assertEqual(
+            button.icon().pixmap(16, 16).toImage(),
+            control_icon("tree-expanded").pixmap(16, 16).toImage(),
+        )
+        button.click()
+        self.assertTrue(button.isChecked())
+        self.assertEqual(button.toolTip(), "展开执行树")
+        self.assertEqual(
+            button.icon().pixmap(16, 16).toImage(),
+            control_icon("tree-collapsed").pixmap(16, 16).toImage(),
+        )
+        self.assertFalse(self.page._tree.topLevelItem(0).isExpanded())
+        self.assertFalse(self.page._find_tree_item(turn).isExpanded())
+        self.page.refresh_run("run-current")
+        self.assertTrue(button.isChecked())
+        self.page.show()
+        self.app.processEvents()
+        self.assertEqual(button.grab().toImage().pixelColor(16, 3).name(), "#dfe7f2")
+        button.click()
+        self.assertFalse(button.isChecked())
+        self.assertTrue(self.page._tree.topLevelItem(0).isExpanded())
+        self.assertTrue(self.page._find_tree_item(turn).isExpanded())
+        self.assertNotEqual(button.grab().toImage().pixelColor(16, 3).name(), "#dfe7f2")
+        self.page._tree.collapseAll()
+        self.assertTrue(button.isChecked())
+        self.page._tree.topLevelItem(0).setExpanded(True)
+        self.assertFalse(button.isChecked())
 
     def test_payload_formats_copy_and_empty_values(self) -> None:
         view = TracePayloadView("测试")
@@ -224,6 +270,27 @@ class TracePageTests(unittest.TestCase):
         root = view._tree.topLevelItem(0)
         self.assertEqual(root.child(0).text(0), "nested")
         self.assertEqual(root.child(0).childCount(), 2)
+
+    def test_model_header_groups_usage_and_hides_unrecorded_fields(self) -> None:
+        model = self.store.create_node(
+            "run-current", "run-current", "model", "模型调用 · example", 100,
+            details={"usage": {
+                "input": 7638.0, "output": 1580.0, "total_tokens": 9218.0,
+                "cache_read": 768.0, "cache_write": 0,
+            }},
+        )
+        self.page.refresh_runs(self.store.list_runs(), "run-current")
+        self.page._tree.setCurrentItem(self.page._find_tree_item(model))
+        fields = self.page._metadata_fields
+        self.assertEqual(fields["tokens"].text(), "输入 7,638 · 输出 1,580")
+        self.assertEqual(fields["cache"].text(), "读取 768 · 写入 0")
+        self.assertEqual(fields["tokens"].toolTip(), "总计 9,218")
+        self.assertFalse(fields["tokens"].parentWidget().isHidden())
+        self.assertFalse(fields["cache"].parentWidget().isHidden())
+        self.assertTrue(fields["approval"].parentWidget().isHidden())
+        self.assertEqual(fields["duration"].text(), "未记录")
+        self.page._tree.setCurrentItem(self.page._tree.topLevelItem(0))
+        self.assertTrue(fields["tokens"].parentWidget().isHidden())
 
 
 if __name__ == "__main__":

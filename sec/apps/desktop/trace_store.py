@@ -421,6 +421,30 @@ def _usage_data(usage: Any) -> dict[str, Any] | None:
     return result or None
 
 
+def _merge_trace_text_blocks(blocks: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    text: list[str] = []
+
+    def flush() -> None:
+        if text:
+            result.append({"type": "text", "text": "".join(text)})
+            text.clear()
+
+    for block in blocks:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and block.keys() <= {"type", "text", "text_signature"}
+        ):
+            text.append(block["text"])
+        else:
+            flush()
+            result.append(block)
+    flush()
+    return result
+
+
 def _model_trace_value(value: Any, *, depth: int = 0) -> Any:
     """Exclude reasoning and binary data before applying the normal trace bounds."""
     if depth >= 8:
@@ -438,7 +462,11 @@ def _model_trace_value(value: Any, *, depth: int = 0) -> Any:
             key: (
                 {"omitted": True}
                 if key == "attachments" and value.get("type") == "tool_result"
-                else _model_trace_value(child, depth=depth + 1)
+                else _model_trace_value(
+                    _merge_trace_text_blocks(child)
+                    if key == "content" and isinstance(child, list) else child,
+                    depth=depth + 1,
+                )
             )
             for key, child in list(value.items())[:100]
             if key not in {
@@ -446,14 +474,75 @@ def _model_trace_value(value: Any, *, depth: int = 0) -> Any:
             }
         }
     if isinstance(value, list):
-        return [_model_trace_value(child, depth=depth + 1) for child in value[:100]]
+        retained = value if len(value) <= 100 else value[:99]
+        result = [_model_trace_value(child, depth=depth + 1) for child in retained]
+        if len(retained) < len(value):
+            result.append({
+                "_trace_truncated": True, "omitted_items": len(value) - len(retained),
+            })
+        return result
     return value
 
 
+def _json_size(value: Any) -> int:
+    return len(json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8"))
+
+
+def _bounded_structure(
+    value: Any, budget: int, *, preserve_recent: bool = False,
+) -> Any:
+    """Fit redacted JSON without serializing a partial document inside a string."""
+    if _json_size(value) <= budget:
+        return value
+    if isinstance(value, str):
+        suffix = "…[TRUNCATED]"
+        low, high = 0, len(value)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if _json_size(value[:middle] + suffix) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        return value[:low] + suffix
+    if isinstance(value, dict):
+        result: dict[str, Any] = {"_trace_truncated": True}
+        items = list(value.items())
+        for index, (key, child) in enumerate(items):
+            overhead = _json_size({key: None}) - 4
+            remaining = budget - _json_size(result) - overhead - 1
+            allowance = remaining // (len(items) - index)
+            if allowance < 64:
+                break
+            result[key] = _bounded_structure(
+                child, allowance, preserve_recent=key == "messages",
+            )
+        return result
+    if isinstance(value, list):
+        result_list: list[Any] = []
+        count = min(len(value), max(1, budget // 512))
+        selected = (
+            [value[0], *value[-(count - 1):]]
+            if preserve_recent and 1 < count < len(value) else value[:count]
+        )
+        marker = {"_trace_truncated": True, "omitted_items": len(value) - count}
+        if budget - _json_size(marker) - 4 < count * 64:
+            return [{"_trace_truncated": True, "omitted_items": len(value)}]
+        for index, child in enumerate(selected):
+            remaining = budget - _json_size(result_list) - _json_size(marker) - 2
+            allowance = remaining // (count - index)
+            result_list.append(_bounded_structure(child, allowance))
+        if count < len(value):
+            result_list.insert(1 if preserve_recent and count > 1 else count, marker)
+        return result_list
+    return {"_trace_truncated": True}
+
+
 def _model_trace_payload(value: Any) -> Any:
-    return json.loads(_json_text(
-        _model_trace_value(value), max_bytes=_MAX_JSON_BYTES // 3,
-    ))
+    return _bounded_structure(
+        redact_value(_model_trace_value(value)), _MAX_JSON_BYTES // 3,
+    )
 
 
 @dataclass

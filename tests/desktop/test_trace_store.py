@@ -279,7 +279,9 @@ class TraceStoreTests(unittest.TestCase):
         ))
         model = self.store.get_tree(recorder.run_id)[0]["children"][0]["children"][0]
         self.assertEqual(model["details"]["request_id"], "request-large")
-        self.assertTrue(model["details"]["input"]["truncated"])
+        self.assertTrue(model["details"]["input"]["_trace_truncated"])
+        self.assertIsInstance(model["details"]["input"]["messages"], list)
+        self.assertNotIn("preview", model["details"]["input"])
         self.assertEqual(model["details"]["output"]["content"][0]["text"], "finished")
         self.assertIsNone(model["details"]["usage"])
         self.assertIsNone(model["details"]["output"]["usage"])
@@ -289,6 +291,76 @@ class TraceStoreTests(unittest.TestCase):
                 (model["node_id"],),
             ).fetchone()[0]
         self.assertLessEqual(len(encoded.encode("utf-8")), 16384)
+
+    def test_fragmented_history_text_is_merged_before_trace_limits(self) -> None:
+        from sec.apps.desktop.trace_store import _model_trace_payload
+
+        fragments = [{"type": "text", "text": f"{i} "} for i in range(150)]
+        payload = _model_trace_payload({"messages": [{
+            "role": "assistant", "content": [
+                *fragments,
+                {"type": "tool_use", "id": "call-1", "name": "lookup", "arguments": {}},
+                {"type": "text", "text": "after"},
+            ],
+        }]})
+        content = payload["messages"][0]["content"]
+        self.assertEqual(len(content), 3)
+        self.assertEqual(content[0]["text"], "".join(f"{i} " for i in range(150)))
+        self.assertEqual(content[1]["type"], "tool_use")
+        self.assertEqual(content[2]["text"], "after")
+
+    def test_structural_truncation_is_valid_bounded_redacted_json(self) -> None:
+        import json
+        from sec.apps.desktop.trace_store import _model_trace_payload
+
+        for text in ('测"试\\\n' * 5000, "plain" * 5000, "short"):
+            with self.subTest(text_length=len(text)):
+                payload = _model_trace_payload({
+                    "messages": [
+                        {"role": "user", "content": text, "api_key": "never-persist"}
+                        for _ in range(30)
+                    ],
+                    "tools": [{"name": "lookup", "description": text}],
+                })
+                encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                self.assertLessEqual(len(encoded.encode("utf-8")), 16384 // 3)
+                self.assertNotIn("never-persist", encoded)
+                self.assertIsInstance(payload["messages"], list)
+                self.assertIsInstance(payload["tools"], list)
+                self.assertNotIn("preview", payload)
+                self.assertEqual(json.loads(encoded), payload)
+        payload = _model_trace_payload({"messages": [{
+            "role": "user", "content": "a" * 8000,
+        }]})
+        self.assertIn("[TRUNCATED]", payload["messages"][0]["content"])
+        payload = _model_trace_payload({"messages": [
+            {"role": "user", "content": f"message-{i} " + "x" * 4000}
+            for i in range(30)
+        ]})
+        messages = payload["messages"]
+        self.assertTrue(messages[0]["content"].startswith("message-0 "))
+        self.assertTrue(messages[-1]["content"].startswith("message-29 "))
+        self.assertGreater(messages[1]["omitted_items"], 0)
+        self.assertNotIn("preview", payload)
+
+    def test_structural_budget_handles_nested_arrays_and_escaped_unicode(self) -> None:
+        import json
+        from sec.apps.desktop.trace_store import _bounded_structure
+
+        values = (
+            [{"nested": [["测\n\"\\" * 1000] * 10]}] * 10,
+            {"long": "测\n\"\\" * 1000, "list": list(range(100))},
+            [{"field": {"inner": "x" * 10000}}] * 100,
+        )
+        for budget in (64, 128, 256, 1024, 5461):
+            for value in values:
+                with self.subTest(budget=budget, kind=type(value).__name__):
+                    encoded = json.dumps(
+                        _bounded_structure(value, budget),
+                        ensure_ascii=False, separators=(",", ":"),
+                    )
+                    self.assertLessEqual(len(encoded.encode("utf-8")), budget)
+                    self.assertIsInstance(json.loads(encoded), (dict, list))
 
 
 class ModelTraceRunTests(unittest.IsolatedAsyncioTestCase):

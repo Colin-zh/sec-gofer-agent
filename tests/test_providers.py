@@ -508,6 +508,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         stream = FakeOpenAIStream(
             [
                 openai_chunk(text_delta("Hello ")),
+                openai_chunk(text_delta("streaming ")),
+                openai_chunk(text_delta("world")),
                 openai_chunk(
                     SimpleNamespace(
                         content=None,
@@ -575,7 +577,15 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0].text, "Hello ")
         self.assertIsInstance(events[-1], ModelResponseCompleted)
         response = events[-1].message
-        self.assertEqual(response.text, "Hello ")
+        self.assertEqual(response.text, "Hello streaming world")
+        self.assertEqual(
+            [block for block in response.content if isinstance(block, TextContent)],
+            [TextContent("Hello streaming world")],
+        )
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ModelTextDelta)],
+            ["Hello ", "streaming ", "world"],
+        )
         self.assertEqual(response.tool_uses[0].id, "call-1")
         self.assertEqual(response.tool_uses[0].arguments, {"city": "Paris"})
         self.assertEqual(response.usage.input, 4)
