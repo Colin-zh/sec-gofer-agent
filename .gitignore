@@ -47,6 +47,7 @@ dist/
 *.swo
 
 .agents/
+.vscode/
 PLAN.md
 ARCHITECTURE.md
 extensions/
