@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/icon.png" alt="Sec icon" width="96">
+</p>
+
 <h1 align="center">Sec</h1>
 
 <p align="center"><strong>Your gofer. A second you, in a second.</strong></p>
