@@ -1,0 +1,42 @@
+[project]
+name = "sec-gofer-agent"
+version = "0.1.0"
+description = "Your gofer. A second you, in a second."
+readme = "README.md"
+authors = [
+    { name = "Colin-zh", email = "colin_zh@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.22.1",
+    "anthropic>=1.13.0",
+    "openai>=3.29.0",
+    "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
+    "sqlalchemy[asyncio]>=2.0.48,<2.1",
+]
+
+[project.optional-dependencies]
+desktop = [
+    "PySide6>=6.8.0",
+]
+opengauss = [
+    "asyncpg>=0.30.0",
+    "opengauss-sqlalchemy>=2.4.0",
+]
+
+[project.scripts]
+sec = "sec.__main__:main"
+sec-desktop = "sec.apps.desktop:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
+
+# pyproject.toml
+[tool.uv.build-backend]
+module-name = "sec"
+module-root = "."
+source-exclude = [
+    "**/.DS_Store",
+]

@@ -1,0 +1,52 @@
+.env
+
+# Keep the checked-in template, but ignore local environment overrides/secrets.
+.env.*
+!.env.example
+
+# Sec runtime state (database, traces, hooks, skills, artifacts).
+.sec/
+
+# Python bytecode and virtual environments.
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+
+# Test, type-checker, and linter caches.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and package artifacts.
+build/
+dist/
+*.egg-info/
+
+# Local database files.
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# Logs and OS/editor detritus.
+*.log
+.DS_Store
+.idea/
+*.swp
+*.swo
+
+.agents/
+PLAN.md
+ARCHITECTURE.md
+extensions/
