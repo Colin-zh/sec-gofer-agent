@@ -13,6 +13,8 @@ from sec._runtime.harness import Harness
 from sec._types.content import TextContent, ThinkingContent, ToolUseContent
 from sec._types.events import (
     AssistantDoneEvent,
+    CapabilitySnapshotEvent,
+    DelegationEvent,
     EmptySessionEvent,
     MessageBoundaryEvent,
     MessageUpdateEvent,
@@ -35,6 +37,24 @@ class TraceStoreTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / ".sec" / "desktop-traces.sqlite3"
         self.store = TraceStore(self.path)
+
+    def test_capability_versions_and_child_run_links_are_persisted(self) -> None:
+        recorder = TraceRecorder(self.store, "parent", "session")
+        recorder.record(CapabilitySnapshotEvent(
+            generation=3, agent_id="reviewer", card_digest="digest",
+            loaded_skills=("review",), tool_names=("read",),
+        ))
+        recorder.record(DelegationEvent(
+            parent_run_id="parent", child_run_id="child",
+            child_session_id="child-session", agent_id="writer", status="started",
+        ))
+        events = self.store.get_node_events("parent", "parent")
+        self.assertEqual([item.event_type for item in events], [
+            "capability_snapshot", "agent_delegation",
+        ])
+        self.assertEqual(events[0].payload["generation"], 3)
+        self.assertEqual(events[0].payload["loaded_skills"], ["review"])
+        self.assertEqual(events[1].payload["child_session_id"], "child-session")
 
     def test_trace_persists_event_tree_and_redacts_bounded_tool_payloads(self) -> None:
         recorder = TraceRecorder(self.store, "run-1234", "session-5678")

@@ -12,6 +12,7 @@ from uuid import uuid4
 from typing import Any
 
 from sec._runtime.budget import Budget
+from sec._runtime.capabilities import CapabilityBinding
 from sec._runtime.control import RunControl
 from sec._runtime.loop import run_loop
 from sec._runtime.event_stream import (
@@ -109,6 +110,7 @@ class Harness:
         prompt: str,
         *,
         session: Session | None = None,
+        capabilities: CapabilityBinding | None = None,
     ) -> Run:
         """在当前事件循环中启动 Run，并返回可观察、可控制的句柄。"""
         loop = asyncio.get_running_loop()
@@ -138,6 +140,7 @@ class Harness:
                     state,
                     self._before_run_hooks,
                     self._after_run_hooks,
+                    capabilities,
                 ),
                 name=f"agent-run-{active_session.id}",
             )
@@ -158,6 +161,7 @@ class Harness:
         state: RunState,
         before_run_hooks: tuple[BeforeRunHook, ...],
         after_run_hooks: tuple[AfterRunHook, ...],
+        capabilities: CapabilityBinding | None = None,
     ) -> RunResult:
         """执行 Agent 循环，并在所有退出路径发布 Run 终态事件。"""
         try:
@@ -171,6 +175,8 @@ class Harness:
             error: BaseException | None = None
             status: RunTerminalStatus
             try:
+                if capabilities is not None and capabilities.initialize is not None:
+                    await capabilities.initialize()
                 for hook in before_run_hooks:
                     await _call_hook(hook, hook_context)
                 result = await run_loop(
@@ -186,6 +192,7 @@ class Harness:
                     metrics=metrics,
                     prompt=prompt,
                     context_builder=self._context_builder,
+                    capabilities=capabilities,
                 )
                 hook_errors = event_stream.take_hook_errors()
                 if hook_errors:
@@ -227,6 +234,11 @@ class Harness:
             for hook in after_run_hooks:
                 try:
                     await _call_hook(hook, outcome)
+                except Exception as exc:
+                    hook_errors.append(exc)
+            if capabilities is not None and capabilities.finalize is not None:
+                try:
+                    await capabilities.finalize()
                 except Exception as exc:
                     hook_errors.append(exc)
             if hook_errors:

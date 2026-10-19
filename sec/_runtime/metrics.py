@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from sec._types.messages import AssistantMessage, Message
-from sec._types.results import RunUsage
+from sec._types.results import RunUsage, RunResult
 
 
 class RunMetricsAccumulator:
@@ -73,6 +73,22 @@ class RunMetricsAccumulator:
             unreported_responses=self._unreported_responses,
             unreported_attempts=self._unreported_attempts,
         )
+
+    def merge_child(self, result: RunResult) -> None:
+        self.model_calls += result.model_calls
+        self.model_attempts += result.model_attempts
+        self.retries += result.retries
+        self.tool_calls += result.tool_calls
+        self.tool_attempts += result.tool_attempts
+        self.tool_retries += result.tool_retries
+        usage = result.usage
+        if usage.input_tokens is not None:
+            self._input_tokens = (self._input_tokens or 0) + usage.input_tokens
+        if usage.output_tokens is not None:
+            self._output_tokens = (self._output_tokens or 0) + usage.output_tokens
+        self._reported_responses += usage.reported_responses
+        self._unreported_responses += usage.unreported_responses
+        self._unreported_attempts += usage.unreported_attempts
 
 def _read_token_count(value: float) -> int | None:
     if isinstance(value, bool) or value < 0:

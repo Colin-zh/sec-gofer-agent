@@ -1,6 +1,12 @@
 """Convenient re-exports of the stable SDK surface."""
 
 from sec.apis import (
+    AgentCard,
+    AgentCatalog,
+    ReloadReport,
+    ToolOutput,
+    CapabilitySnapshotEvent,
+    DelegationEvent,
     AsyncSecClient,
     AgentMessage,
     AgentSettings,
@@ -100,6 +106,12 @@ from sec.apis import (
 )
 
 __all__ = [
+    "AgentCard",
+    "AgentCatalog",
+    "ReloadReport",
+    "ToolOutput",
+    "CapabilitySnapshotEvent",
+    "DelegationEvent",
     "AgentMessage",
     "AsyncSecClient",
     "SecClient",

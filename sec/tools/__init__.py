@@ -4,13 +4,14 @@
 sec.tools.tool，名称注册与查找位于 sec.tools.registry。
 """
 
-from sec.tools.tool import Tool, ToolDefinition, ToolRiskLevel, tool
+from sec.tools.tool import Tool, ToolDefinition, ToolOutput, ToolRiskLevel, tool
 from sec.tools.registry import ToolRegistry
 from sec.tools._builtins import create_builtin_tools
 
 __all__ = [
     "Tool",
     "ToolDefinition",
+    "ToolOutput",
     "ToolRegistry",
     "ToolRiskLevel",
     "create_builtin_tools",

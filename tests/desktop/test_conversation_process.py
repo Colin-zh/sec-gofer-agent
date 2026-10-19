@@ -1,12 +1,32 @@
 import unittest
+from unittest.mock import patch
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint
 from PySide6.QtWidgets import QApplication
 
 from sec.apps.desktop.conversation import Conversation
 
 
 class ConversationProcessTests(unittest.TestCase):
+    def test_cleared_conversation_can_be_destroyed_before_deferred_children(self) -> None:
+        import gc
+        import weakref
+
+        chat = Conversation()
+        chat.add_message("user", "Request")
+        chat.add_message("assistant", "Answer")
+        chat.clear()
+        reference = weakref.ref(chat)
+        chat.close()
+        del chat
+        gc.collect()
+        with patch("sys.excepthook") as callback_error:
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+            callback_error.assert_not_called()
+        gc.collect()
+        self.assertIsNone(reference())
+
     def test_user_navigation_and_return_to_bottom_preserve_content(self) -> None:
         chat = Conversation()
         chat.resize(650, 360)

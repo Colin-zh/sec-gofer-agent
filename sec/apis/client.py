@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import replace
+from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import NoSuchModuleError
 
 from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
 from sec.agent import Agent, Run, Session
@@ -36,8 +40,26 @@ from sec._types.providers import ModelProvider, StreamingModelProvider
 from sec._types.session import SessionEntry, SessionInfoEntry, SessionSnapshot, SessionSummary
 from sec._types.storage import SessionStoreProtocol
 from sec.storage import Database, SessionStore
-from sec.exceptions import SecUIHandlerError
+from sec.exceptions import RecoverableToolError, SecUIHandlerError
 from sec.tools import Tool, tool
+from sec.agent.card import AgentCard
+from sec.resources.agents import AgentCatalog
+from sec.resources.markdown import ResourceManager
+from sec._runtime.capabilities import (
+    CapabilityBinding, CapabilitySnapshot, ReloadReport, RunAllowance,
+)
+from sec._types.session import CustomEntry
+from sec._runtime.resource_settings import (
+    read_worker_extensions, validate_extension_names, write_worker_extensions,
+)
+
+if TYPE_CHECKING:
+    from sec.extensions.worker import WorkerExtensionManager
+    from sec.integrations.mcp import MCPManager
+
+
+class _AsyncResource(Protocol):
+    async def aclose(self) -> None: ...
 
 
 def create_provider(
@@ -78,18 +100,32 @@ def create_database(config: Config) -> Database | None:
             "for the database backend"
         )
     schema = config.storage.database_schema
-    if schema is None:
-        return Database(database_url)
-
     parsed_url = database_url if isinstance(database_url, URL) else make_url(database_url)
-    if parsed_url.drivername != "opengauss+asyncpg":
+    if schema is not None and parsed_url.drivername != "opengauss+asyncpg":
         raise ConfigError(
             "SEC_DATABASE_SCHEMA currently requires the opengauss+asyncpg database driver"
         )
-    return Database(
-        database_url,
-        connect_args={"server_settings": {"search_path": schema}},
-    )
+    try:
+        if schema is None:
+            return Database(database_url)
+        return Database(
+            database_url,
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+    except (NoSuchModuleError, ModuleNotFoundError) as error:
+        if parsed_url.drivername != "opengauss+asyncpg":
+            raise
+        if isinstance(error, ModuleNotFoundError) and error.name not in {
+            "asyncpg", "opengauss", "opengauss_sqlalchemy",
+        }:
+            raise
+        raise ConfigError(
+            "The opengauss+asyncpg database driver requires the openGauss optional "
+            "dependencies in the environment running SEC. Install "
+            "'sec-gofer-agent[desktop,opengauss]', or in a source checkout run "
+            "'uv sync --extra desktop --extra opengauss'. Preserve both extras "
+            "when syncing again."
+        ) from error
 
 
 def create_session_store(
@@ -199,8 +235,8 @@ class _SecClientCore:
 
     def __init__(
         self,
-        name: str,
-        instructions: str,
+        name: str = "assistant",
+        instructions: str = "You are Sec, a helpful assistant.",
         *,
         provider: ProviderName | None = None,
         model: str | None = None,
@@ -232,6 +268,9 @@ class _SecClientCore:
         store: SessionStoreProtocol | None = None,
         database: Database | None = None,
         enabled_extensions: Iterable[str] = (),
+        workspace: str | Path | None = None,
+        agent_id: str | None = None,
+        worker_extensions: Iterable[str] | None = None,
     ) -> None:
         if session is not None and any(
             value is not None for value in (session_id, store, database)
@@ -266,6 +305,31 @@ class _SecClientCore:
         self._extension_manager = ExtensionManager()
         self._extension_catalog: ExtensionCatalog | None = None
         self._closed = False
+        self._workspace = None if workspace is None else Path(workspace).expanduser().resolve()
+        if agent_id is not None and self._workspace is None:
+            raise ValueError("agent_id requires a workspace")
+        self._selected_agent_id = agent_id or "default"
+        self._pending_agent_id: str | None = None
+        self._resources: ResourceManager | None = None
+        self._resource_activation_path: Path | None = None
+        self._capabilities: CapabilitySnapshot | None = None
+        self._mcp_manager: MCPManager | None = None
+        self._worker_manager: WorkerExtensionManager | None = None
+        self._worker_extensions = (
+            read_worker_extensions(self._workspace)
+            if worker_extensions is None and self._workspace is not None
+            else validate_extension_names(tuple(worker_extensions or ()))
+        )
+        self._worker_config_override = (
+            None if worker_extensions is None else self._worker_extensions
+        )
+        if self._worker_extensions and self._workspace is None:
+            raise ValueError("worker_extensions requires a workspace")
+        self._retired_managers: list[_AsyncResource] = []
+        self._reload_lock = asyncio.Lock()
+        self._resource_mutation_lock = asyncio.Lock()
+        self._revoked_capabilities: set[str] = set()
+        self._known_capability_names: set[str] = set()
         explicit_values: dict[str, str] = {}
         for key, value in (
             ("SEC_PROVIDER", provider),
@@ -369,6 +433,9 @@ class _SecClientCore:
                 self._extension_catalog,
             )
             self._config = config
+            if self._workspace is not None:
+                await self._reload_resources()
+                self._restore_agent_selection(self.session)
         except BaseException as initialization_error:
             try:
                 await self._close()
@@ -411,6 +478,8 @@ class _SecClientCore:
                 session = await Session.restore(store, session_id)
                 if not session.entries:
                     raise KeyError(f"Session {session_id!r} was not found")
+            if self._capabilities is not None:
+                self._restore_agent_selection(session)
             self._session = session
             self._session_id = session.id
             return session
@@ -500,6 +569,435 @@ class _SecClientCore:
         return self._agent
 
     @property
+    def resources(self) -> ResourceManager:
+        if self._resources is None:
+            raise RuntimeError("resource discovery requires an initialized workspace Client")
+        return self._resources
+
+    @property
+    def agent_cards(self) -> tuple[AgentCard, ...]:
+        return () if self._capabilities is None else self._capabilities.cards
+
+    @property
+    def selected_agent_id(self) -> str:
+        return self._selected_agent_id
+
+    @property
+    def pending_agent_id(self) -> str | None:
+        return self._pending_agent_id
+
+    @property
+    def worker_extensions(self) -> tuple[str, ...]:
+        return self._worker_extensions
+
+    @property
+    def available_tools(self) -> tuple[Tool, ...]:
+        return self.agent.tools if self._capabilities is None else self._capabilities.tools
+
+    @property
+    def capability_generation(self) -> int:
+        return 0 if self._capabilities is None else self._capabilities.generation
+
+    @property
+    def mcp_statuses(self) -> tuple:
+        return () if self._mcp_manager is None else self._mcp_manager.statuses
+
+    @property
+    def worker_statuses(self) -> tuple:
+        return () if self._worker_manager is None else self._worker_manager.statuses
+
+    def _current_capabilities(self) -> CapabilitySnapshot:
+        if self._capabilities is None:
+            raise RuntimeError("workspace capabilities are not initialized")
+        return self._capabilities
+
+    def _restore_agent_selection(self, session: Session) -> None:
+        selected = "default"
+        for entry in session.snapshot.active_path:
+            if (
+                isinstance(entry, CustomEntry)
+                and entry.custom_type == "sec.agent_selection"
+                and isinstance(entry.data, dict)
+                and isinstance(entry.data.get("agent_id"), str)
+            ):
+                selected = entry.data["agent_id"]
+        if any(
+            isinstance(entry, CustomEntry) and entry.custom_type == "sec.agent_selection"
+            for entry in session.snapshot.active_path
+        ):
+            self._current_capabilities().card(selected)
+            self._selected_agent_id = selected
+        self._current_capabilities().card(self._selected_agent_id)
+        self._pending_agent_id = None
+
+    async def _record_agent_selection(self, agent_id: str) -> None:
+        card = self._current_capabilities().card(agent_id)
+        await self.session.append_entry(CustomEntry(
+            id=uuid4().hex, parent_id=self.session.active_leaf_id,
+            timestamp=time.time(), custom_type="sec.agent_selection",
+            data={"agent_id": agent_id, "digest": card.digest},
+        ))
+        self._selected_agent_id = agent_id
+        if self._pending_agent_id == agent_id:
+            self._pending_agent_id = None
+
+    async def _select_agent(self, agent_id: str) -> None:
+        if self._closed:
+            raise RuntimeError("SecClient is closed")
+        if self._session_switching:
+            raise RuntimeError("cannot select an agent while switching Sessions")
+        async with self._resource_mutation_lock:
+            self._current_capabilities().card(agent_id)
+            if self.session.is_busy:
+                self._pending_agent_id = agent_id
+            else:
+                await self._record_agent_selection(agent_id)
+
+    async def _reload_resources(
+        self, *, worker_extensions: tuple[str, ...] | None = None,
+    ) -> ReloadReport:
+        if self._workspace is None or self._config is None:
+            raise RuntimeError("resource reload requires an initialized workspace Client")
+        if self._closed:
+            raise RuntimeError("SecClient is closed")
+        from sec.integrations.mcp import MCPManager
+        from sec.extensions.worker import WorkerExtensionManager
+
+        async with self._reload_lock:
+            if self._closed:
+                raise RuntimeError("SecClient is closed")
+            desired_workers = worker_extensions
+            if desired_workers is None:
+                desired_workers = (
+                    self._worker_config_override
+                    if self._worker_config_override is not None
+                    else read_worker_extensions(self._workspace)
+                )
+            if set(desired_workers).intersection(self._enabled_extensions):
+                raise ValueError("an extension cannot be enabled both in-process and in a worker")
+            activation_path = self._workspace / ".sec" / "resources.json"
+            legacy_path = self._workspace / ".sec" / "desktop-resources.json"
+            if not activation_path.exists() and legacy_path.exists():
+                activation_path = legacy_path
+            resources = ResourceManager(
+                self._workspace,
+                activation_path=activation_path,
+            )
+            resources.reload(strict=True)
+            catalog = AgentCatalog(self._workspace)
+            catalog.reload()
+            builtin = AgentCard(
+                id="default", name=self._name,
+                description="Default workspace assistant",
+                instructions=self._instructions,
+                tools=("*",), skills=("*",), mcp_servers=("*",), extensions=("*",),
+                max_model_calls=self._config.agent.max_model_calls,
+                max_tool_calls=self._config.agent.max_tool_calls,
+            )
+            if catalog.get("default") is not None:
+                raise ValueError("AgentCard ID 'default' is reserved")
+            mcp = MCPManager(self._workspace)
+            workers = WorkerExtensionManager()
+            try:
+                await mcp.reload()
+                await workers.reload(desired_workers)
+                if self._closed:
+                    raise RuntimeError("SecClient closed while resources were being prepared")
+                tools = tuple(
+                    replace(registered, definition=deepcopy(registered.definition))
+                    for registered in (*self.agent.tools, *mcp.tools, *workers.tools)
+                )
+                names = [item.definition.name for item in tools]
+                if len(names) != len(set(names)) or set(names).intersection({
+                    "skills_load", "capabilities_search", "agents_delegate",
+                }):
+                    raise ValueError("duplicate or reserved capability tool name")
+                previous = self._capabilities
+                candidate = CapabilitySnapshot(
+                    1 if previous is None else previous.generation + 1,
+                    (builtin, *catalog.cards), resources.snapshot.skills, tuple(tools),
+                    resources.snapshot.prompts,
+                )
+                candidate.card(self._selected_agent_id)
+                if self._pending_agent_id is not None:
+                    candidate.card(self._pending_agent_id)
+                before = {} if previous is None else previous.inventory()
+                after = candidate.inventory()
+            except BaseException as error:
+                cleanup: list[BaseException] = []
+                await _attempt_cleanup(cleanup, workers.aclose)
+                await _attempt_cleanup(cleanup, mcp.aclose)
+                if cleanup:
+                    raise BaseExceptionGroup(
+                        "resource preparation and candidate cleanup failed", [error, *cleanup],
+                    ) from None
+                raise
+            self._retired_managers.extend(
+                manager for manager in (self._mcp_manager, self._worker_manager)
+                if manager is not None
+            )
+            self._mcp_manager, self._worker_manager = mcp, workers
+            self._worker_extensions = desired_workers
+            self._resources = resources
+            self._resource_activation_path = activation_path
+            self._capabilities = candidate
+            self._known_capability_names.update(names)
+            if not self.session.is_busy:
+                await self._close_retired_managers()
+            return ReloadReport(
+                generation=candidate.generation,
+                added=tuple(sorted(after.keys() - before.keys())),
+                updated=tuple(sorted(
+                    key for key in after.keys() & before.keys()
+                    if after[key] != before[key] or any(
+                        tool.source.startswith("worker/")
+                        and key == f"tool/{tool.definition.name}"
+                        for tool in candidate.tools
+                    )
+                )),
+                removed=tuple(sorted(before.keys() - after.keys())),
+                pending=("active request and its tool batch retain their original generation",)
+                if self.session.is_busy else (),
+                issues=tuple(str(issue) for issue in (*resources.snapshot.issues, *catalog.issues)),
+            )
+
+    async def _close_retired_managers(self) -> None:
+        retired, self._retired_managers = self._retired_managers, []
+        errors: list[BaseException] = []
+        for manager in reversed(retired):
+            await _attempt_cleanup(errors, manager.aclose)
+        if errors:
+            raise BaseExceptionGroup("retired capability resources failed to close", errors)
+
+    async def _refresh_changed_capabilities(self) -> None:
+        if self._mcp_manager is not None and self._mcp_manager.dirty:
+            async with self._resource_mutation_lock:
+                if self._mcp_manager is not None and self._mcp_manager.dirty:
+                    await self._reload_resources()
+
+    async def _finalize_capabilities(self) -> None:
+        async with self._resource_mutation_lock:
+            await self._close_retired_managers()
+
+    async def _revoke_capability(self, name: str) -> None:
+        if name not in self._known_capability_names:
+            raise ValueError(f"unknown capability: {name!r}")
+        self._revoked_capabilities.add(name)
+
+    async def _set_resource_enabled(self, kind: str, name: str, enabled: bool) -> ReloadReport:
+        if kind not in {"skill", "prompt"}:
+            raise ValueError(f"unsupported resource kind: {kind!r}")
+        resource_kind: Literal["skill", "prompt"] = "skill" if kind == "skill" else "prompt"
+        async with self._resource_mutation_lock:
+            if self._workspace is None:
+                raise RuntimeError("resource configuration requires a workspace")
+            manager = ResourceManager(
+                self._workspace, activation_path=self._resource_activation_path,
+            )
+            manager.reload(strict=True)
+            previous = manager.is_enabled(resource_kind, name)
+            before_snapshot = self._capabilities
+            manager.set_enabled(resource_kind, name, enabled)
+            try:
+                return await self._reload_resources()
+            except BaseException as error:
+                if self._capabilities is not before_snapshot:
+                    raise
+                try:
+                    manager.set_enabled(resource_kind, name, previous)
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "resource update and activation rollback failed", [error, rollback_error],
+                    ) from None
+                raise
+
+    async def _set_worker_extensions(self, names: Iterable[str]) -> ReloadReport:
+        async with self._resource_mutation_lock:
+            if self._workspace is None:
+                raise RuntimeError("worker extensions require a workspace")
+            previous = self._worker_extensions
+            before_snapshot = self._capabilities
+            desired = validate_extension_names(tuple(names))
+            if set(desired).intersection(self._enabled_extensions):
+                raise ValueError("an extension cannot be enabled both in-process and in a worker")
+            write_worker_extensions(self._workspace, desired)
+            try:
+                report = await self._reload_resources(worker_extensions=desired)
+                self._worker_config_override = None
+                return report
+            except BaseException as error:
+                if self._capabilities is not before_snapshot:
+                    self._worker_config_override = None
+                    raise
+                self._worker_extensions = previous
+                try:
+                    write_worker_extensions(self._workspace, previous)
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "worker update and configuration rollback failed", [error, rollback_error],
+                    ) from None
+                raise
+
+    async def _set_mcp_enabled(self, server_id: str, enabled: bool) -> ReloadReport:
+        if not isinstance(enabled, bool):
+            raise TypeError("MCP enabled must be a boolean")
+        async with self._resource_mutation_lock:
+            manager = self._mcp_manager
+            if manager is None:
+                raise RuntimeError("MCP configuration requires an initialized workspace Client")
+            try:
+                configuration = json.loads(manager.config_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                raise ValueError(f"MCP server {server_id!r} is not configured") from None
+            if not isinstance(configuration, dict):
+                raise ValueError("MCP configuration must be an object")
+            container = "servers" if "servers" in configuration else "mcpServers"
+            servers = configuration.get(container)
+            if (
+                not isinstance(servers, dict)
+                or server_id not in servers
+                or not isinstance(servers[server_id], dict)
+            ):
+                raise ValueError(f"MCP server {server_id!r} is not configured")
+            desired = deepcopy(configuration)
+            desired[container][server_id]["enabled"] = enabled
+            before = self._capabilities
+            manager.update_configuration(desired)
+            try:
+                return await self._reload_resources()
+            except BaseException as error:
+                if self._capabilities is not before:
+                    raise
+                try:
+                    manager.update_configuration(configuration)
+                except BaseException as rollback_error:
+                    raise BaseExceptionGroup(
+                        "MCP update and configuration rollback failed", [error, rollback_error],
+                    ) from None
+                raise
+
+    async def _delegate_agent(
+        self, agent_id: str, task: str, parent: CapabilityBinding,
+    ) -> str:
+        from sec._types.approvals import ToolApprovalRequest
+        from sec._types.events import (
+            DelegationEvent, ModelRequestStartEvent, ModelRequestEndEvent,
+            ToolApprovalRequestedEvent, ToolApprovalResolvedEvent,
+            ToolExecutionStartEvent, ToolExecutionEndEvent,
+        )
+        if self._harness is None or parent.context is None or parent.identity is None:
+            raise RuntimeError("delegation requires an active parent Run")
+        if not task.strip():
+            raise ValueError("delegation task must not be empty")
+        ancestors = (*parent.ceiling, parent.identity)
+        depth = parent.depth + 1
+        if any(depth > ancestor.max_depth for ancestor in ancestors):
+            raise RecoverableToolError("agent delegation depth limit reached")
+        card = self._current_capabilities().card(agent_id)
+        binding = CapabilityBinding(
+            latest=parent.latest, agent_id=agent_id, fallback=parent.fallback,
+            allowance=parent.allowance, revoked=parent.revoked,
+            delegate=self._delegate_agent, depth=depth, ceiling=ancestors, identity=card,
+            refresh=self._refresh_changed_capabilities,
+        )
+        control, events = parent.context
+        child_session = Session(store=self._store)
+        async def initialize_child() -> None:
+            await child_session.append_entry(CustomEntry(
+                id=uuid4().hex, parent_id=child_session.active_leaf_id,
+                timestamp=time.time(), custom_type="sec.agent_selection",
+                data={"agent_id": agent_id, "digest": card.digest,
+                      "parent_run_id": events.run_id},
+            ))
+        binding.initialize = initialize_child
+        child = self._harness.run(
+            self.agent, task, session=child_session, capabilities=binding,
+        )
+        def publish(status: Literal["started", "completed", "failed", "cancelled"]) -> None:
+            events.publish(DelegationEvent(
+                parent_run_id=events.run_id, child_run_id=child.id,
+                child_session_id=child_session.id, agent_id=agent_id, status=status,
+            ))
+        publish("started")
+
+        async def relay() -> None:
+            async for event in child.events():
+                if isinstance(event, ToolApprovalRequestedEvent):
+                    if not isinstance(event.args, dict):
+                        raise TypeError("child tool approval arguments must be an object")
+                    forwarded_id = f"{child.id}:{event.tool_call_id}"
+                    request = ToolApprovalRequest(
+                        tool_call_id=forwarded_id, tool_name=event.tool_name,
+                        capability_type="tool", source=f"delegation/{agent_id}",
+                        operation=event.tool_name, mode_name=None, risk_level="unknown",
+                        reason=event.reason or "Delegated tool call requires approval.",
+                        arguments=event.args,
+                    )
+                    if not control.begin_tool_approval(request):
+                        child.cancel()
+                        continue
+                    events.publish(replace(event, tool_call_id=forwarded_id))
+                    approval = await control.wait_for_tool_approval(forwarded_id)
+                    if approval is None:
+                        child.cancel()
+                    elif approval.outcome == "approved":
+                        child.approve_tool(event.tool_call_id)
+                    else:
+                        child.deny_tool(event.tool_call_id, approval.reason)
+                elif isinstance(event, ModelRequestStartEvent):
+                    events.publish(replace(event, input={
+                        **event.input,
+                        "delegation": event.input.get(
+                            "delegation", {"child_run_id": child.id, "agent_id": agent_id},
+                        ),
+                    }))
+                elif isinstance(event, (
+                    ToolApprovalResolvedEvent, ToolExecutionStartEvent, ToolExecutionEndEvent,
+                )):
+                    events.publish(replace(
+                        event, tool_call_id=f"{child.id}:{event.tool_call_id}",
+                    ))
+                elif isinstance(event, ModelRequestEndEvent):
+                    events.publish(event)
+                elif isinstance(event, DelegationEvent):
+                    events.publish(event)
+
+        relay_task = asyncio.create_task(relay())
+        result_task = asyncio.create_task(child.result())
+        stop_task = asyncio.create_task(control.wait_for_stop())
+        try:
+            done, _ = await asyncio.wait(
+                {result_task, relay_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done:
+                raise asyncio.CancelledError
+            if relay_task in done:
+                await relay_task
+            result = await result_task
+            await relay_task
+            if parent.metrics is not None:
+                parent.metrics.merge_child(result)
+            publish("completed")
+            return result.text
+        except asyncio.CancelledError:
+            publish("cancelled")
+            raise
+        except Exception:
+            publish("failed")
+            raise
+        finally:
+            if not child.done:
+                child.cancel()
+            for pending in (relay_task, result_task, stop_task):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(relay_task, result_task, stop_task, return_exceptions=True)
+            try:
+                await child.result()
+            except asyncio.CancelledError:
+                pass
+
+    @property
     def extensions(self) -> ExtensionCatalog:
         """Return the contributions from extensions enabled for this Client."""
         if self._extension_catalog is None:
@@ -525,6 +1023,8 @@ class _SecClientCore:
         if self._config is None or self._extension_catalog is None:
             raise RuntimeError("SecClient is not fully initialized")
         desired = tuple(enabled)
+        if set(desired).intersection(self._worker_extensions):
+            raise ValueError("an extension cannot be enabled both in-process and in a worker")
         previous = self._extension_manager.enabled
         if set(desired) == set(previous) and len(desired) == len(previous):
             return
@@ -553,6 +1053,23 @@ class _SecClientCore:
                     self._config,
                     self._extension_manager.catalog,
                 )
+                new_capabilities = self._capabilities
+                if new_capabilities is not None:
+                    combined_tools = (
+                        *new_agent.tools,
+                        *(() if self._mcp_manager is None else self._mcp_manager.tools),
+                        *(() if self._worker_manager is None else self._worker_manager.tools),
+                    )
+                    names = [item.definition.name for item in combined_tools]
+                    if len(names) != len(set(names)) or set(names).intersection({
+                        "skills_load", "capabilities_search", "agents_delegate",
+                    }):
+                        await new_harness.aclose()
+                        raise ValueError("duplicate or reserved capability tool name")
+                    new_capabilities = replace(
+                        new_capabilities, generation=new_capabilities.generation + 1,
+                        tools=combined_tools,
+                    )
             except BaseException as change_error:
                 rollback_errors: list[BaseException] = []
                 try:
@@ -567,6 +1084,15 @@ class _SecClientCore:
                         )
                         self._extension_catalog = self._extension_manager.catalog
                         self._enabled_extensions = previous
+                        if self._capabilities is not None:
+                            self._capabilities = replace(
+                                self._capabilities,
+                                tools=(
+                                    *self._agent.tools,
+                                    *(() if self._mcp_manager is None else self._mcp_manager.tools),
+                                    *(() if self._worker_manager is None else self._worker_manager.tools),
+                                ),
+                            )
                     except BaseException as rollback_error:
                         rollback_errors.append(rollback_error)
                 if rollback_errors:
@@ -581,6 +1107,8 @@ class _SecClientCore:
             self._harness = new_harness
             self._extension_catalog = self._extension_manager.catalog
             self._enabled_extensions = self._extension_manager.enabled
+            self._capabilities = new_capabilities
+            self._known_capability_names.update(tool.definition.name for tool in new_agent.tools)
         except BaseException:
             if self._harness is None and self._agent is None:
                 self._agent = old_agent
@@ -605,7 +1133,14 @@ class _SecClientCore:
             config,
             self._name,
             self._instructions,
-            tools=(*self._tools, *catalog.tools),
+            tools=(
+                *self._tools,
+                *(replace(
+                    registered,
+                    source=f"extension/{catalog.owner_of('tool', registered.definition.name)}",
+                    workspace_scoped=False,
+                ) for registered in catalog.tools),
+            ),
         )
         harness = create_harness(
             config,
@@ -643,7 +1178,28 @@ class _SecClientCore:
             raise RuntimeError("cannot start a Run while switching Sessions")
         if self._closed or self._harness is None:
             raise RuntimeError("SecClient must be entered before starting a Run")
-        run = self._harness.run(self.agent, prompt, session=self.session)
+        capabilities = None
+        if self._capabilities is not None:
+            target = self._pending_agent_id or self._selected_agent_id
+            card = self._capabilities.card(target)
+            capabilities = CapabilityBinding(
+                latest=self._current_capabilities, agent_id=target, fallback=self.agent,
+                allowance=RunAllowance(
+                    min(card.max_model_calls, self.agent.max_model_calls),
+                    min(card.max_tool_calls, self.agent.max_tool_calls),
+                ),
+                revoked=self._revoked_capabilities,
+                delegate=self._delegate_agent,
+                identity=card,
+                finalize=self._finalize_capabilities,
+                refresh=self._refresh_changed_capabilities,
+            )
+            async def initialize() -> None:
+                await self._record_agent_selection(target)
+            capabilities.initialize = initialize
+        run = self._harness.run(
+            self.agent, prompt, session=self.session, capabilities=capabilities,
+        )
         self._active_run = run
         return run
 
@@ -709,6 +1265,8 @@ class _SecClientCore:
         try:
             await store.append(new_session_id, 0, copied_entries, active_leaf_id)
             session = await Session.restore(store, new_session_id)
+            if self._capabilities is not None:
+                self._restore_agent_selection(session)
             self._session = session
             self._session_id = new_session_id
             return session
@@ -729,8 +1287,13 @@ class _SecClientCore:
                 pass
             except BaseException as error:
                 errors.append(error)
-        if self._harness is not None:
-            await _attempt_cleanup(errors, self._harness.aclose)
+        async with self._resource_mutation_lock:
+            if self._harness is not None:
+                await _attempt_cleanup(errors, self._harness.aclose)
+            await _attempt_cleanup(errors, self._close_retired_managers)
+            for manager in (self._worker_manager, self._mcp_manager):
+                if manager is not None:
+                    await _attempt_cleanup(errors, manager.aclose)
         if self._owns_store and self._store is not None:
             close_store = getattr(self._store, "aclose", None)
             if close_store is not None:
@@ -764,7 +1327,29 @@ class AsyncSecClient(_SecClientCore):
 
     async def set_enabled_extensions(self, enabled: Iterable[str]) -> None:
         """Replace active extensions for future Runs; refuse changes during a Run."""
-        await self._set_enabled_extensions(enabled)
+        async with self._resource_mutation_lock:
+            await self._set_enabled_extensions(enabled)
+
+    async def reload_resources(self) -> ReloadReport:
+        async with self._resource_mutation_lock:
+            return await self._reload_resources()
+
+    async def select_agent(self, agent_id: str) -> None:
+        await self._select_agent(agent_id)
+
+    async def set_resource_enabled(
+        self, kind: str, name: str, enabled: bool,
+    ) -> ReloadReport:
+        return await self._set_resource_enabled(kind, name, enabled)
+
+    async def set_worker_extensions(self, names: Iterable[str]) -> ReloadReport:
+        return await self._set_worker_extensions(names)
+
+    async def set_mcp_enabled(self, server_id: str, enabled: bool) -> ReloadReport:
+        return await self._set_mcp_enabled(server_id, enabled)
+
+    async def revoke_capability(self, name: str) -> None:
+        await self._revoke_capability(name)
 
     def run(self, prompt: str) -> Run:
         """启动一轮对话并返回异步 Run 句柄。"""

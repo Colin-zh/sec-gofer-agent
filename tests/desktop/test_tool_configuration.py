@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from sec import PermissionModePolicy
 from sec.apps.cli import create_chat_commands
@@ -57,6 +57,42 @@ class ToolConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.resources_updated.connect(self.inventories.append)
         self.runtime.command_completions.connect(self.completions.append)
 
+    async def test_worker_configuration_uses_core_and_remains_available_during_run(self) -> None:
+        self.client.capability_generation = 1
+        self.client.resources = self.manager
+        self.client.agent_cards = ()
+        self.client.selected_agent_id = "default"
+        self.client.pending_agent_id = None
+        self.client.mcp_statuses = ()
+        self.client.worker_extensions = ()
+
+        async def set_workers(names):
+            self.client.worker_extensions = names
+
+        self.client.set_worker_extensions = AsyncMock(side_effect=set_workers)
+        self.runtime._active_run = SimpleNamespace(done=False)
+        await self.runtime._configure_resource("worker", "hello", True)
+        self.client.set_worker_extensions.assert_awaited_once_with(("hello",))
+        self.assertEqual(self.results[-1][1], "info")
+        entry = next(item for item in self.inventories[-1].entries if item.kind == "extension")
+        self.assertTrue(entry.enabled)
+        self.assertEqual(entry.execution_mode, "worker")
+        await self.runtime._configure_resource("worker", "hello", False)
+        self.assertEqual(self.client.worker_extensions, ())
+
+    def test_unstarted_resource_controls_do_not_create_unawaited_coroutines(self) -> None:
+        for method, internal, arguments in (
+            ("select_agent", "_select_agent", ("default",)),
+            ("reload_resources", "_reload_resources", ()),
+            ("configure_resource", "_configure_resource", ("skill", "daily", True)),
+        ):
+            with self.subTest(method=method), patch.object(
+                self.runtime, internal, new_callable=AsyncMock,
+            ) as coroutine:
+                with self.assertRaisesRegex(RuntimeError, "not running"):
+                    getattr(self.runtime, method)(*arguments)
+                coroutine.assert_not_called()
+
     async def test_prompt_activation_updates_real_dispatch_completion_and_persistence(self) -> None:
         await self.runtime._configure_resource("prompt", "daily", False)
         self.assertEqual(self.results[-1][1], "info")
@@ -97,7 +133,7 @@ class ToolConfigurationTests(unittest.IsolatedAsyncioTestCase):
             ExtensionSettings(self.runtime._extension_settings.path).resolve(("hello",)), (),
         )
 
-    async def test_busy_changes_and_mcp_are_explicitly_rejected(self) -> None:
+    async def test_busy_changes_are_rejected_and_unavailable_mcp_is_reported(self) -> None:
         self.runtime._active_run = SimpleNamespace(done=False)
         await self.runtime._configure_resource("prompt", "daily", False)
         await self.runtime._configure_resource("extension", "hello", True)
@@ -107,7 +143,7 @@ class ToolConfigurationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime._policy.mode_name, "normal")
         self.runtime._active_run = None
         await self.runtime._configure_resource("mcp", "server", True)
-        self.assertIn("尚未接入", self.results[-1][0])
+        self.assertIn("MCP 配置不可用", self.results[-1][0])
         await self.runtime._configure_permission("plan")
         self.assertEqual(self.runtime._policy.mode_name, "plan")
         self.assertEqual(self.inventories[-1].permission_mode, "plan")

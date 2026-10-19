@@ -41,6 +41,12 @@ class PermissionModePolicy:
 
     def decide(self, context: PolicyContext) -> PolicyDecision:
         """根据风险和资源边界生成结构化策略决策。"""
+        if (
+            context.source == "sec.capabilities"
+            and context.capability_name in {"skills_load", "capabilities_search"}
+            and context.risk_level == "read"
+        ):
+            return PolicyDecision.allow("Reading the already-authorized capability catalog.")
         in_workspace = self._is_workspace_file_operation(context)
         if context.workspace_scoped and not in_workspace:
             return PolicyDecision.deny(

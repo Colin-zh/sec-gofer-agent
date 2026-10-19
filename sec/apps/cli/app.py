@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from hashlib import sha256
 from io import StringIO
+from importlib.metadata import entry_points
 import os
 from pathlib import Path
 import subprocess
@@ -31,6 +32,7 @@ from sec.apps.cli.chat_commands import (
     ChatCommandOutcome,
     ChatCommandRegistry,
     create_default_chat_commands,
+    format_reload_report,
 )
 from sec.apps.cli.presentation import (
     show_event,
@@ -173,17 +175,17 @@ async def _chat(
         permission_mode,
         workspace_root=workspace_root,
     )
-    resource_manager = CliResourceManager(workspace_root)
-    resource_manager.reload()
     try:
         async with AsyncSecClient(
             "sec",
             DEFAULT_INSTRUCTIONS,
+            workspace=workspace_root,
             session_id=resume_session_id,
             enabled_extensions=enabled_extensions,
             tools=create_builtin_tools(workspace_root),
             policy=mode_policy,
         ) as client:
+            resource_manager = client.resources
             if not sys.stdin.isatty() or not sys.stdout.isatty():
                 await _chat_noninteractive(
                     client,
@@ -285,9 +287,23 @@ async def _chat_interactive(
     home = str(Path.cwd())
     model = _configured_model()
     if resource_manager is None:
-        resource_manager = CliResourceManager(Path.cwd())
-        resource_manager.reload()
+        if getattr(client, "agent_cards", ()):
+            resource_manager = client.resources
+        else:
+            resource_manager = CliResourceManager(Path.cwd())
+            resource_manager.reload()
     resources = resource_manager.snapshot
+    selected_agent_id = getattr(client, "selected_agent_id", None)
+    cards = getattr(client, "agent_cards", ())
+    selected_agent = next(
+        (
+            f"{card.name} ({card.id})"
+            for card in cards
+            if card.id == selected_agent_id
+        ),
+        selected_agent_id,
+    )
+    pending_agent_id = getattr(client, "pending_agent_id", None)
     ui = TerminalUI(
         home=home,
         model=model,
@@ -300,6 +316,8 @@ async def _chat_interactive(
             session_id=client.session.id,
             resources=resources,
             enabled_extensions=enabled_extensions,
+            selected_agent=selected_agent,
+            pending_agent_id=pending_agent_id,
             permission_mode=(
                 "normal" if mode_policy is None else mode_policy.mode_name
             ),
@@ -510,8 +528,17 @@ def create_chat_commands(
     """Build the shared interactive command registry for a Sec Client."""
     get_run = get_active_run or (lambda: active_run)
     if resource_manager is None:
-        resource_manager = CliResourceManager(Path.cwd())
-        resource_manager.reload()
+        if getattr(client, "agent_cards", ()):
+            resource_manager = client.resources
+        else:
+            resource_manager = CliResourceManager(Path.cwd())
+            resource_manager.reload()
+
+    def current_resource_manager() -> CliResourceManager:
+        cards = getattr(client, "agent_cards", ())
+        if cards:
+            return client.resources
+        return resource_manager
 
     def enqueue_follow_up(text: str) -> str | None:
         run = get_run()
@@ -715,6 +742,7 @@ def create_chat_commands(
     commands: ChatCommandRegistry
 
     async def reload_resources(args: tuple[str, ...]) -> ChatCommandOutcome:
+        nonlocal resource_manager
         if args and (len(args) < 2 or args[0] not in {"enable", "disable"}):
             return ChatCommandOutcome(
                 "Usage: /reload [enable|disable <extension-name...>]",
@@ -732,7 +760,7 @@ def create_chat_commands(
                 display_kind="error",
             )
 
-        extension_message: str
+        extension_message = ""
         previous_enabled = client.enabled_extensions
         try:
             if args:
@@ -760,24 +788,7 @@ def create_chat_commands(
                     else f"Disabled {', '.join(names)}."
                 )
             else:
-                available = client.discover_extensions()
-                enabled = set(previous_enabled)
-                all_names = tuple(sorted(set(available) | enabled))
-                extension_message = (
-                    "Installed Extensions:\n"
-                    + (
-                        "\n".join(
-                            f"  {name} ({'enabled' if name in enabled else 'disabled'})"
-                            if name in available
-                            else f"  {name} (enabled, entry point not found)"
-                            for name in all_names
-                        )
-                        if all_names
-                        else "  (none)"
-                    )
-                    + "\nUse /reload enable <name...> or "
-                    "/reload disable <name...>."
-                )
+                pass
         except (ConfigError, ExtensionLoadError, ValueError, RuntimeError, ExceptionGroup) as exc:
             return ChatCommandOutcome(
                 f"Could not reload Extensions: {exc}",
@@ -810,24 +821,219 @@ def create_chat_commands(
                 display_kind="error",
             )
 
-        snapshot = resource_manager.reload()
-        commands.replace_resource_commands(_resource_command_specs(resource_manager))
+        if not args and callable(getattr(client, "reload_resources", None)):
+            try:
+                report = await client.reload_resources()
+            except Exception as exc:
+                return ChatCommandOutcome(
+                    f"Could not reload resources: {exc}",
+                    display_kind="error",
+                )
+            resource_manager = current_resource_manager()
+            extension_message = format_reload_report(report)
+        else:
+            snapshot = resource_manager.reload()
+            resource_message = (
+                f"Reloaded {len(snapshot.skills)} Skill(s) and "
+                f"{len(snapshot.prompts)} Prompt(s)."
+            )
+            extension_message = " ".join(
+                part for part in (resource_message, extension_message) if part
+            )
+        if not args:
+            available = client.discover_extensions()
+            enabled = set(previous_enabled)
+            all_names = tuple(sorted(set(available) | enabled))
+            extension_message += (
+                "\nInstalled Extensions:\n"
+                + (
+                    "\n".join(
+                        f"  {name} ({'enabled' if name in enabled else 'disabled'})"
+                        if name in available
+                        else f"  {name} (enabled, entry point not found)"
+                        for name in all_names
+                    )
+                    if all_names
+                    else "  (none)"
+                )
+                + "\nUse /reload enable <name...> or "
+                "/reload disable <name...>."
+            )
+        commands.replace_resource_commands(
+            _resource_command_specs(current_resource_manager())
+        )
         if refresh_completions is not None:
             refresh_completions(commands.completion_items())
-        issues = (
-            f" {len(snapshot.issues)} issue(s); see /help full."
-            if snapshot.issues
-            else ""
-        )
-        return ChatCommandOutcome(
-            f"Reloaded {len(snapshot.skills)} Skill(s) and "
-            f"{len(snapshot.prompts)} Prompt(s). {extension_message}{issues}"
-        )
+        return ChatCommandOutcome(extension_message)
 
     def help_details() -> str:
         return _format_resource_help(
-            resource_manager.snapshot,
+            current_resource_manager().snapshot,
             client.extensions.commands,
+        )
+
+    def list_agents(args: tuple[str, ...]) -> ChatCommandOutcome:
+        if args:
+            return ChatCommandOutcome("Usage: /agents", display_kind="error")
+        cards = getattr(client, "agent_cards", ())
+        if not cards:
+            return ChatCommandOutcome(
+                "Agent selection is unavailable in this client.",
+                display_kind="error",
+            )
+        selected = getattr(client, "selected_agent_id", "default")
+        pending = getattr(client, "pending_agent_id", None)
+        lines = ["Available Agents:"]
+        for card in cards:
+            marker = " (selected)" if card.id == selected else ""
+            if card.id == pending:
+                marker += " (queued for next Run)"
+            lines.append(f"  {card.id}{marker} — {card.name}: {card.description}")
+        lines.append("Use /agent <id> to select an Agent.")
+        return ChatCommandOutcome("\n".join(lines))
+
+    async def select_agent(args: tuple[str, ...]) -> ChatCommandOutcome:
+        if len(args) != 1:
+            return ChatCommandOutcome("Usage: /agent <id>", display_kind="error")
+        selector = getattr(client, "select_agent", None)
+        if not callable(selector):
+            return ChatCommandOutcome(
+                "Agent selection is unavailable in this client.",
+                display_kind="error",
+            )
+        try:
+            await selector(args[0])
+        except (ValueError, RuntimeError) as exc:
+            return ChatCommandOutcome(f"Could not select Agent: {exc}", display_kind="error")
+        pending = getattr(client, "pending_agent_id", None)
+        if pending == args[0]:
+            return ChatCommandOutcome(f"Agent {args[0]} queued for the next Run.")
+        return ChatCommandOutcome(f"Agent {args[0]} selected.")
+
+    def mcp_status_line(status: object) -> str:
+        def value(*names: str, default: object = "") -> object:
+            if isinstance(status, dict):
+                return next((status[name] for name in names if name in status), default)
+            return next(
+                (getattr(status, name) for name in names if hasattr(status, name)),
+                default,
+            )
+        identifier = value("id", "server_id", "name", default="(unknown)")
+        label = value("name", "label", default=identifier)
+        state = value("status", "state", default="unknown")
+        enabled = value("enabled", default=None)
+        error = value("error", "message", default="")
+        line = f"  {identifier} — {label}: {state}"
+        if enabled is not None:
+            line += f" ({'enabled' if enabled else 'disabled'})"
+        if error:
+            line += f" — {error}"
+        return line
+
+    async def manage_mcp(args: tuple[str, ...]) -> ChatCommandOutcome:
+        action = args[0].casefold() if args else "list"
+        if action == "list" and len(args) == 1 or not args:
+            statuses = getattr(client, "mcp_statuses", ())
+            lines = ["MCP services:"]
+            lines.extend(mcp_status_line(status) for status in statuses)
+            if not statuses:
+                lines.append("  No MCP services are configured.")
+            lines.append("Use /mcp enable|disable <id> or /mcp refresh.")
+            return ChatCommandOutcome("\n".join(lines))
+        if action == "refresh" and len(args) == 1:
+            reload_method = getattr(client, "reload_resources", None)
+            if not callable(reload_method):
+                return ChatCommandOutcome(
+                    "MCP refresh is unavailable in this client.",
+                    display_kind="error",
+                )
+            try:
+                report = await reload_method()
+            except Exception as exc:
+                return ChatCommandOutcome(f"Could not refresh MCP services: {exc}", display_kind="error")
+            return ChatCommandOutcome(format_reload_report(report))
+        if action in {"enable", "disable"} and len(args) == 2:
+            setter = getattr(client, "set_mcp_enabled", None)
+            if not callable(setter):
+                return ChatCommandOutcome(
+                    "MCP configuration is unavailable in this client.",
+                    display_kind="error",
+                )
+            try:
+                report = await setter(args[1], action == "enable")
+            except Exception as exc:
+                return ChatCommandOutcome(f"Could not {action} MCP service {args[1]!r}: {exc}", display_kind="error")
+            return ChatCommandOutcome(
+                f"MCP service {args[1]} {action}d.\n{format_reload_report(report)}"
+            )
+        return ChatCommandOutcome(
+            "Usage: /mcp [list|enable <id>|disable <id>|refresh]",
+            display_kind="error",
+        )
+
+    async def manage_plugins(args: tuple[str, ...]) -> ChatCommandOutcome:
+        action = args[0].casefold() if args else "list"
+        names = tuple(getattr(client, "worker_extensions", ()))
+        if action == "list" and len(args) == 1 or not args:
+            installed = tuple(sorted(
+                point.name for point in entry_points(group="sec.worker_extensions")
+            ))
+            all_names = tuple(sorted(set(installed) | set(names)))
+            lines = ["Worker extensions (isolated tools only):"]
+            lines.extend(
+                f"  {name} ({'enabled' if name in names else 'disabled'})"
+                for name in all_names
+            )
+            if not all_names:
+                lines.append("  (none installed)")
+            lines.append("Use /plugins enable|disable <name...> or /plugins reload.")
+            return ChatCommandOutcome("\n".join(lines))
+        if action == "reload" and len(args) == 1:
+            reload_method = getattr(client, "reload_resources", None)
+            if not callable(reload_method):
+                return ChatCommandOutcome(
+                    "Worker extension reload is unavailable in this client.",
+                    display_kind="error",
+                )
+            try:
+                report = await reload_method()
+            except Exception as exc:
+                return ChatCommandOutcome(f"Could not reload worker extensions: {exc}", display_kind="error")
+            return ChatCommandOutcome(format_reload_report(report))
+        if action in {"enable", "disable"} and len(args) >= 2:
+            setter = getattr(client, "set_worker_extensions", None)
+            if not callable(setter):
+                return ChatCommandOutcome(
+                    "Worker extension configuration is unavailable in this client.",
+                    display_kind="error",
+                )
+            requested = args[1:]
+            if len(requested) != len(set(requested)):
+                return ChatCommandOutcome("Extension names must not be repeated.", display_kind="error")
+            if action == "enable":
+                desired = tuple(dict.fromkeys((*names, *requested)))
+            else:
+                missing = tuple(name for name in requested if name not in names)
+                if missing:
+                    return ChatCommandOutcome(
+                        f"Worker extension(s) not enabled: {', '.join(missing)}",
+                        display_kind="error",
+                    )
+                desired = tuple(name for name in names if name not in requested)
+            try:
+                report = await setter(desired)
+            except Exception as exc:
+                return ChatCommandOutcome(
+                    f"Could not {action} worker extension(s): {exc}",
+                    display_kind="error",
+                )
+            return ChatCommandOutcome(
+                f"Worker extension(s) {action}d: {', '.join(requested)}.\n"
+                + format_reload_report(report)
+            )
+        return ChatCommandOutcome(
+            "Usage: /plugins [list|enable <name...>|disable <name...>|reload]",
+            display_kind="error",
         )
 
     commands = create_default_chat_commands(
@@ -860,11 +1066,15 @@ def create_chat_commands(
                 "Reload Skills/Prompts and list or change enabled Extensions",
                 reload_resources,
             ),
+            "agents": ("List available Agents and the current selection", list_agents),
+            "agent": ("Select the Agent for this and subsequent Runs", select_agent),
+            "mcp": ("List, enable, disable, or refresh MCP services", manage_mcp),
+            "plugins": ("Configure isolated worker extensions", manage_plugins),
             "export": ("Export the current Session to JSON", export_session),
             "import": ("Import a Session from a JSON file", import_session),
             "copy": ("Copy active conversation text to the clipboard", copy_session),
         },
-        resource_commands=_resource_command_specs(resource_manager),
+        resource_commands=_resource_command_specs(current_resource_manager()),
         help_details=help_details,
     )
     commands.replace_extension_commands(_extension_chat_commands(client))

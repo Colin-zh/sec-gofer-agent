@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from time import time
 
 from sec._types.approvals import ToolApprovalRequest
@@ -50,6 +50,8 @@ async def execute_tool_batch(
     turn_id: str,
     budget: Budget,
     metrics: RunMetricsAccumulator,
+    is_revoked: Callable[[str], bool] | None = None,
+    consume_tool: Callable[[], None] | None = None,
 ) -> tuple[list[ToolResultMessage], int, Exception | None, bool]:
     """执行一个工具调用批次，并为每次调用保留独立结果和事件。"""
     results: list[ToolResultMessage] = []
@@ -57,6 +59,12 @@ async def execute_tool_batch(
     stopped = False
 
     for index, tool_use in enumerate(tool_uses):
+        if is_revoked is not None and is_revoked(tool_use.name):
+            results.append(_error_result(
+                tool_use, "Capability was revoked before execution.",
+                error_kind="capability_revoked",
+            ))
+            continue
         if failure is not None:
             results.append(
                 _error_result(
@@ -92,6 +100,15 @@ async def execute_tool_batch(
                 )
             )
             continue
+        if consume_tool is not None:
+            try:
+                consume_tool()
+            except RunLimitExceeded as error:
+                failure = error
+                results.append(_error_result(
+                    tool_use, str(error), error_kind="tool_call_limit",
+                ))
+                continue
         try:
             result, call_stopped = await _execute_one_tool(
                 tool_use,
@@ -105,6 +122,7 @@ async def execute_tool_batch(
                 turn_id,
                 budget,
                 metrics,
+                is_revoked,
             )
         except Exception as exc:
             failure = exc
@@ -140,6 +158,7 @@ async def _execute_one_tool(
     turn_id: str,
     budget: Budget,
     metrics: RunMetricsAccumulator,
+    is_revoked: Callable[[str], bool] | None = None,
 ) -> tuple[ToolResultMessage, bool]:
     """校验并授权工具调用，必要时等待审批，再委托 Executor 执行。"""
     registered = tools_by_name.get(tool_use.name)
@@ -268,6 +287,12 @@ async def _execute_one_tool(
     attempt = 0
     try:
         for attempt in range(1, budget.tool_retries.max_attempts + 1):
+            if is_revoked is not None and is_revoked(tool_use.name):
+                result = _error_result(
+                    tool_use, "Capability was revoked before execution.",
+                    error_kind="capability_revoked",
+                )
+                break
             metrics.start_tool_attempt(retry=attempt > 1)
             try:
                 attempt_result = await executor.execute(registered, tool_use)

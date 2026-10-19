@@ -60,6 +60,7 @@ async def complete_or_interrupt(
         if tools is None
         else tools
     )
+    request_tools = deepcopy(request_tools)
     completion = _complete_with_retries(
         provider=provider,
         messages=request_messages,

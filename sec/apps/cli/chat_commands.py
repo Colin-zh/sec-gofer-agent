@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from importlib.metadata import entry_points
 from typing import Literal
 
 from sec.apps.cli.command_catalog import CommandCatalog, CommandDefinition
@@ -354,6 +355,29 @@ def create_default_chat_commands(
     return commands
 
 
+def format_reload_report(report: object) -> str:
+    """Render the public reload summary without depending on a report class."""
+    generation = getattr(report, "generation", None)
+    changes = tuple(
+        f"{label}: {', '.join(getattr(report, field, ()))}"
+        for label, field in (
+            ("added", "added"),
+            ("updated", "updated"),
+            ("removed", "removed"),
+        )
+        if getattr(report, field, ())
+    )
+    parts = [f"Resources reloaded (generation {generation})." if generation is not None else "Resources reloaded."]
+    parts.extend(changes)
+    pending = tuple(getattr(report, "pending", ()))
+    issues = tuple(getattr(report, "issues", ()))
+    if pending:
+        parts.append("Pending: " + "; ".join(pending))
+    if issues:
+        parts.append("Issues: " + "; ".join(issues))
+    return "\n".join(parts)
+
+
 async def _invoke(
     command: ChatCommand,
     args: tuple[str, ...],
@@ -369,4 +393,5 @@ __all__ = [
     "ChatCommandOutcome",
     "ChatCommandRegistry",
     "create_default_chat_commands",
+    "format_reload_report",
 ]

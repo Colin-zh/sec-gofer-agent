@@ -17,6 +17,8 @@ from sec.apis.client import _SecClientCore
 from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
 from sec._types.events import SessionEvent
 from sec._types.results import RunResult
+from sec._runtime.capabilities import ReloadReport
+from collections.abc import Iterable
 
 _T = TypeVar("_T")
 
@@ -139,6 +141,33 @@ class SecClient(_SecClientCore):
         return self._blocking_call(
             self._handle_ui_request(handler_name, request)
         )
+
+    def reload_resources(self) -> ReloadReport:
+        async def reload() -> ReloadReport:
+            async with self._resource_mutation_lock:
+                return await self._reload_resources()
+        return self._blocking_call(reload())
+
+    def select_agent(self, agent_id: str) -> None:
+        self._blocking_call(self._select_agent(agent_id))
+
+    def set_resource_enabled(self, kind: str, name: str, enabled: bool) -> ReloadReport:
+        return self._blocking_call(self._set_resource_enabled(kind, name, enabled))
+
+    def set_worker_extensions(self, names: Iterable[str]) -> ReloadReport:
+        return self._blocking_call(self._set_worker_extensions(names))
+
+    def set_enabled_extensions(self, names: Iterable[str]) -> None:
+        async def set_enabled() -> None:
+            async with self._resource_mutation_lock:
+                await self._set_enabled_extensions(names)
+        self._blocking_call(set_enabled())
+
+    def set_mcp_enabled(self, server_id: str, enabled: bool) -> ReloadReport:
+        return self._blocking_call(self._set_mcp_enabled(server_id, enabled))
+
+    def revoke_capability(self, name: str) -> None:
+        self._blocking_call(self._revoke_capability(name))
 
     def stream(self, prompt: str) -> SyncRunStream:
         """创建同步事件流上下文；实际启动 Run 发生在进入上下文时。"""

@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 from anthropic import APIConnectionError as AnthropicAPIConnectionError
 from openai import APIConnectionError as OpenAIAPIConnectionError
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import NoSuchModuleError
 
 from sec._types.content import TextContent
 from sec._types.messages import Message, SystemMessage, UserMessage
@@ -275,6 +276,32 @@ class ConfigTests(unittest.TestCase):
             config.storage.sqlalchemy_url,
             connect_args={"server_settings": {"search_path": "sec_history"}},
         )
+
+    def test_missing_opengauss_dependencies_report_actionable_configuration_error(self) -> None:
+        for schema in (None, "sec_history"):
+            config = Config.from_env(
+                None, environ={
+                    "SEC_PROVIDER": "openai", "SEC_MODEL": "test",
+                    "OPENAI_API_KEY": "test",
+                    "SEC_SESSION_STORE_BACKEND": "database",
+                    "SEC_DATABASE_URL": "opengauss+asyncpg://localhost/sec",
+                    **({"SEC_DATABASE_SCHEMA": schema} if schema is not None else {}),
+                },
+            )
+            for error in (
+                NoSuchModuleError("missing dialect"),
+                ModuleNotFoundError("missing asyncpg", name="asyncpg"),
+            ):
+                with self.subTest(schema=schema, error=type(error).__name__), patch(
+                    "sec.apis.client.Database", side_effect=error,
+                ):
+                    with self.assertRaisesRegex(ConfigError, "uv sync --extra desktop --extra opengauss"):
+                        create_database(config)
+            unrelated = ModuleNotFoundError("missing unrelated dependency", name="other_library")
+            with patch("sec.apis.client.Database", side_effect=unrelated):
+                with self.assertRaises(ModuleNotFoundError) as raised:
+                    create_database(config)
+                self.assertIs(raised.exception, unrelated)
 
     def test_database_schema_rejects_other_drivers_and_unsafe_names(self) -> None:
         sqlite_config = Config.from_env(

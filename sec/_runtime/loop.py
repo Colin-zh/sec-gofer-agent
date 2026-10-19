@@ -24,6 +24,7 @@ from sec._types.events import (
     MessageBoundaryEvent,
     MessageUpdateEvent,
     TurnEndEvent,
+    CapabilitySnapshotEvent,
 )
 from sec._types.messages import (
     AgentMessage,
@@ -32,6 +33,7 @@ from sec._types.messages import (
     UserMessage,
 )
 from sec._runtime.budget import Budget
+from sec._runtime.capabilities import CapabilityBinding
 from sec._runtime.control import RunControl
 from sec._runtime.event_stream import RunEventStream
 from sec._runtime.metrics import RunMetricsAccumulator
@@ -68,6 +70,7 @@ async def run_loop(
     metrics: RunMetricsAccumulator,
     executor: ToolExecutor,
     context_builder: ContextBuilder | None = None,
+    capabilities: CapabilityBinding | None = None,
 ) -> RunResult:
     """逐轮执行 Agent；每轮模型调用受预算限制，follow-up 会开启新预算。"""
     policy_engine = policy if policy is not None else DenyAllPolicy()
@@ -76,6 +79,9 @@ async def run_loop(
     turn_id = uuid4().hex
     turn_prompt = prompt
     turn_source = "user"
+    if capabilities is not None:
+        capabilities.context = (control, events)
+        capabilities.metrics = metrics
 
     state.start()
     events.publish(EmptySessionEvent("agent_start"))
@@ -94,6 +100,9 @@ async def run_loop(
         events.publish(MessageBoundaryEvent("message_end", message))
 
     while True:
+        if capabilities is not None and capabilities.depth == 0:
+            capabilities.allowance.model_calls = 0
+            capabilities.allowance.tool_calls = 0
         events.publish(EmptySessionEvent("turn_start"))
         await append_user_message(turn_prompt, turn_source)
         turn_model_calls = 0
@@ -115,6 +124,21 @@ async def run_loop(
             control.raise_if_stopped()
             for steering_text in _drain_steering(control):
                 await append_user_message(steering_text, "steering")
+            if capabilities is not None:
+                if capabilities.refresh is not None:
+                    await capabilities.refresh()
+                task_text = "\n".join(
+                    message.text for message in session.messages
+                    if message.role == "user" and message.metadata.get("turn_id") == turn_id
+                )
+                agent = capabilities.resolve(task_text)
+                events.publish(CapabilitySnapshotEvent(
+                    generation=capabilities.generation,
+                    agent_id=capabilities.agent_id,
+                    card_digest=capabilities.card_digest,
+                    loaded_skills=capabilities.active_skills,
+                    tool_names=tuple(tool.definition.name for tool in agent.tools),
+                ))
 
             prepared_context = None
             if context_builder is not None:
@@ -146,6 +170,8 @@ async def run_loop(
                             tools=tuple(tool.definition for tool in agent.tools),
                         )
                         turn_model_calls += 1
+                        if capabilities is not None:
+                            capabilities.allowance.model()
                         metrics.model_calls += 1
                         events.publish(MessageUpdateEvent(AssistantStartEvent()))
                         summary_completion, interrupted_steering = (
@@ -245,6 +271,8 @@ async def run_loop(
                     )
 
             turn_model_calls += 1
+            if capabilities is not None:
+                capabilities.allowance.model()
             metrics.model_calls += 1
             events.publish(MessageUpdateEvent(AssistantStartEvent()))
             try:
@@ -282,6 +310,13 @@ async def run_loop(
                 metadata={
                     **response.metadata,
                     "turn_id": turn_id,
+                    **(
+                        {} if capabilities is None else {
+                            "agent_id": capabilities.agent_id,
+                            "card_digest": capabilities.card_digest,
+                            "capability_generation": capabilities.generation,
+                        }
+                    ),
                 },
             )
             events.publish(
@@ -340,6 +375,13 @@ async def run_loop(
                         turn_id=turn_id,
                         budget=budget,
                         metrics=metrics,
+                        is_revoked=(
+                            None if capabilities is None else capabilities.check_revoked
+                        ),
+                        consume_tool=(
+                            None if capabilities is None
+                            else lambda: capabilities.allowance.tools(1)
+                        ),
                     )
                 )
                 turn_tool_calls += requested_tools

@@ -32,6 +32,18 @@ uv sync --extra desktop --no-editable
 uv run --no-sync sec-desktop
 ```
 
+When the configured Session database uses `opengauss+asyncpg`, retain both
+optional dependency groups on every sync:
+
+```sh
+uv sync --extra desktop --extra opengauss --no-editable
+uv run --no-sync sec-desktop
+```
+
+For pip installations, use `pip install 'sec-gofer-agent[desktop,opengauss]'`.
+Syncing only the `desktop` extra removes the optional openGauss dialect and
+`asyncpg` driver and prevents that database configuration from starting.
+
 The non-editable install avoids a macOS Python issue where hidden editable
 `.pth` files may be ignored. After source changes, refresh the installed package:
 
@@ -58,7 +70,8 @@ declared project dependencies. After syncing again, reinstall local extensions.
 
 The desktop reuses the CLI slash-command registry, including `/help`, `/new`,
 `/resume`, `/name`, `/session`, `/tree`, `/fork`, `/clone`, `/mode`, `/trust`,
-`/reload`, `/export`, `/import`, `/copy`, `/stop`, `/steer`, `/followup`, and
+`/agents`, `/agent`, `/mcp`, `/plugins`, `/reload`, `/export`, `/import`, `/copy`,
+`/stop`, `/steer`, `/followup`, and
 commands contributed by enabled extensions. Type `/` for completion.
 
 ## Chat layout and controls
@@ -76,10 +89,12 @@ commands contributed by enabled extensions. Type `/` for completion.
 - The sidebar has icon-assisted primary entries: 新对话、快捷指令、定时任务、记忆、工具.
   记忆 opens a placeholder page for episodic, semantic, and procedural memory;
   no memory read/write/delete operations are connected yet.
-  定时任务 is a disabled placeholder. Tool categories are 智能体、技能、插件、MCP;
-  智能体 retains the existing prompt-template behavior, and 插件 retains extension behavior.
+  定时任务 is a disabled placeholder. Tool categories are
+  智能体、提示词模板、技能、插件、MCP. Agent identity uses core AgentCards;
+  prompt templates remain explicit one-shot input resources.
   Composer controls appear as help, agent, mode, reload with equal spacing;
-  agent is a disabled placeholder for future agent selection.
+  agent opens the AgentCard selector after the runtime is ready.
+  Selection preserves the Session; changes during a Run queue for the next Run.
   Controls use content-sized icon/text bounds without native menu padding.
   Reserved agent/timer icons retain their source colors while disabled.
   The icon to the left of the conversation title collapses/expands the sidebar,
@@ -96,29 +111,43 @@ commands contributed by enabled extensions. Type `/` for completion.
   returns to the latest output and resumes automatic following.
   工具 starts collapsed; click its row (with a right-aligned more icon) to
   expand/collapse the indented, softly shaded submenu without leaving chat.
-  Under 工具, text-only entries 提示词模版、技能、扩展、MCP show the available
+  Under 工具, text-only category entries show the available
   count (including disabled resources) on the lower right in gray.
   Selecting a category opens a preview and activation page; 返回对话 preserves
   the current Session, messages, draft, and running task.
 - Skill/prompt activation immediately removes or restores its slash command and
   completion. Full text and source paths remain available for preview. These
-  resources are invoked explicitly, not automatically injected into every turn.
-  Desktop activation choices persist per workspace in
-  `.sec/desktop-resources.json`; core CLI behavior remains unchanged.
+  prompt bodies are expanded explicitly. Skill summaries are automatically
+  available to the selected Agent, with native loading and required-trigger
+  activation handled by the core runtime. Shared activation choices persist in
+  `.sec/resources.json`; an existing `.sec/desktop-resources.json` is reused for
+  backwards compatibility. CLI and Desktop use the same resource catalog.
 - Extension activation reuses `/reload enable|disable <name>` and the SDK's live
   loading, command refresh, and rollback logic. Installed but inactive extensions
   remain visible without importing their code for preview. Desktop choices persist
   in `.sec/desktop-extensions.json`; explicit saved choices override `--extension`
   defaults on restart. Saving failures are reported and trigger runtime rollback.
+  The plugin page also offers tools-only worker execution. Choose the mode while
+  the plugin is disabled. Worker choices persist in `.sec/worker-extensions.json`;
+  reload imports updated tool code in a fresh process without restarting the
+  Session. In-process extensions retain complete contributions but require host
+  restart for Python code changes. Neither mode is a security sandbox.
 - The page's global permission control changes the real `/mode` policy:
   normal asks for every tool, plan permits only built-in workspace reads, and auto
   auto-approves workspace file operations while retaining shell/remote approval.
-  Activation never grants blanket approval. Configuration is blocked during a Run.
+  Activation never grants blanket approval. Global permissions and in-process
+  extensions require an idle Run; skills, prompts, MCP and worker tools can
+  publish new generations at safe request boundaries during a Run.
   Permission mode is shared with chat commands and starts in normal on restart.
   Its selector and popup use the same light palette, rounded corners, and
   selection highlight as the rest of the desktop UI, with a muted disabled state.
-- MCP is a reserved entry with a count of zero and an explicit not-connected
-  notice; no pretend activation, discovery, or remote calls are provided.
+- MCP displays configured enabled and disabled services from `.sec/mcp.json`.
+  Core adapters support stdio and Streamable HTTP, schema-backed tools, resource
+  reads and prompt retrieval through the existing policy/approval chain.
+  Reload stages and validates a complete candidate before publication; failure
+  leaves the previous generation active. Credentials are not shown in inventory.
+  See the [AgentCard, MCP and hot-reload guide](../../../docs/tutorials/16-agents-capabilities-and-reload.md)
+  for configuration and lifecycle boundaries.
 - Recent Sessions display the name on the left (elided when necessary) and a
   smaller gray `YY-MM-DD HH:MM` timestamp on the right. The complete Session ID
   remains selectable on a single line in the header.
@@ -138,7 +167,7 @@ commands contributed by enabled extensions. Type `/` for completion.
   transactional). Third-party stores without deletion report an explicit error.
   The async Client exposes `rename_session(id, name)`, `delete_session(id)`,
   `get_session_snapshot(id)`, `fork_session(id)`, and `clone_session(id)`.
-- The compact composer keeps icon-assisted `help`, `mode`, and `reload`
+- The compact composer keeps icon-assisted `help`, `agent`, `mode`, and `reload`
   buttons. Its completion popup displays command names and descriptions but
   inserts only the command. The visible button labels omit `/`; the underlying
   slash commands remain supported.

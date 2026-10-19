@@ -324,16 +324,16 @@ class FloatingWindow(QMainWindow):
         self._scheduled_tasks.setEnabled(False)
         layout.addWidget(self._scheduled_tasks)
 
-        self._memory_button = QPushButton("记忆")
+        self._memory_button = QPushButton("记忆管理")
         self._memory_button.setIcon(control_icon("memory"))
         self._memory_button.setToolTip("记忆管理 · 三层记忆功能预留")
         self._memory_button.clicked.connect(self._show_memory)
         layout.addWidget(self._memory_button)
 
-        self._tools_button = QPushButton("工具")
+        self._tools_button = QPushButton("扩展能力")
         self._tools_button.setIcon(control_icon("components"))
         self._tools_button.setCheckable(True)
-        self._tools_button.setToolTip("展开工具分类")
+        self._tools_button.setToolTip("展开扩展能力分类")
         self._tools_button.setStyleSheet(
             "QPushButton { padding-right: 34px; }"
             "QPushButton:checked { background: #e6e9ed; }"
@@ -370,7 +370,7 @@ class FloatingWindow(QMainWindow):
             "QTreeWidget::item:hover { background: #e0e6ee; }"
             "QTreeWidget::item:selected { background: #dce5f0; color: #202124; }"
         )
-        self._resources.setToolTip("选择工具分类，预览内容并配置权限与激活状态")
+        self._resources.setToolTip("选择扩展能力分类，预览内容并配置权限与激活状态")
         self._inventory = ToolInventory()
         self._resource_counts: dict[ToolKind, QLabel] = {}
         for kind, title in TOOL_CATEGORIES:
@@ -523,7 +523,7 @@ class FloatingWindow(QMainWindow):
         back = QPushButton("返回对话")
         back.clicked.connect(self._show_chat)
         memory_layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
-        title = QLabel("记忆")
+        title = QLabel("记忆管理")
         title.setStyleSheet("font-size: 18px; font-weight: 600; color: #202124;")
         memory_layout.addWidget(title)
         description = QLabel("三层记忆管理预留页，暂未接入读取、编辑与删除能力。")
@@ -573,7 +573,7 @@ class FloatingWindow(QMainWindow):
         title = QLabel("今天想一起完成什么？")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         title.setStyleSheet("font-size: 25px; font-weight: 650; color: #242a33;")
-        subtitle = QLabel("直接提问，或使用 SEC 命令管理会话、权限和工具。")
+        subtitle = QLabel("直接提问，或使用 SEC 命令管理会话和扩展能力。")
         subtitle.setObjectName("subtle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(title)
@@ -627,12 +627,13 @@ class FloatingWindow(QMainWindow):
         help_button.setToolTip("查看可用命令")
         help_button.clicked.connect(lambda: self._submit_command("/help"))
         self._agent_button = ComposerButton("agent")
-        self._agent_button.setToolTip("智能体选择 · 功能预留，暂未开放")
-        self._agent_button.setAccessibleName("智能体选择")
         self._agent_button.setEnabled(False)
+        self._agent_button.setToolTip("选择当前 Agent；运行期间的选择会在下一次 Run 生效")
+        self._agent_button.setAccessibleName("智能体选择")
+        self._agent_button.clicked.connect(lambda: self._open_tools("agent"))
         self._mode_button = ComposerButton("mode · 普通")
         mode_button = self._mode_button
-        mode_button.setToolTip("切换工具权限模式")
+        mode_button.setToolTip("切换扩展能力权限模式")
         mode_button.setStyleSheet(
             "QPushButton::menu-indicator { image: none; width: 0; }"
         )
@@ -655,7 +656,7 @@ class FloatingWindow(QMainWindow):
         mode_button.setMenu(mode_menu)
         mode_button.setEnabled(False)
         reload_button = ComposerButton("reload")
-        reload_button.setToolTip("重新加载 Skills 和 Prompts")
+        reload_button.setToolTip("重新加载智能体、技能、提示词、MCP 与工具插件")
         reload_button.clicked.connect(lambda: self._submit_command("/reload"))
         for button, name in (
             (help_button, "help"), (self._agent_button, "agent"),
@@ -785,6 +786,8 @@ class FloatingWindow(QMainWindow):
         self._runtime.resources_updated.connect(self._set_resources)
         self._runtime.configuration_result.connect(self._tool_page.show_result)
         self._runtime.configuration_result.connect(self._show_command_result)
+        self._tool_page.agent_requested.connect(self._runtime.select_agent)
+        self._tool_page.reload_requested.connect(self._runtime.reload_resources)
         self._runtime.assistant_started.connect(self._assistant_started)
         self._runtime.exit_requested.connect(self.close)
         self._runtime.run_failed.connect(self._show_error)
@@ -799,6 +802,7 @@ class FloatingWindow(QMainWindow):
         self._send.setEnabled(True)
         self._send_options.setEnabled(True)
         self._mode_button.setEnabled(True)
+        self._agent_button.setEnabled(True)
         self._tool_page.set_ready()
         self._input.setFocus()
 
@@ -872,7 +876,7 @@ class FloatingWindow(QMainWindow):
 
     def _toggle_tools(self, expanded: bool) -> None:
         self._resources.setVisible(expanded)
-        self._tools_button.setToolTip("收起工具分类" if expanded else "展开工具分类")
+        self._tools_button.setToolTip("收起扩展能力分类" if expanded else "展开扩展能力分类")
 
     def _open_tools(self, kind: ToolKind) -> None:
         self._tools_button.setChecked(True)
@@ -1104,7 +1108,12 @@ class FloatingWindow(QMainWindow):
             item = self._resources.topLevelItem(index)
             item.setData(1, Qt.ItemDataRole.UserRole, count)
             self._resource_counts[kind].setText(count)
-            item.setToolTip(0, "尚未接入" if kind == "mcp" else f"共 {count} 项（含已停用）")
+            item.setToolTip(
+                0,
+                "MCP 服务状态由 Sec Client 管理"
+                if kind == "mcp"
+                else f"共 {count} 项（含已停用）",
+            )
         self._tool_page.set_inventory(inventory)
 
     def _update_status(self, status: str) -> None:

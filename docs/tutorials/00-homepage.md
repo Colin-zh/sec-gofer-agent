@@ -29,7 +29,8 @@
 3. [配置重试、预算与上下文压缩](13-retries-budgets-and-context-compaction.md)
 4. [实现存储适配器](14-implement-storage-adapters.md)
 5. [排查常见问题](15-troubleshooting.md)
+6. [AgentCard、MCP、能力发现与会话内刷新](16-agents-capabilities-and-reload.md)
 
 ## 当前实现边界
 
-教程只指导当前可用的功能。MCP 连接管理、Dashboard 和云厂商 ObjectStore 适配器尚未实现；上下文压缩需要同时提供窗口大小和匹配 Provider 的 `TokenEstimator`；内置 Bash 不是安全沙箱。每篇相关教程会说明这些前提和限制。
+教程只指导当前可用的功能。Dashboard、网络 A2A 和云厂商 ObjectStore 适配器尚未实现；上下文压缩需要同时提供窗口大小和匹配 Provider 的 `TokenEstimator`；内置 Bash 和工具 worker 都不是安全沙箱。每篇相关教程会说明这些前提和限制。

@@ -293,6 +293,13 @@ class Conversation(QScrollArea):
             self._saved_follow = self._follow_tail
         self._update_navigation()
 
+    def _jump_to_marker(self) -> None:
+        marker = self.sender()
+        for bubble, button in self._user_targets:
+            if button is marker:
+                self._jump_to_user(bubble)
+                return
+
     def _update_navigation(self) -> None:
         height = min(len(self._user_targets) * 14 + 8, max(40, self.viewport().height() // 2))
         self._navigation.setGeometry(0, max(0, (self.viewport().height() - height) // 2), 26, height)
@@ -317,7 +324,7 @@ class Conversation(QScrollArea):
             return
         self._anchor = (widget, widget.mapTo(self.viewport(), QPoint()).y())
         self._anchor_passes = 0
-        QTimer.singleShot(0, self._restore_anchor)
+        QTimer.singleShot(0, self, self._restore_anchor)
 
     def _restore_anchor(self) -> None:
         if self._anchor is None:
@@ -329,7 +336,7 @@ class Conversation(QScrollArea):
             bar.setValue(bar.value() + widget.mapTo(self.viewport(), QPoint()).y() - previous_y)
         self._anchor_passes += 1
         if self._anchor_passes < 3:
-            QTimer.singleShot(0, self._restore_anchor)
+            QTimer.singleShot(0, self, self._restore_anchor)
             return
         self._anchor = None
         self._follow_tail = bar.maximum() - bar.value() <= 24
@@ -340,7 +347,7 @@ class Conversation(QScrollArea):
         self._restoring = True
 
     def end_refresh(self) -> None:
-        QTimer.singleShot(0, self._finish_refresh)
+        QTimer.singleShot(0, self, self._finish_refresh)
 
     def _finish_refresh(self) -> None:
         self._layout.activate()
@@ -384,7 +391,7 @@ class Conversation(QScrollArea):
             self._group.update_time(timestamp)
             row.deleteLater()
             self.bubbles.append(bubble)
-            QTimer.singleShot(0, bubble._fit_height)
+            QTimer.singleShot(0, bubble, bubble._fit_height)
             return bubble
         else:
             bubble = MessageBubble(role, text, row)
@@ -399,7 +406,7 @@ class Conversation(QScrollArea):
         self.bubbles.append(bubble)
         if role == "user":
             self._add_user_marker(bubble, text)
-        QTimer.singleShot(0, bubble._fit_height)
+        QTimer.singleShot(0, bubble, bubble._fit_height)
         return bubble
 
     def _add_user_marker(self, bubble: MessageBubble, text: str) -> None:
@@ -417,7 +424,7 @@ class Conversation(QScrollArea):
             "QPushButton:hover { color: #858b95; background: transparent; }"
             "QPushButton:checked { color: #000000; font-weight: 700; }"
         )
-        marker.clicked.connect(lambda _checked=False, target=bubble: self._jump_to_user(target))
+        marker.clicked.connect(self._jump_to_marker)
         self._navigation_layout.addWidget(marker)
         self._user_targets.append((bubble, marker))
         self._update_navigation()
@@ -453,5 +460,5 @@ class Conversation(QScrollArea):
         card = ApprovalCard(call_id, tool_name, arguments, self._content)
         card.decision_requested.connect(self.approval_decided)
         self._layout.insertWidget(self._layout.count() - 1, card)
-        QTimer.singleShot(0, card._fit_height)
+        QTimer.singleShot(0, card, card._fit_height)
         return card

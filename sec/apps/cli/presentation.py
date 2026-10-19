@@ -22,6 +22,8 @@ def welcome_panel(
     session_id: str,
     resources: ResourceSnapshot | None = None,
     enabled_extensions: tuple[str, ...] = (),
+    selected_agent: str | None = None,
+    pending_agent_id: str | None = None,
     permission_mode: str = "normal",
 ) -> Panel:
     """呈现版本、当前上下文、加载资源和主要终端快捷键。"""
@@ -40,6 +42,11 @@ def welcome_panel(
     content.append("\n")
     content.append("◈  Model              ", style="magenta")
     content.append(model or "not configured", style="bold")
+    content.append("\n")
+    content.append("✦  Agent              ", style="cyan")
+    content.append(selected_agent or "default", style="bold")
+    if pending_agent_id is not None:
+        content.append(f" · {pending_agent_id} queued for next Run", style="yellow")
     content.append("\n")
     content.append("#  Session            ", style="yellow")
     content.append(session_id, style="bold")

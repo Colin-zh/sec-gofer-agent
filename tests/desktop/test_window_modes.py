@@ -74,7 +74,9 @@ class WindowModeTests(unittest.TestCase):
         ]
         self.assertFalse(self.window._agent_button.isEnabled())
         self.assertFalse(self.window._agent_button.icon().pixmap(16, 16).isNull())
-        self.assertIn("暂未开放", self.window._agent_button.toolTip())
+        self.assertIn("下一次 Run", self.window._agent_button.toolTip())
+        self.window._runtime_ready("workspace")
+        self.assertTrue(self.window._agent_button.isEnabled())
         for button in buttons:
             self.assertEqual(button.height(), 36)
             self.assertEqual(button.geometry().center().y(), buttons[0].geometry().center().y())
@@ -88,9 +90,24 @@ class WindowModeTests(unittest.TestCase):
         ]
         self.assertEqual(gaps, [16, 16, 16])
         for button in (self.window._agent_button, self.window._scheduled_tasks):
+            normal = button.icon().pixmap(16, 16, QIcon.Mode.Normal).toImage()
+            disabled = button.icon().pixmap(16, 16, QIcon.Mode.Disabled).toImage()
+            self.assertFalse(normal.isNull())
+            self.assertFalse(disabled.isNull())
+
+            def visible_colors(image):
+                return {
+                    image.pixelColor(x, y).getRgb()[:3]
+                    for x in range(image.width())
+                    for y in range(image.height())
+                    if image.pixelColor(x, y).alpha() > 0
+                }
+
+            # SVG mode caches can use different edge antialiasing; compare source colors.
             self.assertEqual(
-                button.icon().pixmap(16, 16, QIcon.Mode.Normal).toImage(),
-                button.icon().pixmap(16, 16, QIcon.Mode.Disabled).toImage(),
+                visible_colors(normal),
+                visible_colors(disabled),
+                button.text(),
             )
 
     def test_scheduled_tasks_is_reserved_between_commands_and_tools(self) -> None:
@@ -479,8 +496,8 @@ class WindowModeTests(unittest.TestCase):
             ToolEntry("extension", "hello", "Enabled", "Extension", True),
         )))
         tree = self.window._resources
-        self.assertEqual(tree.topLevelItemCount(), 4)
-        self.assertEqual(tree.topLevelItem(0).data(1, Qt.ItemDataRole.UserRole), "1")
+        self.assertEqual(tree.topLevelItemCount(), 5)
+        self.assertEqual(tree.topLevelItem(2).data(1, Qt.ItemDataRole.UserRole), "1")
         self.window._open_tools("skill")
         self.assertIn("Review content", self.window._tool_page._preview.toPlainText())
         self.window._set_session_id("current")
@@ -503,7 +520,7 @@ class WindowModeTests(unittest.TestCase):
         self.assertEqual(tree.indentation(), 0)
         self.app.processEvents()
         self.assertFalse(tree.horizontalScrollBar().isVisible())
-        for index, title in enumerate(("智能体", "技能", "插件", "MCP")):
+        for index, title in enumerate(("智能体", "提示词模板", "技能", "插件", "MCP")):
             item = tree.topLevelItem(index)
             self.assertEqual(item.text(0), title)
             self.assertTrue(item.icon(0).isNull())
@@ -513,7 +530,7 @@ class WindowModeTests(unittest.TestCase):
             self.assertIn("#9299a3", count.styleSheet())
         self.window._input.setPlainText("draft")
         self.window._set_session_history((("user", "hello"),))
-        tree.itemClicked.emit(tree.topLevelItem(1), 0)
+        tree.itemClicked.emit(tree.topLevelItem(2), 0)
         self.assertIs(self.window._pages.currentWidget(), self.window._tool_page)
         self.assertIn("Review content", self.window._tool_page._preview.toPlainText())
         self.app.processEvents()
@@ -521,14 +538,68 @@ class WindowModeTests(unittest.TestCase):
             self.window._tool_page._explanation.palette().color(QPalette.ColorRole.WindowText).name(),
             "#202124",
         )
-        self.assertEqual(tree.topLevelItem(1).data(1, Qt.ItemDataRole.UserRole), "1")
+        self.assertEqual(tree.topLevelItem(2).data(1, Qt.ItemDataRole.UserRole), "1")
         self.window._set_resources(inventory)
         self.window._show_chat()
         self.assertEqual(self.window._input.toPlainText(), "draft")
         self.assertEqual(self.window._messages, [("user", "hello")])
         self.window._open_tools("mcp")
-        self.assertIn("尚未接入", self.window._tool_page._explanation.text())
+        self.assertIn("由 Sec Client 管理", self.window._tool_page._explanation.text())
         self.assertFalse(self.window._tool_page._enabled.isEnabled())
+
+    def test_agent_category_is_single_selection_and_reload_remains_available_while_busy(self) -> None:
+        page = self.window._tool_page
+        self.window._runtime_ready("workspace")
+        self.window._set_resources(ToolInventory((
+            ToolEntry("agent", "default", "General assistant", "Current Agent", True),
+            ToolEntry(
+                "agent", "writer", "Writing specialist · 已排队，将在下一次 Run 生效",
+                "Next Run", False,
+            ),
+            ToolEntry("mcp", "docs", "Docs · connected", "Service status: connected", True),
+        ), busy=True))
+        self.window._open_tools("agent")
+        self.assertEqual(page._list.selectionMode(), page._list.SelectionMode.SingleSelection)
+        self.assertEqual(page._list.currentItem().data(Qt.ItemDataRole.UserRole).name, "default")
+        self.assertFalse(page._enabled.isVisible())
+        requests = []
+        reloads = []
+        page.agent_requested.disconnect()
+        page.reload_requested.disconnect()
+        page.agent_requested.connect(requests.append)
+        page.reload_requested.connect(lambda: reloads.append(True))
+        page._list.setCurrentRow(1)
+        self.assertEqual(requests, ["writer"])
+        page.set_inventory(ToolInventory((
+            ToolEntry("mcp", "docs", "Docs · connected", "Service status: connected", True),
+        ), busy=True))
+        self.window._open_tools("mcp")
+        self.assertTrue(page._enabled.isEnabled())
+        self.assertTrue(page._reload.isEnabled())
+        page._reload.click()
+        self.assertEqual(reloads, [True])
+
+    def test_worker_plugin_mode_supports_hot_configuration_without_changing_global_permissions(self) -> None:
+        page = self.window._tool_page
+        page.activation_requested.disconnect()
+        requests = []
+        page.activation_requested.connect(lambda *args: requests.append(args))
+        self.window._runtime_ready("workspace")
+        self.window._set_resources(ToolInventory((
+            ToolEntry("extension", "hello", "Tools", "Trusted plugin", False, "worker"),
+        ), busy=True))
+        self.window._open_tools("extension")
+        self.assertTrue(page._execution_mode.isVisible())
+        self.assertEqual(page._execution_mode.currentData(), "worker")
+        self.assertTrue(page._enabled.isEnabled())
+        self.assertFalse(page._mode.isEnabled())
+        page._enabled.click()
+        self.assertEqual(requests, [("worker", "hello", True)])
+        self.window._set_resources(ToolInventory((
+            ToolEntry("extension", "hello", "Tools", "Trusted plugin", True, "worker"),
+        ), busy=True))
+        self.assertFalse(page._execution_mode.isEnabled())
+        self.assertTrue(page._enabled.isEnabled())
 
     def test_activation_and_permissions_wait_for_runtime_confirmation(self) -> None:
         page = self.window._tool_page

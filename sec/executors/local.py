@@ -11,7 +11,7 @@ from time import time
 
 from sec._types.content import TextContent, ToolUseContent
 from sec._types.messages import ToolResultMessage
-from sec.tools.tool import Tool
+from sec.tools.tool import Tool, ToolOutput
 
 
 class LocalToolExecutor:
@@ -24,6 +24,22 @@ class LocalToolExecutor:
     ) -> ToolResultMessage:
         """运行绑定函数，并保留工具调用 ID 以配对结果。"""
         value = await tool.invoke(tool_use.arguments)
+        if isinstance(value, ToolOutput):
+            metadata = dict(value.metadata or {})
+            if value.structured_content is not None:
+                metadata["structured_content"] = dict(value.structured_content)
+            json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+            text = value.text
+            if not text and value.structured_content is not None:
+                text = json.dumps(value.structured_content, ensure_ascii=False)
+            return ToolResultMessage(
+                tool_call_id=tool_use.id,
+                tool_name=tool_use.name,
+                content=[TextContent(text=text)],
+                is_error=value.is_error,
+                metadata=metadata,
+                timestamp=time(),
+            )
         content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         return ToolResultMessage(
             tool_call_id=tool_use.id,

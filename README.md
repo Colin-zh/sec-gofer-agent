@@ -56,11 +56,17 @@ uv run --no-sync sec-desktop
 # 或 uv run --no-sync python -m sec.apps.desktop
 ```
 
+若数据库配置使用 `opengauss+asyncpg`，同步时必须同时保留两组可选依赖：
+`uv sync --extra desktop --extra opengauss --no-editable`。
+pip 安装则使用 `pip install 'sec-gofer-agent[desktop,opengauss]'`。
+后续仅同步 `desktop` 会移除 openGauss 方言和 asyncpg 驱动。
+
 支持大屏专注/悬浮球切换、会话恢复、流式回答、工具审批及 CLI 斜杠命令。
 Extension 安装到同一 `.venv` 后，可通过 `--extension <name>` 显式启用；
 交互 CLI 也支持 `/reload` 查看已安装扩展，并用 `/reload enable <name...>` /
 `/reload disable <name...>` 在当前 Client 生命周期内切换启用集合。
-扩展代码更新仍需重启进程，且启停仅影响后续 Run。
+进程内扩展启停仅影响后续 Run；需要工具代码热更新时使用显式 tools-only
+worker 模式。AgentCard、Skill 和 MCP 管理通过共享核心资源 API 实现。
 详细说明见[桌面应用](sec/apps/desktop/README.md)。
 
 ## CLI 界面速览
@@ -117,7 +123,10 @@ with SecClient("assistant", "遵循用户指令。") as client:
 - **CLI**：交互式与管道式对话、命令补全、Run 控制、权限模式、Session 分支和便携式导入/导出。
 - **Python SDK**：同步和异步 Client、流式响应、工具调用、Run 事件与运行控制。
 - **工具与策略**：类型化工具定义、参数校验、工作区内置文件工具、工具审批及可替换 Policy/Executor。
-- **Skills 与 Prompts**：从 Markdown 文件加载可复用的操作说明和提示模板。
+- **AgentCard 与能力目录**：选择和恢复智能体身份；Skills 支持模型原生发现、按需加载和确定性必用规则；Prompts 保留为输入模板。
+- **会话内刷新**：原子发布能力 generation，进行中的模型请求和完整工具批次保留旧绑定，后续请求使用新版本。
+- **MCP 与工具 worker**：MCP 连接、发现和调用沿用核心工具审批链；显式工具 worker 支持无需重启宿主的代码更新。
+- **多 Agent 委派**：子任务使用独立 Session，继承能力上限、共享每轮预算、审批和取消控制。
 - **Extensions**：通过 Python entry point 显式启用，可注册工具、Provider、Policy、SessionStore、UI handler、CLI 命令和 Run hooks。
 - **Session 与存储**：进程内或 SQLite SessionStore、会话恢复和分支操作；提供可实现的 ObjectStore 协议。
 - **运行可靠性**：模型及安全声明工具的有限重试、可控的工具错误反馈、每轮调用预算、用量统计和可选上下文压缩。
@@ -128,7 +137,8 @@ with SecClient("assistant", "遵循用户指令。") as client:
 - 内置 Bash 以当前用户权限在主机上运行，**不是安全沙箱**。不要执行不可信命令。
 - CLI 的 Skills 和 Prompts 是提示文本，不执行 Markdown 文件中的代码；Extension 则是可执行 Python 包，只应启用可信扩展。
 - 当前 Provider 支持 OpenAI 与 Anthropic 的文本和工具交互；多模态内容尚未适配。
-- MCP 连接管理、Dashboard 和云厂商 ObjectStore 适配器尚未实现。`/share`、`/thinking` 和手动 `/compact` 也尚不可用。
+- Dashboard、网络 A2A 和云厂商 ObjectStore 适配器尚未实现。`/share`、`/thinking` 和手动 `/compact` 也尚不可用。
+- 工具 worker 不是安全沙箱；进程内 Extension 的任意 Provider、存储、UI 和 hooks 不支持原地代码热替换。详见 [AgentCard、MCP 与 Reload](docs/tutorials/16-agents-capabilities-and-reload.md)。
 
 ## 开发与测试
 

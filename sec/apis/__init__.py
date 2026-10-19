@@ -36,6 +36,10 @@ from sec.exceptions import (
     ToolExecutorProtocolError,
 )
 from sec.agent import Run, Session
+from sec.agent.card import AgentCard
+from sec.resources.agents import AgentCatalog
+from sec._runtime.capabilities import ReloadReport
+from sec.tools.tool import ToolOutput
 from sec._types.content import (
     Content,
     FileContent,
@@ -51,7 +55,10 @@ from sec._types.approvals import (
     ToolApprovalDecision,
     ToolApprovalRequest,
 )
-from sec._types.events import ModelRequestEndEvent, ModelRequestStartEvent, SessionEvent
+from sec._types.events import (
+    CapabilitySnapshotEvent, DelegationEvent,
+    ModelRequestEndEvent, ModelRequestStartEvent, SessionEvent,
+)
 from sec._types.limits import Limits, validate_timeout
 from sec._types.messages import (
     AgentMessage,
@@ -118,6 +125,12 @@ from sec.storage import (
 from sec.tools import Tool, ToolRiskLevel, tool
 
 __all__ = [
+    "AgentCard",
+    "AgentCatalog",
+    "ReloadReport",
+    "ToolOutput",
+    "CapabilitySnapshotEvent",
+    "DelegationEvent",
     "AgentMessage",
     "AsyncSecClient",
     "AssistantMessage",

@@ -17,7 +17,11 @@ from PySide6.QtCore import QObject, Signal
 from sec import AsyncSecClient, PermissionModePolicy, SessionSummary
 from sec.apps.cli import create_chat_commands
 from sec.apps.cli.app import _resource_command_specs
-from sec.apps.cli.chat_commands import ChatCommandOutcome, ChatCommandRegistry
+from sec.apps.cli.chat_commands import (
+    ChatCommandOutcome,
+    ChatCommandRegistry,
+    format_reload_report,
+)
 from sec.apps.cli.resources import CliResourceManager
 from sec.apps.cli.session_io import write_session_file
 from sec.agent import Run
@@ -28,6 +32,15 @@ from sec._types.session import CustomMessageEntry, MessageEntry
 from sec._types.json import JSONObject
 from sec._types.events import AgentSettledEvent
 from sec.apps.desktop.trace_store import TraceRecorder, TraceStore
+
+
+def _status_value(status: object, *names: str, default: object = "") -> object:
+    if isinstance(status, dict):
+        return next((status[name] for name in names if name in status), default)
+    return next(
+        (getattr(status, name) for name in names if hasattr(status, name)),
+        default,
+    )
 
 
 class SecRuntime(QObject):
@@ -113,8 +126,9 @@ class SecRuntime(QObject):
             )
 
     def submit_message(self, text: str, mode: str = "replace") -> None:
+        loop = self._require_loop()
         asyncio.run_coroutine_threadsafe(
-            self._submit_message(text, mode), self._require_loop(),
+            self._submit_message(text, mode), loop,
         )
 
     async def _submit_message(self, text: str, mode: str) -> None:
@@ -150,13 +164,27 @@ class SecRuntime(QObject):
         loop.call_soon_threadsafe(self._cancel_run)
 
     def configure_resource(self, kind: str, name: str, enabled: bool) -> None:
+        loop = self._require_loop()
         asyncio.run_coroutine_threadsafe(
-            self._configure_resource(kind, name, enabled), self._require_loop(),
+            self._configure_resource(kind, name, enabled), loop,
+        )
+
+    def reload_resources(self) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._reload_resources(), loop,
+        )
+
+    def select_agent(self, agent_id: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._select_agent(agent_id), loop,
         )
 
     def configure_permission(self, mode: str) -> None:
+        loop = self._require_loop()
         asyncio.run_coroutine_threadsafe(
-            self._configure_permission(mode), self._require_loop(),
+            self._configure_permission(mode), loop,
         )
 
     def _require_configuration_idle(self) -> tuple[AsyncSecClient, ChatCommandRegistry]:
@@ -186,22 +214,49 @@ class SecRuntime(QObject):
     async def _configure_resource(self, kind: str, name: str, enabled: bool) -> None:
         owns_update = False
         try:
-            client, commands = self._require_configuration_idle()
-            self._configuring = True
-            owns_update = True
+            client, commands = self._client, self._commands
+            if client is None or commands is None:
+                raise RuntimeError("Sec Client is not ready")
+            if self._configuring:
+                raise RuntimeError("配置正在更新，请稍后重试。")
+            if kind in {"skill", "prompt", "extension", "mcp", "worker"}:
+                if kind == "extension" or getattr(client, "capability_generation", 0) == 0:
+                    self._require_configuration_idle()
+                self._configuring = True
+                owns_update = True
             if kind in {"skill", "prompt"}:
-                manager = self._resources
-                if manager is None:
-                    raise RuntimeError("资源尚未就绪")
-                resource_kind: Literal["skill", "prompt"] = "skill" if kind == "skill" else "prompt"
-                previous = manager.is_enabled(resource_kind, name)
-                manager.set_enabled(resource_kind, name, enabled)
-                try:
-                    commands.replace_resource_commands(_resource_command_specs(manager))
-                except Exception:
-                    manager.set_enabled(resource_kind, name, previous)
-                    raise
+                setter = getattr(client, "set_resource_enabled", None)
+                if callable(setter):
+                    await setter(kind, name, enabled)
+                    manager = client.resources
+                else:
+                    manager = self._resources
+                    if manager is None:
+                        raise RuntimeError("资源尚未就绪")
+                    resource_kind: Literal["skill", "prompt"] = (
+                        "skill" if kind == "skill" else "prompt"
+                    )
+                    manager.set_enabled(resource_kind, name, enabled)
+                self._resources = manager
+                commands.replace_resource_commands(_resource_command_specs(manager))
                 self.command_completions.emit(commands.completion_items())
+            elif kind == "mcp":
+                setter = getattr(client, "set_mcp_enabled", None)
+                if not callable(setter):
+                    raise RuntimeError("MCP 配置不可用")
+                report = await setter(name, enabled)
+                self.configuration_result.emit(
+                    f"MCP 服务 {name} 已{'启用' if enabled else '停用'}。\n"
+                    f"{format_reload_report(report)}",
+                    "info",
+                )
+            elif kind == "worker":
+                names = set(client.worker_extensions)
+                if enabled:
+                    names.add(name)
+                else:
+                    names.discard(name)
+                await client.set_worker_extensions(tuple(sorted(names)))
             elif kind == "extension":
                 previous_extensions = client.enabled_extensions
                 action = "enable" if enabled else "disable"
@@ -224,15 +279,49 @@ class SecRuntime(QObject):
                         ) from save_error
                     raise
             else:
-                raise ValueError("MCP 尚未接入，不能激活")
-            self.configuration_result.emit(
-                f"{name} 已{'启用' if enabled else '停用'}，配置已保存。", "info",
-            )
+                raise ValueError(f"unsupported resource kind: {kind!r}")
+            if kind != "mcp":
+                self.configuration_result.emit(
+                    f"{name} 已{'启用' if enabled else '停用'}，配置已保存。", "info",
+                )
         except Exception as error:
             self.configuration_result.emit(f"资源配置失败：{error}", "error")
         finally:
             if owns_update:
                 self._configuring = False
+            self._publish_resources()
+
+    async def _reload_resources(self) -> None:
+        try:
+            client, commands = self._client, self._commands
+            if client is None or commands is None:
+                raise RuntimeError("Sec Client is not ready")
+            report = await client.reload_resources()
+            self._resources = client.resources
+            commands.replace_resource_commands(_resource_command_specs(self._resources))
+            self.command_completions.emit(commands.completion_items())
+            self.configuration_result.emit(format_reload_report(report), "info")
+        except Exception as error:
+            self.configuration_result.emit(f"资源重新加载失败：{error}", "error")
+        finally:
+            self._publish_resources()
+
+    async def _select_agent(self, agent_id: str) -> None:
+        try:
+            client = self._client
+            if client is None:
+                raise RuntimeError("Sec Client is not ready")
+            await client.select_agent(agent_id)
+            pending = client.pending_agent_id
+            message = (
+                f"Agent {agent_id} queued for the next Run."
+                if pending == agent_id
+                else f"Agent {agent_id} selected."
+            )
+            self.configuration_result.emit(message, "info")
+        except Exception as error:
+            self.configuration_result.emit(f"Agent selection failed: {error}", "error")
+        finally:
             self._publish_resources()
 
     def rename_session(self, session_id: str, name: str) -> None:
@@ -344,10 +433,6 @@ class SecRuntime(QObject):
             "normal",
             workspace_root=self.workspace,
         )
-        self._resources = CliResourceManager(
-            self.workspace, activation_path=self.workspace / ".sec" / "desktop-resources.json",
-        )
-        self._resources.reload()
         self._extension_settings = ExtensionSettings(
             self.workspace / ".sec" / "desktop-extensions.json",
         )
@@ -356,9 +441,11 @@ class SecRuntime(QObject):
             "You are Sec, a helpful desktop assistant. Be concise and transparent.",
             tools=create_builtin_tools(self.workspace),
             policy=self._policy,
+            workspace=self.workspace,
             enabled_extensions=self._extension_settings.resolve(self.enabled_extensions),
         ) as client:
             self._client = client
+            self._resources = client.resources
             self._commands = create_chat_commands(
                 client,
                 get_active_run=lambda: self._active_run,
@@ -715,6 +802,12 @@ class SecRuntime(QObject):
         ))
 
     def _publish_resources(self) -> None:
+        client = self._client
+        workspace_capabilities = (
+            client is not None and getattr(client, "capability_generation", 0) > 0
+        )
+        if workspace_capabilities:
+            self._resources = client.resources
         if self._resources is None:
             return
         snapshot = self._resources.available_snapshot
@@ -726,13 +819,53 @@ class SecRuntime(QObject):
             )
             for item in (*snapshot.prompts, *snapshot.skills)
         ]
-        if self._client is not None:
-            enabled = self._client.enabled_extensions
-            available = self._client.discover_extensions()
+        if workspace_capabilities:
+            selected_agent = client.selected_agent_id
+            pending_agent = client.pending_agent_id
+            for card in client.agent_cards:
+                state = (
+                    "Queued for the next Run."
+                    if card.id == pending_agent
+                    else "Currently selected."
+                    if card.id == selected_agent
+                    else ""
+                )
+                description = card.description
+                if card.id == pending_agent:
+                    description += " · 已排队，将在下一次 Run 生效"
+                entries.append(ToolEntry(
+                    "agent",
+                    card.id,
+                    description,
+                    f"{card.name}\n{card.description}\n\n{state}".strip(),
+                    card.id == selected_agent,
+                ))
+
+            for status in client.mcp_statuses:
+                server_id = str(_status_value(status, "id", "server_id", "name", default="unknown"))
+                name = str(_status_value(status, "name", "label", default=server_id))
+                state = str(_status_value(status, "status", "state", default="unknown"))
+                enabled_state = _status_value(status, "enabled", default=False)
+                error = _status_value(status, "error", "message", default="")
+                details = [f"Service: {name}", f"Status: {state}"]
+                if error:
+                    details.append(f"Details: {error}")
+                entries.append(ToolEntry(
+                    "mcp",
+                    server_id,
+                    f"{name} · {state}",
+                    "\n".join(details),
+                    bool(enabled_state),
+                ))
+
+        if client is not None:
+            enabled = client.enabled_extensions
+            workers = client.worker_extensions if workspace_capabilities else ()
+            available = client.discover_extensions()
             installed = {
                 point.name: point for point in entry_points(group="sec.extensions")
             }
-            for name in sorted(set(available) | set(enabled)):
+            for name in sorted(set(available) | set(enabled) | set(workers)):
                 point = installed.get(name)
                 distribution = point.dist if point is not None else None
                 summary = (
@@ -751,9 +884,14 @@ class SecRuntime(QObject):
                 entries.append(ToolEntry(
                     "extension", name, summary,
                     source + "\n"
-                    "启用时加载扩展代码及其工具、命令等贡献；停用会卸载贡献。\n"
+                    "worker 模式只接受工具，可重新加载 Python 代码；"
+                    "进程内模式支持工具、命令等完整贡献，但代码更新需要重启宿主。\n"
+                    "切换执行方式前须先停用当前插件。\n"
                     "预览不会导入未启用的扩展。工具执行仍受全局权限策略控制。",
-                    name in enabled,
+                    name in enabled or name in workers,
+                    "worker" if name in workers or (
+                        workspace_capabilities and name not in enabled
+                    ) else "in_process",
                 ))
         self.resources_updated.emit(ToolInventory(
             tuple(entries),

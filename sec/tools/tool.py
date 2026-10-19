@@ -9,12 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, get_args, get_origin, get_type_hints
 
 from sec._types.policy import PolicyCapabilityType, PolicyRiskLevel
+from jsonschema import ValidationError
+from jsonschema.validators import validator_for
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 ToolRiskLevel = PolicyRiskLevel
+
+
+@dataclass(frozen=True)
+class ToolOutput:
+    """Text and JSON results with explicit remote error semantics."""
+
+    text: str = ""
+    structured_content: Mapping[str, Any] | None = None
+    metadata: Mapping[str, Any] | None = None
+    is_error: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("tool output text must be a string")
+        if not isinstance(self.is_error, bool):
+            raise TypeError("tool output is_error must be a boolean")
+        for value in (self.structured_content, self.metadata):
+            if value is not None and not isinstance(value, Mapping):
+                raise TypeError("tool output structured content and metadata must be objects")
 
 
 def _schema_for(annotation: Any) -> dict[str, Any]:
@@ -27,7 +51,7 @@ def _schema_for(annotation: Any) -> dict[str, Any]:
         dict: {"type": "object"},
         list: {"type": "array"},
     }
-    if annotation is inspect.Signature.empty or annotation is Any:
+    if annotation is inspect.Signature.empty or annotation is Any or annotation is ToolOutput:
         return {}
     if annotation in schemas:
         return schemas[annotation]
@@ -77,7 +101,7 @@ class Tool:
 
     function: Callable[..., Any]
     definition: ToolDefinition
-    signature: inspect.Signature
+    signature: inspect.Signature | None
     retry_safe: bool = False
     risk_level: ToolRiskLevel = "unknown"
     source: str = "local"
@@ -153,14 +177,62 @@ class Tool:
 
     def validate_arguments(self, arguments: dict[str, Any]) -> None:
         """检查参数是否符合函数签名及生成的 JSON 类型约束。"""
+        if self.signature is None:
+            validator_class = validator_for(self.definition.input_schema)
+            try:
+                validator_class(
+                    self.definition.input_schema, registry=Registry()
+                ).validate(arguments)
+            except ValidationError as error:
+                raise TypeError(f"tool arguments do not match JSON schema: {error.message}") from error
+            except Unresolvable as error:
+                raise TypeError(f"tool JSON schema reference cannot be resolved: {error.ref}") from error
+            return
         self.signature.bind(**arguments)
         properties = self.definition.input_schema["properties"]
         for name, value in arguments.items():
             _validate_value(value, properties[name], name)
 
+    @classmethod
+    def from_schema(
+        cls,
+        function: Callable[[dict[str, Any]], Any],
+        *,
+        name: str,
+        description: str = "",
+        input_schema: Mapping[str, Any],
+        output_schema: Mapping[str, Any] | None = None,
+        retry_safe: bool = False,
+        risk_level: ToolRiskLevel = "unknown",
+        source: str = "local",
+        workspace_scoped: bool = False,
+        capability_type: PolicyCapabilityType = "tool",
+    ) -> Tool:
+        """Bind a JSON-schema tool to a callable accepting one argument object."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("tool name must not be empty")
+        schemas = [deepcopy(dict(input_schema)), deepcopy(dict(output_schema or {}))]
+        for schema in schemas:
+            validator_for(schema).check_schema(schema)
+        return cls(
+            function=function,
+            definition=ToolDefinition(name, description, schemas[0], schemas[1]),
+            signature=None,
+            retry_safe=retry_safe,
+            risk_level=risk_level,
+            source=source,
+            workspace_scoped=workspace_scoped,
+            capability_type=capability_type,
+        )
+
     async def invoke(self, arguments: dict[str, Any]) -> Any:
         """校验参数后调用工具，并等待同步或异步函数完成。"""
         self.validate_arguments(arguments)
+        if self.signature is None:
+            if inspect.iscoroutinefunction(self.function):
+                return await self.function(arguments)
+            result = await asyncio.to_thread(self.function, arguments)
+            return await result if inspect.isawaitable(result) else result
         if inspect.iscoroutinefunction(self.function):
             return await self.function(**arguments)
         result = await asyncio.to_thread(self.function, **arguments)

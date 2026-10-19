@@ -183,6 +183,26 @@ class ToolExecutionStartEvent:
 
 
 @dataclass(frozen=True)
+class DelegationEvent:
+    type: Literal["agent_delegation"] = field(default="agent_delegation", init=False)
+    parent_run_id: str
+    child_run_id: str
+    child_session_id: str
+    agent_id: str
+    status: Literal["started", "completed", "failed", "cancelled"]
+
+
+@dataclass(frozen=True)
+class CapabilitySnapshotEvent:
+    type: Literal["capability_snapshot"] = field(default="capability_snapshot", init=False)
+    generation: int
+    agent_id: str
+    card_digest: str
+    loaded_skills: tuple[str, ...]
+    tool_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ToolExecutionUpdateEvent:
     type: Literal["tool_execution_update"] = field(
         default="tool_execution_update",
@@ -344,6 +364,8 @@ class BashExecutionUpdateEvent:
 
 SessionEvent: TypeAlias = (
     EmptySessionEvent
+    | DelegationEvent
+    | CapabilitySnapshotEvent
     | AgentSettledEvent
     | AgentEndEvent
     | TurnEndEvent

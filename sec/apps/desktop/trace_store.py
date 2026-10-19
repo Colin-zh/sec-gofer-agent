@@ -18,8 +18,10 @@ from sec._types.events import (
     AgentSettledEvent,
     AutoRetryEndEvent,
     BranchRetryAttemptEvent,
+    CapabilitySnapshotEvent,
     CompactionEndEvent,
     CompactionStartEvent,
+    DelegationEvent,
     EmptySessionEvent,
     MessageBoundaryEvent,
     MessageUpdateEvent,
@@ -971,6 +973,18 @@ class TraceRecorder:
                 elapsed_ms=turn_duration,
             )
             payload = {"status": "completed", "duration_ms": turn_duration}
+        elif isinstance(event, CapabilitySnapshotEvent):
+            payload = {
+                "generation": event.generation, "agent_id": event.agent_id,
+                "card_digest": event.card_digest,
+                "loaded_skills": event.loaded_skills, "tool_names": event.tool_names,
+            }
+        elif isinstance(event, DelegationEvent):
+            payload = {
+                "parent_run_id": event.parent_run_id, "child_run_id": event.child_run_id,
+                "child_session_id": event.child_session_id,
+                "agent_id": event.agent_id, "status": event.status,
+            }
         elif isinstance(event, AgentSettledEvent):
             payload = {"status": event.status}
         elif isinstance(event, AgentEndEvent):
