@@ -41,6 +41,13 @@ class InMemoryEpisodicStore(EpisodicStoreProtocol):
             if item_id in self._records
         )
 
+    async def list(self, *, limit: int) -> tuple[EpisodicRecord, ...]:
+        _validate_top_k(limit)
+        async with self._lock:
+            records = list(self._records.values())
+        records.sort(key=lambda record: (record.timestamp, record.id), reverse=True)
+        return tuple(records[:limit])
+
     async def delete_session(self, session_id: str) -> None:
         _validate_session_id(session_id)
         async with self._lock:

@@ -24,3 +24,11 @@ def control_icon(name: str, *, retain_disabled_color: bool = False) -> QIcon:
     if retain_disabled_color:
         icon.addFile(path, QSize(), QIcon.Mode.Disabled)
     return icon
+
+
+def toggle_icon(name: str, active_name: str) -> QIcon:
+    """返回普通/选中两态图标；选中态使用填充的 ``active_name`` SVG。"""
+    icon = control_icon(name)
+    active_path = str(ICON_PATH.parent / f"{active_name}.svg")
+    icon.addFile(active_path, QSize(), QIcon.Mode.Normal, QIcon.State.On)
+    return icon

@@ -9,6 +9,7 @@ from sec.tools._builtins.edit import create_edit_tool
 from sec.tools._builtins.find import create_find_tool
 from sec.tools._builtins.grep import create_grep_tool
 from sec.tools._builtins.ls import create_ls_tool
+from sec.tools._builtins.question import create_question_tool
 from sec.tools._builtins.read import create_read_tool
 from sec.tools._builtins.write import create_write_tool
 from sec.tools.registry import ToolRegistry
@@ -29,11 +30,12 @@ def create_builtin_registry(workspace_root: str | Path) -> ToolRegistry:
         create_bash_tool,
     ):
         registry.register(create_tool(root))
+    registry.register(create_question_tool())
     return registry
 
 
 def create_builtin_tools(workspace_root: str | Path) -> tuple[Tool, ...]:
-    """创建绑定到一个工作区的 read/write/edit/ls/find/grep/bash 工具。"""
+    """创建绑定到一个工作区的 read/write/edit/ls/find/grep/bash/question 工具。"""
     return create_builtin_registry(workspace_root).tools
 
 __all__ = [

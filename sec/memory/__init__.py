@@ -13,6 +13,7 @@ from sec.memory.context_builder import (
 )
 from sec.memory.gate import MemoryGate
 from sec.memory.procedural import SkillSource, UserProfile
+from sec.memory.procedural_consolidation import ProceduralConsolidator
 from sec.memory.retrieval import MemoryRetriever
 from sec.memory.runtime import MemoryRuntime
 
@@ -24,6 +25,7 @@ __all__ = [
     "MemoryRetriever",
     "MemoryRuntime",
     "PreparedContext",
+    "ProceduralConsolidator",
     "SkillSource",
     "UserProfile",
 ]

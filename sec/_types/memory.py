@@ -2,9 +2,9 @@
 
 sec 的三层记忆由不同层负责：
 
-- episodic（情景）：原始对话消息的检索索引，见 EpisodicRecord / EpisodicStoreProtocol；
-- semantic（语义）：从会话对话抽取的持久事实，见 MemoryEntry / SemanticStoreProtocol；
-- procedural（程序性）：本地 USER.md 等跨 session 偏好，见 sec.memory.procedural。
+- episodic（情景）：带时间和 SessionStore 来源引用的事件检索记录；原始消息仍由 SessionStore 保存；
+- semantic（语义）：从用户明确陈述中抽取的稳定事实，见 MemoryEntry / SemanticStoreProtocol；
+- procedural（程序性）：用户确认的长期偏好/规则；Skill 作为独立能力资源，不写入用户偏好。
 
 检索/整理结果统一携带 status（ok/empty/failed），用于区分「没有命中」与
 「检索失败」，避免把失败伪装成没有记忆。
@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from hashlib import sha256
 from math import isfinite
 from typing import Literal, Protocol, TypeAlias
-
-from sec._types.embedding import Embedding
 
 MemoryKind: TypeAlias = Literal["semantic", "episodic"]
 MemoryOrigin: TypeAlias = Literal["user", "assistant", "explicit"]
@@ -59,7 +57,7 @@ class MemorySource:
 
 @dataclass(frozen=True)
 class MemoryEntry:
-    """表示一条持久语义记忆（事实 / 偏好 / 决定）。"""
+    """表示一条持久语义记忆（事实 / 决定；用户偏好归入程序记忆）。"""
 
     id: str
     content: str
@@ -100,7 +98,6 @@ class EpisodicRecord:
     entry_id: str
     text: str
     timestamp: float
-    embedding: Embedding | None = None
     kind: EpisodicKind = "message"
 
     def __post_init__(self) -> None:
@@ -116,11 +113,6 @@ class EpisodicRecord:
             raise ValueError("episodic record timestamp must be a finite number")
         if self.kind not in ("message", "tool_call", "tool_result"):
             raise ValueError("episodic record kind must be message, tool_call, or tool_result")
-        if self.embedding is not None and (
-            not isinstance(self.embedding, tuple)
-            or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in self.embedding)
-        ):
-            raise ValueError("episodic record embedding must be a tuple of numbers")
 
 
 class SemanticStoreProtocol(Protocol):
@@ -163,6 +155,9 @@ class EpisodicStoreProtocol(Protocol):
     async def search(self, query: str, *, top_k: int) -> tuple[EpisodicRecord, ...]:
         """按相关度返回最多 top_k 条消息；空结果返回 ()。"""
 
+    async def list(self, *, limit: int) -> tuple[EpisodicRecord, ...]:
+        """按时间倒序返回最多 limit 条记录；空结果返回 ()。"""
+
     async def delete_session(self, session_id: str) -> None:
         """删除某 session 的全部消息索引。"""
 
@@ -172,16 +167,19 @@ class EpisodicStoreProtocol(Protocol):
 
 @dataclass(frozen=True)
 class ProceduralBlock:
-    """表示一条可复用的过程性记忆（技能、用户偏好、执行规则等）。"""
+    """表示用户规则或独立 Skill 能力，不将两类来源混为一谈。"""
 
     name: str
     text: str
+    category: Literal["user_rule", "skill"] = "user_rule"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("procedural block name must not be empty")
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("procedural block text must not be empty")
+        if self.category not in ("user_rule", "skill"):
+            raise ValueError("procedural block category must be user_rule or skill")
 
 
 class ProceduralSource(Protocol):
@@ -224,6 +222,15 @@ class MemoryConsolidationResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ProceduralConsolidationResult:
+    """程序记忆（USER.md）整理结果；added 为本次新写入的规则文本。"""
+
+    status: MemoryConsolidationStatus
+    added: tuple[str, ...] = ()
+    error: str | None = None
+
+
 __all__ = [
     "DEFAULT_SCOPE",
     "EpisodicKind",
@@ -239,6 +246,7 @@ __all__ = [
     "MemoryRetrievalStatus",
     "MemorySource",
     "ProceduralBlock",
+    "ProceduralConsolidationResult",
     "ProceduralSource",
     "SemanticStoreProtocol",
     "memory_dedup_key",

@@ -28,6 +28,8 @@ class AgentLimits:
 class AgentDelegation:
     allowed_agents: tuple[str, ...] = ()
     max_depth: int = 0
+    fanout: int | None = None
+    budget_slice: int | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,8 @@ class AgentCard:
     max_tool_calls: int = 32
     allowed_agents: tuple[str, ...] = ()
     max_depth: int = 0
+    fanout: int | None = None
+    budget_slice: int | None = None
 
     def __post_init__(self) -> None:
         if not self.digest:
@@ -68,7 +72,9 @@ class AgentCard:
 
     @property
     def delegation(self) -> AgentDelegation:
-        return AgentDelegation(self.allowed_agents, self.max_depth)
+        return AgentDelegation(
+            self.allowed_agents, self.max_depth, self.fanout, self.budget_slice,
+        )
 
 
 def __getattr__(name: str):

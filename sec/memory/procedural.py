@@ -1,8 +1,8 @@
 """程序性记忆（「怎么做」）来源：本地 USER.md 与已发现的 Skills。
 
 统一为 `ProceduralSource` 契约（`load(query) -> tuple[ProceduralBlock, ...]`），
-由 `MemoryRetriever` 逐源加载后注入上下文。USER.md 是用户偏好文件，缺失或读取
-失败为尽力而为的降级（返回空，不阻断对话）；SkillSource 按 query 关键词匹配
+由 `MemoryRetriever` 逐源加载后注入上下文。USER.md 是用户偏好文件，缺失视为空；
+读取失败作为检索失败上报；SkillSource 按 query 关键词匹配
 已发现技能的名称/描述/适用场景，返回相关技能正文。
 
 Skills 在此仅作为可检索的过程性记忆被引用，不改变 `capabilities` 既有的
@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from sec._types.memory import ProceduralBlock, ProceduralSource
+from sec.exceptions import MemoryStoreError
 from sec.resources.markdown import CliResource
 
 
@@ -30,11 +31,15 @@ class UserProfile:
             return ()
         try:
             content = self._path.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeError):
+        except FileNotFoundError:
             return ()
+        except (OSError, UnicodeError) as exc:
+            raise MemoryStoreError(
+                f"could not read user memory profile {self._path}: {exc}"
+            ) from exc
         if not content:
             return ()
-        return (ProceduralBlock("User preferences", content),)
+        return (ProceduralBlock("User preferences", content, "user_rule"),)
 
 
 class SkillSource:
@@ -64,14 +69,16 @@ class SkillSource:
             return ()
         try:
             skills = self._skills_provider()
-        except Exception:
-            return ()
+        except Exception as exc:
+            raise MemoryStoreError(
+                f"could not load Skill resources: {type(exc).__name__}: {exc}"
+            ) from exc
 
         blocks: list[ProceduralBlock] = []
         for skill in skills:
             haystack = f"{skill.name} {skill.description} {skill.when_to_use}".casefold()
             if all(term in haystack for term in terms):
-                blocks.append(ProceduralBlock(skill.name, skill.content))
+                blocks.append(ProceduralBlock(skill.name, skill.content, "skill"))
                 if len(blocks) >= self._top_k:
                     break
         return tuple(blocks)

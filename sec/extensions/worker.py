@@ -375,6 +375,7 @@ class WorkerExtensionManager:
                 input_schema=definition["input_schema"],
                 output_schema=definition["output_schema"],
                 retry_safe=definition["retry_safe"],
+                safe_parallel=definition.get("safe_parallel", False),
                 risk_level=definition["risk_level"],
                 source=f"worker/{extension}",
                 workspace_scoped=definition["workspace_scoped"],

@@ -100,6 +100,13 @@ commands contributed by enabled extensions. Type `/` for completion.
   Selection preserves the Session; changes during a Trace queue for the next Trace.
   Controls use content-sized icon/text bounds without native menu padding.
   Reserved agent/timer icons retain their source colors while disabled.
+  Untitled sessions receive a short, automatically generated title after a run,
+  using the small-model tier (or the main provider when no small model is configured).
+  This auxiliary request is separate from conversation turns and is not added to
+  message history. Prompt completion waits for its title write to finish so the
+  next session action cannot race a detached rename. Generation failures leave
+  the session untitled; manual names and session switches take precedence over
+  a title still being generated.
   The icon to the left of the conversation title collapses/expands the sidebar,
   restoring its previous width without changing the conversation or draft.
   It is highlighted while the sidebar is collapsed, matching the pin button's
@@ -249,9 +256,14 @@ commands contributed by enabled extensions. Type `/` for completion.
   support expandable fields, JSON text, and copying the sanitized payload.
   Separate tabs retain the overview, observed events, and sanitized raw JSON.
   Live refreshes preserve the selected span, tree expansion, and detail tab.
-  Trace data is stored locally in `.sec/desktop-traces.sqlite3` and remains
-  available after restarting the desktop app; it is not uploaded. Sensitive
-  field names and common credential formats are redacted, and each stored JSON
+  Trace storage follows the configured SessionStore backend. With
+  `SEC_SESSION_STORE_BACKEND=database`, traces use the Client's shared database;
+  any existing local Trace database is migrated idempotently at startup and
+  retained as a backup. `SEC_DESKTOP_TRACE_STORE_PATH` configures that local
+  database path; relative paths are workspace-relative, and the default is
+  `.sec/desktop-traces.sqlite3`. When no Client database is configured, this
+  path is used for active local SQLite storage. Sensitive field
+  names and common credential formats are redacted, and each stored JSON
   payload is bounded. New model attempts record the actual standardized request
   messages and tool definitions, plus the normalized AssistantMessage response.
   This includes prompt/chat text; do not treat redaction as a guarantee that all

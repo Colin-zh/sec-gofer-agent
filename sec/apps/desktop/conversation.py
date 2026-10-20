@@ -2,11 +2,12 @@
 
 from datetime import datetime
 from html import escape
-from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
+    QLabel,
     QScrollArea,
     QSizePolicy,
     QStyle,
@@ -16,12 +17,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sec.apps.desktop.appearance import control_icon, toggle_icon
+
 
 class MessageBubble(QFrame):
-    def __init__(self, role: str, text: str, parent: QWidget) -> None:
+    action_requested = Signal(str)
+
+    def __init__(
+        self, role: str, text: str, parent: QWidget, timestamp: float | None = None,
+    ) -> None:
         super().__init__(parent)
         self.role = role
         self.text = text
+        self.message_index: int | None = None
+        self.retry_index: int | None = None
+        self.end_time: float | None = None
+        self._action_buttons: dict[str, QPushButton] = {}
+        self._action_bar: QWidget | None = None
+        self._end_time_label: QLabel | None = None
         self.setObjectName("userBubble" if role == "user" else "agentMessage")
         self.setStyleSheet(
             f"QFrame#{self.objectName()} {{"
@@ -42,7 +55,98 @@ class MessageBubble(QFrame):
         self.body.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.body)
+        if role == "assistant":
+            self._build_action_row(layout)
         self.set_text(text)
+        if role == "assistant" and timestamp is not None:
+            self.set_end_time(timestamp)
+
+    def _build_action_row(self, layout: QVBoxLayout) -> None:
+        bar = QWidget(self)
+        bar.setStyleSheet("QWidget { background: transparent; }")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 2, 0, 0)
+        row.setSpacing(2)
+        toggle_icons = {
+            "mark": "mark-active",
+            "like": "like-active",
+            "dislike": "dislike-active",
+        }
+        for name, tip, checkable in (
+            ("copy", "复制", False),
+            ("mark", "标记", True),
+            ("like", "点赞", True),
+            ("dislike", "点踩", True),
+            ("fork", "分支", False),
+            ("retry", "重试", False),
+            ("share", "分享", False),
+        ):
+            button = QPushButton()
+            if name in toggle_icons:
+                button.setIcon(toggle_icon(name, toggle_icons[name]))
+            else:
+                button.setIcon(control_icon(name))
+            button.setIconSize(QSize(16, 16))
+            button.setFixedSize(24, 24)
+            button.setCheckable(checkable)
+            button.setToolTip(tip)
+            button.setAccessibleName(tip)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(
+                "QPushButton { background: transparent; border: 0; border-radius: 6px;"
+                "padding: 0; }"
+                "QPushButton:hover { background: #e6e9ed; }"
+            )
+            button.clicked.connect(self._action_clicked)
+            self._action_buttons[name] = button
+            row.addWidget(button)
+        row.addStretch(1)
+        self._end_time_label = QLabel("")
+        self._end_time_label.setStyleSheet(
+            "color: #9299a3; font-size: 11px; background: transparent;"
+        )
+        row.addWidget(self._end_time_label)
+        layout.addWidget(bar)
+        self._action_bar = bar
+        # 操作栏在模型响应完成前隐藏，完成后随结束时间一起展示。
+        bar.setVisible(False)
+
+    def _action_clicked(self) -> None:
+        sender = self.sender()
+        for name, button in self._action_buttons.items():
+            if button is sender:
+                self._emit_action(name)
+                return
+
+    def _emit_action(self, name: str) -> None:
+        if name == "like":
+            dislike = self._action_buttons.get("dislike")
+            if dislike is not None:
+                dislike.setChecked(False)
+        elif name == "dislike":
+            like = self._action_buttons.get("like")
+            if like is not None:
+                like.setChecked(False)
+        self.action_requested.emit(name)
+
+    def set_end_time(self, timestamp: float | None) -> None:
+        if timestamp is None or self._end_time_label is None:
+            return
+        self.end_time = timestamp
+        formatted = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        self._end_time_label.setText(formatted)
+        self._end_time_label.setToolTip(formatted)
+        if self._action_bar is not None:
+            self._action_bar.setVisible(True)
+
+    def action_checked(self, name: str) -> bool:
+        button = self._action_buttons.get(name)
+        return bool(button is not None and button.isChecked())
+
+    def set_action_checked(self, name: str, checked: bool) -> None:
+        button = self._action_buttons.get(name)
+        if button is not None:
+            button.setChecked(checked)
 
     def set_text(self, text: str) -> None:
         self.text = text
@@ -101,6 +205,7 @@ class ActivityBubble(MessageBubble):
 
     def __init__(self, text: str, parent: QWidget, timestamp: float | None = None) -> None:
         self.timestamp = timestamp
+        self.expansion_key: tuple[str, int] | None = None
         super().__init__("process", text, parent)
         font = self.body.font()
         font.setPointSizeF(max(7, font.pointSizeF() - 2))
@@ -145,6 +250,7 @@ class ProcessGroup(QFrame):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.count = 0
+        self.turn = 0
         self.started_at = started_at
         self.finished_at: float | None = None
         self._layout = QVBoxLayout(self)
@@ -200,6 +306,7 @@ class ProcessGroup(QFrame):
 
 class Conversation(QScrollArea):
     approval_decided = Signal(str, bool)
+    message_action = Signal(str, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -226,6 +333,7 @@ class Conversation(QScrollArea):
         self._restoring = False
         self._anchor: tuple[QWidget, int] | None = None
         self._user_targets: list[tuple[MessageBubble, QPushButton]] = []
+        self._nav_targets: list[tuple[MessageBubble, QPushButton]] = []
         self._navigation = QScrollArea(self.viewport())
         self._navigation.setWidgetResizable(True)
         self._navigation.setFrameShape(QFrame.Shape.NoFrame)
@@ -235,7 +343,7 @@ class Conversation(QScrollArea):
             "QScrollArea, QWidget#inputNavigationRail { background: transparent; border: 0; }"
         )
         self._navigation.viewport().setAutoFillBackground(False)
-        self._navigation.setAccessibleName("用户输入导航")
+        self._navigation.setAccessibleName("会话导航")
         rail = QWidget()
         rail.setObjectName("inputNavigationRail")
         rail.setAutoFillBackground(False)
@@ -295,22 +403,23 @@ class Conversation(QScrollArea):
 
     def _jump_to_marker(self) -> None:
         marker = self.sender()
-        for bubble, button in self._user_targets:
+        for bubble, button in self._nav_targets:
             if button is marker:
                 self._jump_to_user(bubble)
                 return
 
     def _update_navigation(self) -> None:
-        height = min(len(self._user_targets) * 14 + 8, max(40, self.viewport().height() // 2))
+        targets = self._nav_targets
+        height = min(len(targets) * 14 + 8, max(40, self.viewport().height() // 2))
         self._navigation.setGeometry(0, max(0, (self.viewport().height() - height) // 2), 26, height)
-        self._navigation.setVisible(bool(self._user_targets))
+        self._navigation.setVisible(bool(targets))
         self._navigation.raise_()
         bar = self.verticalScrollBar()
         active = 0
-        for index, (bubble, _button) in enumerate(self._user_targets):
+        for index, (bubble, _button) in enumerate(targets):
             if bubble.mapTo(self._content, QPoint()).y() <= bar.value() + 24:
                 active = index
-        for index, (_bubble, button) in enumerate(self._user_targets):
+        for index, (_bubble, button) in enumerate(targets):
             button.setChecked(index == active)
         self._bottom_button.move(
             max(0, (self.viewport().width() - 34) // 2),
@@ -318,6 +427,39 @@ class Conversation(QScrollArea):
         )
         self._bottom_button.setVisible(bar.maximum() - bar.value() > 24)
         self._bottom_button.raise_()
+
+    def _rebuild_navigation(self) -> None:
+        self._nav_targets = list(self._user_targets)
+        for _ in range(self._navigation_layout.count()):
+            self._navigation_layout.takeAt(0)
+        for _bubble, button in self._nav_targets:
+            self._navigation_layout.addWidget(button)
+        self._update_navigation()
+
+    def set_bubble_marked(self, bubble: MessageBubble, marked: bool) -> None:
+        user_bubble = self._user_bubble_for(bubble)
+        if user_bubble is None:
+            return
+        marker = self._marker_for_user(user_bubble)
+        if marker is not None:
+            marker.setText("●" if marked else "—")
+            marker.setStyleSheet(self._user_marker_style(marked))
+
+    def _user_bubble_for(self, assistant: MessageBubble) -> MessageBubble | None:
+        try:
+            index = self.bubbles.index(assistant)
+        except ValueError:
+            return None
+        for bubble in reversed(self.bubbles[:index]):
+            if bubble.role == "user":
+                return bubble
+        return None
+
+    def _marker_for_user(self, user_bubble: MessageBubble) -> QPushButton | None:
+        for target, marker in self._user_targets:
+            if target is user_bubble:
+                return marker
+        return None
 
     def _preserve_toggle(self, widget: QWidget) -> None:
         if not widget.isVisible() or self._restoring:
@@ -370,22 +512,20 @@ class Conversation(QScrollArea):
             occurrence = self._activity_counts.get(text, 0)
             self._activity_counts[text] = occurrence + 1
             key = (text, occurrence)
+            bubble.expansion_key = key
             bubble.toggle.setChecked(self._activity_expansion.get(key, False))
-            bubble.toggle.toggled.connect(
-                lambda checked, identity=key: self._activity_expansion.__setitem__(identity, checked)
-            )
+            bubble.toggle.toggled.connect(self._activity_toggled)
             bubble.expansion_changing.connect(self._preserve_toggle)
             if self._group is None:
                 self._group = ProcessGroup(
                     self._content,
                     self._turn_started_at if self._turn_started_at is not None else timestamp,
                 )
+                self._group.turn = self._turn
                 self.process_groups.append(self._group)
                 self._group.toggle.setChecked(self._group_expansion.get(self._turn, False))
                 self._group.expansion_changing.connect(self._preserve_toggle)
-                self._group.toggle.toggled.connect(
-                    lambda checked, turn=self._turn: self._group_expansion.__setitem__(turn, checked)
-                )
+                self._group.toggle.toggled.connect(self._group_toggled)
                 self._layout.insertWidget(self._layout.count() - 1, self._group)
             self._group.add_step(bubble)
             self._group.update_time(timestamp)
@@ -394,9 +534,11 @@ class Conversation(QScrollArea):
             QTimer.singleShot(0, bubble, bubble._fit_height)
             return bubble
         else:
-            bubble = MessageBubble(role, text, row)
+            bubble = MessageBubble(role, text, row, timestamp=timestamp)
             if role == "assistant" and self._group is not None:
                 self._group.update_time(timestamp)
+        if role == "assistant":
+            bubble.action_requested.connect(self._message_action_requested)
         if role == "user":
             layout.addStretch(1)
             layout.addWidget(bubble, 4)
@@ -409,6 +551,35 @@ class Conversation(QScrollArea):
         QTimer.singleShot(0, bubble, bubble._fit_height)
         return bubble
 
+    def _message_action_requested(self, action: str) -> None:
+        bubble = self.sender()
+        if isinstance(bubble, MessageBubble):
+            self.message_action.emit(action, bubble)
+
+    def _activity_toggled(self, checked: bool) -> None:
+        toggle = self.sender()
+        bubble = toggle.parent() if isinstance(toggle, QPushButton) else None
+        if isinstance(bubble, ActivityBubble) and bubble.expansion_key is not None:
+            self._activity_expansion[bubble.expansion_key] = checked
+
+    def _group_toggled(self, checked: bool) -> None:
+        toggle = self.sender()
+        group = toggle.parent() if isinstance(toggle, QPushButton) else None
+        if isinstance(group, ProcessGroup):
+            self._group_expansion[group.turn] = checked
+
+    def _user_marker_style(self, marked: bool) -> str:
+        color = "#22a06b" if marked else "#bcc2cb"
+        hover = "#1a7f52" if marked else "#858b95"
+        checked = "#0f5c3a" if marked else "#000000"
+        size = " font-size: 10px;" if marked else ""
+        return (
+            "QPushButton { background: transparent; border: 0; padding: 0;"
+            f"color: {color};{size} text-align: center; }}"
+            f"QPushButton:hover {{ color: {hover}; background: transparent; }}"
+            f"QPushButton:checked {{ color: {checked}; font-weight: 700; }}"
+        )
+
     def _add_user_marker(self, bubble: MessageBubble, text: str) -> None:
         marker = QPushButton("—")
         marker.setFixedSize(22, 14)
@@ -418,19 +589,15 @@ class Conversation(QScrollArea):
         preview = " ".join(text.split())[:240]
         marker.setToolTip(f"<b>第 {number} 条输入</b><br>{escape(preview)}")
         marker.setAccessibleName(f"定位第 {number} 条用户输入")
-        marker.setStyleSheet(
-            "QPushButton { background: transparent; border: 0; padding: 0;"
-            "color: #bcc2cb; text-align: center; }"
-            "QPushButton:hover { color: #858b95; background: transparent; }"
-            "QPushButton:checked { color: #000000; font-weight: 700; }"
-        )
+        marker.setStyleSheet(self._user_marker_style(False))
         marker.clicked.connect(self._jump_to_marker)
         self._navigation_layout.addWidget(marker)
         self._user_targets.append((bubble, marker))
-        self._update_navigation()
+        self._rebuild_navigation()
 
     def clear(self) -> None:
         self._user_targets.clear()
+        self._nav_targets.clear()
         while self._navigation_layout.count():
             item = self._navigation_layout.takeAt(0)
             widget = item.widget()

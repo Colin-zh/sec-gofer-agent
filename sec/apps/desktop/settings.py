@@ -1,8 +1,36 @@
 """Persist explicit workspace extension choices without importing extensions."""
 
+from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
 import tempfile
+
+from dotenv import dotenv_values
+
+
+def resolve_trace_store_path(
+    workspace: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the local TraceStore path from workspace .env and process settings."""
+    workspace = Path(workspace).expanduser().resolve()
+    values = {
+        **dotenv_values(workspace / ".env"),
+        **(os.environ if environ is None else environ),
+    }
+    configured = values.get("SEC_DESKTOP_TRACE_STORE_PATH")
+    if configured is None or not configured.strip():
+        return (workspace / ".sec" / "desktop-traces.sqlite3").resolve()
+
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = workspace / path
+    path = path.resolve()
+    if path.exists() and not path.is_file():
+        raise ValueError(f"Desktop TraceStore path is not a file: {path}")
+    return path
 
 
 class ExtensionSettings:

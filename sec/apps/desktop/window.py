@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import sys
+import time
 
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, Signal
 from PySide6.QtGui import QActionGroup, QCloseEvent, QColor, QIcon, QKeyEvent, QPainter, QPaintEvent, QStandardItem, QStandardItemModel, QTextCursor
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -40,6 +42,9 @@ from sec.apps.desktop.session_list import SessionItemDelegate
 from sec.apps.desktop.tool_page import TOOL_CATEGORIES, ToolInventory, ToolKind, ToolPage
 from sec.apps.desktop.trace_page import TracePage
 from sec.apps.desktop.commands_page import CommandsPage
+from sec.apps.desktop.scheduled_tasks_page import ScheduledTasksPage
+from sec.apps.desktop.memory_page import MemoryPage
+from sec.apps.desktop.toast import ToastManager
 from sec.apps.desktop.dialogs import confirm_delete, export_session, rename_session, show_error
 
 
@@ -195,6 +200,7 @@ class FloatingWindow(QMainWindow):
         self._session_id: str | None = None
         self._session_names: dict[str, str] = {}
         self._send_mode = "replace"
+        self._ready = False
         self._run_active = False
         self._history_timestamps: tuple[float, ...] = ()
         self._active_assistant = False
@@ -254,6 +260,11 @@ class FloatingWindow(QMainWindow):
             QListWidget#sessions::item:selected {
                 background: white; color: #1d232c;
             }
+            QLineEdit#sessionSearch {
+                background: white; color: #202124; padding: 7px 10px;
+                border: 1px solid #dfe3ea; border-radius: 8px;
+            }
+            QLineEdit#sessionSearch:focus { border-color: #a8b8cf; }
             QFrame#composer {
                 background: white; border: 1px solid #dfe3e8; border-radius: 16px;
             }
@@ -281,6 +292,10 @@ class FloatingWindow(QMainWindow):
         splitter.setSizes([252, 868])
         self.setCentralWidget(splitter)
 
+        self._toasts = ToastManager(self)
+        self._toasts.setGeometry(self.rect())
+        self._toasts.raise_()
+
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
@@ -294,7 +309,7 @@ class FloatingWindow(QMainWindow):
         brand_icon = QLabel()
         brand_icon.setPixmap(application_icon().pixmap(28, 28))
         brand_row.addWidget(brand_icon)
-        brand = QLabel("Sec")
+        brand = QLabel("Sec · 小二")
         brand.setObjectName("brand")
         brand_row.addWidget(brand)
         brand_row.addStretch(1)
@@ -312,6 +327,7 @@ class FloatingWindow(QMainWindow):
 
         self._new_chat = QPushButton("新对话")
         self._new_chat.setIcon(control_icon("new"))
+        self._new_chat.setEnabled(False)
         self._new_chat.clicked.connect(lambda: self._submit_command("/new"))
         layout.addWidget(self._new_chat)
 
@@ -322,8 +338,8 @@ class FloatingWindow(QMainWindow):
 
         self._scheduled_tasks = QPushButton("定时任务")
         self._scheduled_tasks.setIcon(control_icon("timer", retain_disabled_color=True))
-        self._scheduled_tasks.setToolTip("定时任务 · 功能预留，暂未开放")
-        self._scheduled_tasks.setEnabled(False)
+        self._scheduled_tasks.setToolTip("定时任务")
+        self._scheduled_tasks.clicked.connect(self._show_scheduled_tasks)
         layout.addWidget(self._scheduled_tasks)
 
         self._memory_button = QPushButton("知识与记忆")
@@ -447,6 +463,14 @@ class FloatingWindow(QMainWindow):
         )
         section.addWidget(self._refresh_sessions_button)
         layout.addLayout(section)
+
+        self._session_search = QLineEdit()
+        self._session_search.setObjectName("sessionSearch")
+        self._session_search.setPlaceholderText("搜索会话")
+        self._session_search.setClearButtonEnabled(True)
+        self._session_search.setAccessibleName("搜索最近会话")
+        self._session_search.textChanged.connect(self._filter_sessions)
+        layout.addWidget(self._session_search)
 
         self._sessions = QListWidget()
         self._sessions.setObjectName("sessions")
@@ -572,19 +596,19 @@ class FloatingWindow(QMainWindow):
             ),
         )
         self._pages.addWidget(self._knowledge_page)
-        self._memory_page = self._build_memory_subpage(
-            "长期记忆",
-            "按三层架构组织的长期记忆：语义记忆（知道什么）、情景记忆（经历过什么）、"
-            "程序性记忆（应该怎么做）。",
-            (
-                ("情景记忆 · Episodic", "预留：任务经历、历史事件与结果回溯。"),
-                ("语义记忆 · Semantic", "预留：事实、偏好与长期知识。"),
-                ("程序记忆 · Procedural", "预留：可复用的方法、流程与经验。"),
-            ),
-        )
+        self._memory_page = MemoryPage()
+        self._memory_page.setEnabled(False)
+        self._memory_page.back_requested.connect(self._show_chat)
         self._pages.addWidget(self._memory_page)
         self._trace_page = TracePage(self._runtime.trace_store)
         self._pages.addWidget(self._trace_page)
+        self._scheduled_page = ScheduledTasksPage()
+        self._scheduled_page.setEnabled(False)
+        self._scheduled_page.back_requested.connect(self._show_chat)
+        self._scheduled_page.add_requested.connect(self._runtime.add_scheduled_task)
+        self._scheduled_page.remove_requested.connect(self._runtime.remove_scheduled_task)
+        self._scheduled_page.toggle_requested.connect(self._runtime.toggle_scheduled_task)
+        self._pages.addWidget(self._scheduled_page)
         self._pages.currentChanged.connect(self._sync_trace_button)
         layout.addWidget(self._pages, 1)
         return pane
@@ -612,6 +636,8 @@ class FloatingWindow(QMainWindow):
             self._pages.setCurrentWidget(self._knowledge_page)
         else:
             self._pages.setCurrentWidget(self._memory_page)
+            if self._ready:
+                self._runtime.list_memories()
         self._resources.clearSelection()
         for index in range(self._memory_resources.topLevelItemCount()):
             item = self._memory_resources.topLevelItem(index)
@@ -653,7 +679,7 @@ class FloatingWindow(QMainWindow):
         layout = QVBoxLayout(welcome)
         layout.setContentsMargins(0, 28, 0, 12)
         layout.addStretch(1)
-        title = QLabel("今天想一起完成什么？")
+        title = QLabel("客官，您是打尖还是住店？")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         title.setStyleSheet("font-size: 25px; font-weight: 650; color: #242a33;")
         subtitle = QLabel("直接提问，或使用 SEC 命令管理会话和扩展能力。")
@@ -865,11 +891,12 @@ class FloatingWindow(QMainWindow):
         self._runtime.command_completions.connect(self._set_command_completions)
         self._runtime.session_changed.connect(self._set_session_id)
         self._runtime.session_history.connect(self._set_session_history)
+        self._transcript.message_action.connect(self._message_action)
         self._runtime.session_timing.connect(self._set_session_timing)
         self._runtime.sessions_updated.connect(self._set_sessions)
         self._runtime.resources_updated.connect(self._set_resources)
         self._runtime.configuration_result.connect(self._tool_page.show_result)
-        self._runtime.configuration_result.connect(self._show_command_result)
+        self._runtime.configuration_result.connect(self._on_page_result)
         self._tool_page.agent_requested.connect(self._runtime.select_agent)
         self._tool_page.reload_requested.connect(self._runtime.reload_resources)
         self._runtime.assistant_started.connect(self._assistant_started)
@@ -878,8 +905,18 @@ class FloatingWindow(QMainWindow):
         self._runtime.run_finished.connect(self._run_finished)
         self._runtime.traces_updated.connect(self._trace_page.refresh_traces)
         self._runtime.trace_updated.connect(self._trace_page.refresh_trace)
+        self._runtime.scheduled_tasks_updated.connect(self._scheduled_page.set_jobs)
+        self._runtime.scheduled_task_result.connect(self._on_page_result)
+        self._runtime.memories_updated.connect(self._memory_page.set_data)
+        self._runtime.memory_result.connect(self._on_page_result)
+        self._runtime.memory_result.connect(self._memory_page.set_result)
+        self._memory_page.add_requested.connect(self._runtime.add_memory)
+        self._memory_page.update_requested.connect(self._runtime.update_memory)
+        self._memory_page.delete_requested.connect(self._runtime.delete_memory)
+        self._memory_page.procedural_save_requested.connect(self._runtime.save_procedural)
 
     def _runtime_ready(self, workspace: str) -> None:
+        self._ready = True
         self._workspace.setText(workspace)
         self._workspace.setToolTip(workspace)
         self._update_status("就绪")
@@ -888,6 +925,12 @@ class FloatingWindow(QMainWindow):
         self._mode_button.setEnabled(True)
         self._agent_button.setEnabled(True)
         self._tool_page.set_ready()
+        self._new_chat.setEnabled(True)
+        self._memory_page.setEnabled(True)
+        self._scheduled_page.setEnabled(True)
+        self._runtime.list_memories()
+        if self._pages.currentWidget() is self._scheduled_page:
+            self._runtime.list_scheduled_tasks()
         self._input.setFocus()
 
     def _send_prompt(self) -> None:
@@ -912,6 +955,8 @@ class FloatingWindow(QMainWindow):
         if command in {"/help", "/help full"}:
             self._show_commands()
             return
+        if not self._ready:
+            return
         self._show_chat()
         self._runtime.submit_input(command)
 
@@ -930,6 +975,12 @@ class FloatingWindow(QMainWindow):
     def _show_chat(self) -> None:
         self._pages.setCurrentWidget(self._chat_page)
         self._resources.clearSelection()
+
+    def _show_scheduled_tasks(self) -> None:
+        self._pages.setCurrentWidget(self._scheduled_page)
+        self._resources.clearSelection()
+        if self._ready:
+            self._runtime.list_scheduled_tasks()
 
     def _show_trace(self) -> None:
         self._pages.setCurrentWidget(self._trace_page)
@@ -976,7 +1027,7 @@ class FloatingWindow(QMainWindow):
         if not text:
             return
         if not self._run_active:
-            self._show_command_result("引导和追加需要正在运行的任务，输入已保留。", "error")
+            self._show_toast("引导和追加需要正在运行的任务，输入已保留。", "warning")
             return
         self._runtime.submit_control(command, text)
         self._input.clear()
@@ -985,11 +1036,14 @@ class FloatingWindow(QMainWindow):
         self._transcript.add_message("user", text)
 
     def _assistant_started(self) -> None:
+        if self._assistant_bubble is not None:
+            self._assistant_bubble.set_end_time(time.time())
         self._active_assistant = True
         self._assistant_index = len(self._messages)
         self._messages.append(("assistant", ""))
         self._welcome.hide()
         self._assistant_bubble = self._transcript.add_message("assistant", "")
+        self._assistant_bubble.message_index = self._assistant_index
 
     def _append_delta(self, text: str) -> None:
         if (
@@ -1028,6 +1082,7 @@ class FloatingWindow(QMainWindow):
             elif role in {"activity", "process"}:
                 last_activity[turn] = index
         turn = 0
+        retry_ordinal = 0
         for index, (role, text) in enumerate(messages):
             if role == "user":
                 turn += 1
@@ -1036,8 +1091,13 @@ class FloatingWindow(QMainWindow):
             ):
                 role = "process"
             timestamp = timestamps[index] if index < len(timestamps) else None
-            self._transcript.add_message(role, text, timestamp=timestamp)
+            bubble = self._transcript.add_message(role, text, timestamp=timestamp)
+            if role == "assistant":
+                bubble.message_index = index
+                bubble.retry_index = retry_ordinal
+                retry_ordinal += 1
         self._transcript.end_refresh()
+        self._apply_persisted_feedback()
 
     def _set_session_timing(self, timestamps: tuple[float, ...]) -> None:
         self._history_timestamps = timestamps
@@ -1047,6 +1107,13 @@ class FloatingWindow(QMainWindow):
             return
         self._transcript.add_message("notice", message)
         self._welcome.hide()
+
+    def _show_toast(self, message: str, kind: str = "info") -> None:
+        self._toasts.show_message(message, kind)
+
+    def _on_page_result(self, message: str, display_kind: str) -> None:
+        # 记忆/定时任务/配置等子页面已在页面内内联展示结果，这里统一用 toast 做全局提示。
+        self._show_toast(message, display_kind)
 
     def _set_command_completions(
         self,
@@ -1074,12 +1141,25 @@ class FloatingWindow(QMainWindow):
         self,
         sessions: tuple[tuple[str, str | None, float | None], ...],
     ) -> None:
-        self._sessions.clear()
+        self._all_sessions = sessions
         self._session_names = {
             session_id: name for session_id, name, _updated_at in sessions if name
         }
-        for session_id, name, updated_at in sessions:
+        self._render_sessions()
+        self._update_session_title()
+        self._select_active_session()
+
+    def _filter_sessions(self, _text: str | None = None) -> None:
+        self._render_sessions()
+        self._select_active_session()
+
+    def _render_sessions(self) -> None:
+        query = self._session_search.text().strip().casefold()
+        self._sessions.clear()
+        for session_id, name, updated_at in getattr(self, "_all_sessions", ()):
             title = name or f"对话 {session_id[:8]}"
+            if query and query not in f"{title} {session_id}".casefold():
+                continue
             if updated_at is not None:
                 date = datetime.fromtimestamp(updated_at).strftime("%y-%m-%d %H:%M")
             else:
@@ -1091,8 +1171,6 @@ class FloatingWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.AccessibleTextRole, f"{title} {date}".strip())
             item.setToolTip(f"{title}\n{date}\n{session_id}")
             self._sessions.addItem(item)
-        self._update_session_title()
-        self._select_active_session()
 
     def _update_session_title(self) -> None:
         name = self._session_names.get(self._session_id or "")
@@ -1176,7 +1254,7 @@ class FloatingWindow(QMainWindow):
         if name is None:
             return
         if not name.strip():
-            self._show_command_result("会话名称不能为空。", "error")
+            self._show_toast("会话名称不能为空。", "warning")
             return
         self._runtime.rename_session(session_id, name.strip())
 
@@ -1222,6 +1300,8 @@ class FloatingWindow(QMainWindow):
         self._update_send_button()
 
     def _run_finished(self) -> None:
+        if self._assistant_bubble is not None:
+            self._assistant_bubble.set_end_time(time.time())
         self._active_assistant = False
         self._assistant_index = None
         self._assistant_bubble = None
@@ -1231,6 +1311,107 @@ class FloatingWindow(QMainWindow):
         self._mode_button.setEnabled(True)
         self._tool_page.set_busy(False)
         self._input.setFocus()
+
+    def _message_action(self, action: str, bubble: MessageBubble) -> None:
+        if action == "copy":
+            if bubble.text:
+                QApplication.clipboard().setText(bubble.text)
+                self._show_toast("已复制到剪贴板。", "success")
+        elif action == "fork":
+            if self._session_id:
+                self._runtime.fork_session(
+                    self._session_id,
+                    self._session_names.get(self._session_id, ""),
+                )
+        elif action == "share":
+            if self._session_id:
+                self._session_action("export", self._session_id)
+        elif action == "retry":
+            self._retry_message(bubble)
+        elif action == "mark":
+            self._persist_mark(bubble)
+        elif action in {"like", "dislike"}:
+            self._persist_rating(bubble)
+
+    def _feedback_marks_key(self, session_id: str) -> str:
+        return f"feedback/{session_id}/marks"
+
+    def _feedback_ratings_key(self, session_id: str) -> str:
+        return f"feedback/{session_id}/ratings"
+
+    def _load_marks(self, session_id: str) -> set[int]:
+        raw = self._settings.value(self._feedback_marks_key(session_id), [])
+        return {int(item) for item in (raw or [])}
+
+    def _save_marks(self, session_id: str, marks: set[int]) -> None:
+        self._settings.setValue(self._feedback_marks_key(session_id), sorted(marks))
+
+    def _load_ratings(self, session_id: str) -> dict[int, str]:
+        raw = self._settings.value(self._feedback_ratings_key(session_id), {})
+        return {int(key): value for key, value in (raw or {}).items()}
+
+    def _save_ratings(self, session_id: str, ratings: dict[int, str]) -> None:
+        self._settings.setValue(
+            self._feedback_ratings_key(session_id),
+            {str(key): value for key, value in ratings.items()},
+        )
+
+    def _persist_mark(self, bubble: MessageBubble) -> None:
+        session_id = self._session_id
+        index = bubble.message_index
+        if session_id is None or index is None:
+            return
+        marks = self._load_marks(session_id)
+        marked = bubble.action_checked("mark")
+        if marked:
+            marks.add(index)
+        else:
+            marks.discard(index)
+        self._save_marks(session_id, marks)
+        self._transcript.set_bubble_marked(bubble, marked)
+        self._show_toast(
+            "已标记该回复。" if marked else "已取消标记。", "success",
+        )
+
+    def _persist_rating(self, bubble: MessageBubble) -> None:
+        session_id = self._session_id
+        index = bubble.message_index
+        if session_id is None or index is None:
+            return
+        ratings = self._load_ratings(session_id)
+        if bubble.action_checked("like"):
+            ratings[index] = "like"
+        elif bubble.action_checked("dislike"):
+            ratings[index] = "dislike"
+        else:
+            ratings.pop(index, None)
+        self._save_ratings(session_id, ratings)
+
+    def _apply_persisted_feedback(self) -> None:
+        session_id = self._session_id
+        if not session_id:
+            return
+        marks = self._load_marks(session_id)
+        ratings = self._load_ratings(session_id)
+        for bubble in self._transcript.bubbles:
+            if bubble.role != "assistant" or bubble.message_index is None:
+                continue
+            index = bubble.message_index
+            marked = index in marks
+            bubble.set_action_checked("mark", marked)
+            bubble.set_action_checked("like", ratings.get(index) == "like")
+            bubble.set_action_checked("dislike", ratings.get(index) == "dislike")
+            self._transcript.set_bubble_marked(bubble, marked)
+
+    def _retry_message(self, bubble: MessageBubble) -> None:
+        if self._run_active:
+            self._show_toast("请等待当前任务完成后再重试。", "warning")
+            return
+        retry_index = bubble.retry_index
+        if retry_index is None:
+            return
+        self._welcome.hide()
+        self._runtime.retry_message(retry_index)
 
     def _approve_tool(self, tool_call_id: str, tool_name: str, arguments: str) -> None:
         self._show_chat()
@@ -1349,3 +1530,9 @@ class FloatingWindow(QMainWindow):
         self._ball.close()
         self._runtime.shutdown()
         event.accept()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_toasts"):
+            self._toasts.setGeometry(self.rect())
+            self._toasts.raise_()

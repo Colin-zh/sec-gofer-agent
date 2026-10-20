@@ -1,8 +1,4 @@
-"""post-run 阶段从本次 Trace 消息中抽取语义事实并写入 SemanticStore。
-
-user 与 assistant 消息分开抽取，避免互相污染；抽取出的每条事实打 origin 标签
-（user / assistant）与来源 session，写入语义仓储时按 dedup_key 幂等去重。
-"""
+"""post-run 阶段从用户明确陈述中抽取语义事实并写入 SemanticStore。"""
 
 from __future__ import annotations
 
@@ -17,7 +13,6 @@ from sec._types.memory import (
     DEFAULT_SCOPE,
     MemoryConsolidationResult,
     MemoryEntry,
-    MemoryOrigin,
     MemorySource,
     memory_dedup_key,
     SemanticStoreProtocol,
@@ -27,20 +22,15 @@ from sec._types.providers import ModelProvider, ModelRequestOptions
 from sec.exceptions import MemoryStoreError, ProviderProtocolError, RetryableProviderError
 
 _USER_SYSTEM = (
-    "Extract durable facts and preferences stated BY the user from the given "
-    "conversation messages. Reply with ONLY a JSON array of objects with "
+    "Extract only stable factual statements explicitly stated BY the user "
+    "from the given conversation "
+    "messages. Reply with ONLY a JSON array of objects with "
     '"subject" and "content" keys. The subject is a short noun phrase, the '
-    "content is a self-contained factual sentence. Ignore greetings, chitchat, "
-    "commands, questions, and any statements about memory or system state. "
-    "Return [] if there are no durable facts."
-)
-
-_ASSISTANT_SYSTEM = (
-    "Extract durable facts, decisions, and results produced BY the assistant "
-    "from the given conversation messages. Reply with ONLY a JSON array of "
-    'objects with "subject" and "content" keys. Ignore process commentary, '
-    "restated user input, and any statements about memory or system state. "
-    "Return [] if there are no durable facts."
+    "content is a self-contained factual sentence. Do not infer facts from "
+    "assistant messages or unstated implications. Do NOT extract preferences "
+    "or instructions about how to work; those are handled separately. Ignore "
+    "greetings, chitchat, commands, questions, and any statements about memory "
+    "or system state. Return [] if there are no explicit stable facts."
 )
 
 _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.DOTALL)
@@ -53,9 +43,8 @@ _EPHEMERAL_MARKERS = (
     "recall nothing",
 )
 
-
 class MemoryConsolidator:
-    """对活动分支消息做 user/assistant 分离抽取并写入语义仓储。"""
+    """仅从用户明确陈述抽取稳定事实并写入语义仓储。"""
 
     def __init__(
         self,
@@ -84,38 +73,28 @@ class MemoryConsolidator:
             for message in messages
             if message.role == "user" and message.text.strip()
         ]
-        assistant_texts = [
-            message.text.strip()
-            for message in messages
-            if message.role == "assistant" and message.text.strip()
-        ]
-        if not user_texts and not assistant_texts:
+        if not user_texts:
             return MemoryConsolidationResult(status="empty")
 
         added_ids: list[str] = []
-        errors: list[str] = []
-        for origin, texts in (("user", user_texts), ("assistant", assistant_texts)):
-            if not texts:
-                continue
-            try:
-                facts = await self._extract(origin, texts)
-            except (RetryableProviderError, ProviderProtocolError, MemoryStoreError) as exc:
-                errors.append(f"{origin}: {type(exc).__name__}: {exc}")
-                continue
+        try:
+            facts = await self._extract(user_texts)
+        except (RetryableProviderError, ProviderProtocolError, MemoryStoreError) as exc:
+            return MemoryConsolidationResult(
+                status="failed",
+                error=f"user: {type(exc).__name__}: {exc}",
+            )
+        try:
             for subject, content in facts:
-                try:
-                    stored_id = await self._semantic.add(
-                        _build_entry(origin, subject, content, session_id)
-                    )
-                    added_ids.append(stored_id)
-                except MemoryStoreError as exc:
-                    errors.append(f"{origin} write: {type(exc).__name__}: {exc}")
-
-        if errors:
+                stored_id = await self._semantic.add(
+                    _build_entry(subject, content, session_id)
+                )
+                added_ids.append(stored_id)
+        except MemoryStoreError as exc:
             return MemoryConsolidationResult(
                 status="failed",
                 added_ids=tuple(added_ids),
-                error="; ".join(errors),
+                error=f"user write: {type(exc).__name__}: {exc}",
             )
         if not added_ids:
             return MemoryConsolidationResult(status="empty")
@@ -123,12 +102,10 @@ class MemoryConsolidator:
 
     async def _extract(
         self,
-        origin: MemoryOrigin,
         texts: Sequence[str],
     ) -> list[tuple[str | None, str]]:
-        system = _USER_SYSTEM if origin == "user" else _ASSISTANT_SYSTEM
         messages = [
-            SystemMessage(content=[TextContent(text=system)], timestamp=time()),
+            SystemMessage(content=[TextContent(text=_USER_SYSTEM)], timestamp=time()),
             UserMessage(content=[TextContent(text="\n\n".join(texts))], timestamp=time()),
         ]
         response = await self._provider.complete(
@@ -143,15 +120,19 @@ def _parse_facts(text: str) -> list[tuple[str | None, str]]:
     if array_match is not None:
         try:
             data = json.loads(array_match.group(0))
-        except json.JSONDecodeError:
-            data = None
+        except json.JSONDecodeError as exc:
+            raise ProviderProtocolError(
+                "semantic consolidation response contains invalid JSON"
+            ) from exc
     if data is None:
         object_match = _JSON_OBJECT_RE.search(text)
         if object_match is not None:
             try:
                 payload = json.loads(object_match.group(0))
-            except json.JSONDecodeError:
-                payload = None
+            except json.JSONDecodeError as exc:
+                raise ProviderProtocolError(
+                    "semantic consolidation response contains invalid JSON"
+                ) from exc
             if isinstance(payload, dict):
                 for key in ("facts", "items", "memories"):
                     candidate = payload.get(key)
@@ -159,7 +140,9 @@ def _parse_facts(text: str) -> list[tuple[str | None, str]]:
                         data = candidate
                         break
     if not isinstance(data, list):
-        return []
+        raise ProviderProtocolError(
+            "semantic consolidation response must contain a JSON array"
+        )
 
     facts: list[tuple[str | None, str]] = []
     for item in data:
@@ -181,7 +164,6 @@ def _is_ephemeral(content: str) -> bool:
 
 
 def _build_entry(
-    origin: MemoryOrigin,
     subject: str | None,
     content: str,
     session_id: str | None,
@@ -191,7 +173,7 @@ def _build_entry(
         id=uuid4().hex,
         content=content,
         kind="semantic",
-        source=MemorySource(origin=origin, session_id=session_id),
+        source=MemorySource(origin="user", session_id=session_id),
         created_at=now,
         updated_at=now,
         dedup_key=memory_dedup_key(subject, content),

@@ -169,6 +169,9 @@ class SecClient(_SecClientCore):
     def revoke_capability(self, name: str) -> None:
         self._blocking_call(self._revoke_capability(name))
 
+    def revoke_delegation(self, agent_id: str) -> int:
+        return self._blocking_call(self._revoke_delegation(agent_id))
+
     def stream(self, prompt: str) -> SyncTraceStream:
         """创建同步事件流上下文；实际启动 Trace 发生在进入上下文时。"""
         self._require_worker()

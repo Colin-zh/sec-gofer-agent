@@ -113,13 +113,22 @@ class ToolRetrySettings:
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    """保存 Harness 的运行时事件缓冲配置。"""
+    """保存运行时事件缓冲与工作区根目录配置。"""
 
     event_buffer_size: int = 128
+    root_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.event_buffer_size < 1:
             raise ConfigError("event buffer size must be at least 1")
+        if self.root_path is not None:
+            if not isinstance(self.root_path, Path):
+                raise ConfigError("SEC_ROOT_PATH must be a filesystem path")
+            object.__setattr__(
+                self,
+                "root_path",
+                self.root_path.expanduser().resolve(),
+            )
 
 
 @dataclass(frozen=True)
@@ -288,16 +297,18 @@ class MemorySettings:
 
     backend 取值 auto/in_memory/database；auto 跟随 SessionStore 后端并复用
     同一 Database。gate 与 consolidation 依赖模型 provider，额外消耗模型调用，
-    因此整体默认关闭，需通过 SEC_MEMORY_ENABLED=true 显式开启。
+    因此整体默认关闭，需通过 SEC_MEMORY_ENABLED=true 显式开启。检索预算默认
+    2048；USER.md 路径由 Client 根据 SEC_ROOT_PATH/workspace 提供默认值。
     """
 
     enabled: bool = False
     backend: str = "auto"
     top_k: int = 5
-    token_budget: int | None = None
+    token_budget: int = 2048
     user_md_path: str | None = None
     gate_enabled: bool = True
     consolidation_enabled: bool = True
+    procedural_consolidation_enabled: bool = True
     vector_dim: int = 1536
 
     def __post_init__(self) -> None:
@@ -351,6 +362,27 @@ class EmbeddingSettings:
 
 
 @dataclass(frozen=True)
+class AuxiliarySettings:
+    """保存辅助推理（小模型）步骤的开关与单轮调用预算。
+
+    enabled 为总开关；intent/rewrite/judge/trace_summary 分别控制意图分类与
+    内容路由、检索查询改写、LLM-as-Judge 输出判断、trace 摘要。辅助步骤不
+    计入 Agent 的 max_model_calls 预算，改用 max_calls_per_turn 独立限制。
+    """
+
+    enabled: bool = False
+    intent_enabled: bool = True
+    rewrite_enabled: bool = True
+    judge_enabled: bool = False
+    trace_summary_enabled: bool = False
+    max_calls_per_turn: int = 4
+
+    def __post_init__(self) -> None:
+        if self.max_calls_per_turn < 1:
+            raise ConfigError("aux max calls per turn must be at least 1")
+
+
+@dataclass(frozen=True)
 class Config:
     """封装 sec 的分层配置值。
 
@@ -359,6 +391,7 @@ class Config:
     """
 
     provider: ProviderSettings
+    small_provider: ProviderSettings | None = None
     agent: AgentSettings = field(default_factory=AgentSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     retry: RetrySettings = field(default_factory=RetrySettings)
@@ -367,6 +400,7 @@ class Config:
     storage: StorageSettings = field(default_factory=StorageSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
+    auxiliary: AuxiliarySettings = field(default_factory=AuxiliarySettings)
 
     @classmethod
     def from_env(
@@ -389,13 +423,15 @@ class Config:
             )
         environment = os.environ if environ is None else environ
         values = {**file_values, **environment}
+        main_provider = _load_provider_settings(
+            file_values,
+            environment,
+            values,
+            provider_names,
+        )
         return cls(
-            provider=_load_provider_settings(
-                file_values,
-                environment,
-                values,
-                provider_names,
-            ),
+            provider=main_provider,
+            small_provider=_load_small_provider_settings(values, main_provider),
             agent=_load_agent_settings(values),
             runtime=_load_runtime_settings(values),
             retry=_load_retry_settings(values),
@@ -404,6 +440,7 @@ class Config:
             storage=_load_storage_settings(values, storage_backends),
             memory=_load_memory_settings(values),
             embedding=_load_embedding_settings(values),
+            auxiliary=_load_auxiliary_settings(values),
         )
 
 
@@ -496,12 +533,14 @@ def _load_agent_settings(values: Mapping[str, str]) -> AgentSettings:
 
 
 def _load_runtime_settings(values: Mapping[str, str]) -> RuntimeSettings:
+    root_path = _optional_raw(values, "SEC_ROOT_PATH")
     return RuntimeSettings(
         event_buffer_size=_positive_int(
             values,
             "SEC_EVENT_BUFFER_SIZE",
             default=128,
-        )
+        ),
+        root_path=Path(root_path).expanduser() if root_path is not None else None,
     )
 
 
@@ -595,12 +634,21 @@ def _load_memory_settings(values: Mapping[str, str]) -> MemorySettings:
         enabled=_boolean(values, "SEC_MEMORY_ENABLED", default=False),
         backend=_nonempty(values, "SEC_MEMORY_BACKEND", default="auto").lower(),
         top_k=_positive_int(values, "SEC_MEMORY_TOP_K", default=5),
-        token_budget=_optional_positive_int(values, "SEC_MEMORY_TOKEN_BUDGET"),
+        token_budget=_positive_int(
+            values,
+            "SEC_MEMORY_TOKEN_BUDGET",
+            default=2048,
+        ),
         user_md_path=_optional_raw(values, "SEC_MEMORY_USER_MD_PATH"),
         gate_enabled=_boolean(values, "SEC_MEMORY_GATE_ENABLED", default=True),
         consolidation_enabled=_boolean(
             values,
             "SEC_MEMORY_CONSOLIDATION_ENABLED",
+            default=True,
+        ),
+        procedural_consolidation_enabled=_boolean(
+            values,
+            "SEC_MEMORY_PROCEDURAL_CONSOLIDATION_ENABLED",
             default=True,
         ),
         vector_dim=_positive_int(values, "SEC_MEMORY_VECTOR_DIM", default=1536),
@@ -616,6 +664,52 @@ def _load_embedding_settings(values: Mapping[str, str]) -> EmbeddingSettings:
             values,
             "SEC_EMBEDDING_REQUEST_TIMEOUT_SECONDS",
             default=60.0,
+        ),
+    )
+
+
+def _load_small_provider_settings(
+    values: Mapping[str, str],
+    main: ProviderSettings,
+) -> ProviderSettings | None:
+    """读取可选的小模型层；未设置 SEC_SMALL_MODEL 时关闭（返回 None）。"""
+    small_model = _first_nonempty(values, "SEC_SMALL_MODEL")
+    if small_model is None:
+        return None
+    name = _nonempty(values, "SEC_SMALL_PROVIDER", default=main.name).lower()
+    if re.fullmatch(r"[a-z][a-z0-9-]*", name) is None:
+        raise ConfigError("SEC_SMALL_PROVIDER must be a lowercase kebab-case name")
+    api_key = _first_nonempty(values, "SEC_SMALL_API_KEY")
+    if api_key is None:
+        api_key = main.api_key
+    base_url = _first_nonempty(values, "SEC_SMALL_BASE_URL")
+    if base_url is None:
+        base_url = main.base_url
+    return ProviderSettings(
+        name=name,
+        model=small_model,
+        api_key=api_key,
+        base_url=base_url,
+        request_timeout_seconds=main.request_timeout_seconds,
+        max_output_tokens=main.max_output_tokens,
+    )
+
+
+def _load_auxiliary_settings(values: Mapping[str, str]) -> AuxiliarySettings:
+    return AuxiliarySettings(
+        enabled=_boolean(values, "SEC_AUX_ENABLED", default=False),
+        intent_enabled=_boolean(values, "SEC_AUX_INTENT_ENABLED", default=True),
+        rewrite_enabled=_boolean(values, "SEC_AUX_REWRITE_ENABLED", default=True),
+        judge_enabled=_boolean(values, "SEC_AUX_JUDGE_ENABLED", default=False),
+        trace_summary_enabled=_boolean(
+            values,
+            "SEC_AUX_TRACE_SUMMARY_ENABLED",
+            default=False,
+        ),
+        max_calls_per_turn=_positive_int(
+            values,
+            "SEC_AUX_MAX_CALLS_PER_TURN",
+            default=4,
         ),
     )
 

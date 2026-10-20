@@ -64,6 +64,15 @@ def _integer(data: dict, key: str, minimum: int, default: int) -> int:
     return value
 
 
+def _optional_integer(data: dict, key: str, minimum: int) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    return value
+
+
 def _load_card(path: Path, root: Path) -> AgentCard:
     source, resolved = _read(path, root)
     data = _keys(tomllib.loads(source), _CARD_KEYS, "agent card")
@@ -99,11 +108,13 @@ def _load_card(path: Path, root: Path) -> AgentCard:
         _integer(limits_data, "max_tool_calls", 1, 32),
     )
     delegation_data = _keys(data.get("delegation", {}), {
-        "allowed_agents", "max_depth",
+        "allowed_agents", "max_depth", "fanout", "budget_slice",
     }, "delegation")
     delegation = AgentDelegation(
         _strings(delegation_data, "allowed_agents"),
         _integer(delegation_data, "max_depth", 0, 0),
+        _optional_integer(delegation_data, "fanout", 1),
+        _optional_integer(delegation_data, "budget_slice", 1),
     )
     values = dict(
         schema_version=1, id=identifier, name=_text(data, "name"),

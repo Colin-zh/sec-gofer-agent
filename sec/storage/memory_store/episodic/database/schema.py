@@ -6,10 +6,10 @@ sec_episodic 保存进入情景检索索引的原始对话消息；SQLite 后端
 
 from __future__ import annotations
 
-from sqlalchemy import Column, Float, Index, MetaData, String, Table, Text, inspect
+from sqlalchemy import Column, Float, Index, MetaData, String, Table, Text
 from sqlalchemy.engine import Connection
 
-from sec.storage.memory_store._vector import is_vector_dialect
+from sec.storage.memory_store._vector import is_vector_dialect, reflect_column_names
 
 metadata = MetaData()
 
@@ -21,7 +21,6 @@ episodes = Table(
     Column("entry_id", String(255), nullable=False),
     Column("text", Text, nullable=False),
     Column("timestamp", Float, nullable=False),
-    Column("embedding", Text, nullable=True),
     Column("kind", String(32), nullable=False, server_default="message"),
     Index("ix_sec_episodic_session", "session_id"),
 )
@@ -51,7 +50,7 @@ def create_or_upgrade_schema(
 
 def _ensure_kind_column(connection: Connection, table_name: str) -> None:
     """为既有表补齐 kind 列（新建表已由 create_all 包含该列）。"""
-    columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+    columns = reflect_column_names(connection, table_name)
     if "kind" in columns:
         return
     connection.exec_driver_sql(
@@ -64,7 +63,7 @@ def _ensure_vector_column(
     table_name: str,
     vector_dim: int,
 ) -> None:
-    columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+    columns = reflect_column_names(connection, table_name)
     if VECTOR_COLUMN in columns:
         return
     connection.exec_driver_sql(

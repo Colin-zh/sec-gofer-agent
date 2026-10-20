@@ -122,15 +122,25 @@ with SecClient("assistant", "遵循用户指令。") as client:
 
 - **CLI**：交互式与管道式对话、命令补全、Trace 控制、权限模式、Session 分支和便携式导入/导出。
 - **Python SDK**：同步和异步 Client、流式响应、工具调用、Trace 事件与运行控制。
-- **工具与策略**：类型化工具定义、参数校验、工作区内置文件工具、工具审批及可替换 Policy/Executor。
+- **工具与策略**：类型化工具定义、参数校验、工作区内置文件工具、工具审批及可替换 Policy/Executor；`safe_parallel` 标记只读工具以并入混合执行器的并行分组。
 - **AgentCard 与能力目录**：选择和恢复智能体身份；Skills 支持模型原生发现、按需加载和确定性必用规则；Prompts 保留为输入模板。
 - **会话内刷新**：原子发布能力 generation，进行中的模型请求和完整工具批次保留旧绑定，后续请求使用新版本。
 - **MCP 与工具 worker**：MCP 连接、发现和调用沿用核心工具审批链；显式工具 worker 支持无需重启宿主的代码更新。
-- **多 Agent 委派**：子任务使用独立 Session，继承能力上限、共享每轮预算、审批和取消控制。
+- **多 Agent 委派**：子任务使用独立 Session，继承能力上限、共享每轮预算、审批和取消控制；支持 fanout 并发上限、预算切片、actchain 令牌链与级联撤销。
 - **Extensions**：通过 Python entry point 显式启用，可注册工具、Provider、Policy、SessionStore、UI handler、CLI 命令和 Trace hooks。
 - **Session 与存储**：进程内或 SQLite SessionStore、会话恢复和分支操作；提供可实现的 ObjectStore 协议。
 - **运行可靠性**：模型及安全声明工具的有限重试、可控的工具错误反馈、每轮调用预算、用量统计和可选上下文压缩。
 - **可观测模型**：一次执行是一棵 Trace（其原子步骤为 Span）；`Trajectory` 提供跨多轮对话拍扁后的扁平行为序列（用户/助手/工具步骤），与技术细节解耦，便于检索和展示。
+
+## 0.3.0 更新与升级说明
+
+- **双层模型与辅助推理**：新增 main/small 模型路由，以及可选的意图分类、查询改写、输出评估和 Trace 摘要；未配置小模型时复用主模型。辅助步骤默认关闭，启用后有独立调用预算，配置见 `.env.example`。`EntityExtractor` 提供独立 API，尚未接入主循环。
+- **工具与委派**：新增 `question` 宿主交互工具；`safe_parallel` 工具仅在策略直接允许时并行，需审批的调用仍作为串行屏障；委派增加并发上限、预算切片和令牌链撤销。
+- **三层记忆**：区分语义事实、情景记录和程序性偏好，新增 JSON 文件仓储；长期偏好可整理到 `USER.md` 自动维护区，保留手写内容。桌面端新增记忆管理页面。
+- **桌面与调度**：新增持久化 Cron 定时任务及管理页面，回答操作栏支持复制、反馈、标记等操作；修复对话组件销毁时的信号引用问题，以及运行中的定时任务完成后覆盖删除/停用状态的问题。
+- **Trace 存储**：数据库 SessionStore 下复用 Client 的共享 Database；旧本地 Trace 数据库支持迁移并保留备份，本地路径可通过 `SEC_DESKTOP_TRACE_STORE_PATH` 配置。
+
+从 0.2.x 升级时，建议先备份工作区 `.sec/` 和数据库。自定义记忆仓储需要实现新增的 `list()` 接口；`EpisodicRecord` 不再接收 `embedding` 参数，向量生成由数据库仓储及注入的 Embedder 负责。SQLite 使用 FTS5，无需配置 Embedder；PostgreSQL/openGauss 向量后端的原生 vector 列和索引仍需在目标数据库环境单独验证。
 
 ## 安全与支持边界
 

@@ -57,6 +57,8 @@ max_tool_calls = 32
 [delegation]
 allowed_agents = ["writer"]
 max_depth = 1
+fanout = 1        # 可选，>=1：允许同时活跃的子智能体数上限
+budget_slice = 4  # 可选，>=1：每次委派从父预算切出的模型/工具调用上限
 ```
 
 能力列表是限制，不是授权。没有列出的来源不会提供给该智能体；
@@ -224,6 +226,12 @@ PYTHONPATH=. .venv/bin/python examples/worker-hot-reload/demo.py
 - 同时受自身和祖先能力范围约束。
 - 与父任务 turn 共用模型/工具调用总额度，并受最大深度限制；
   根 Trace 的 follow-up 开启新 turn，保持既有每轮预算语义。
+- 受 fanout 并发上限与预算切片约束：`budget_slice` 每次委派从父 allowance
+  切出独立的子额度，子只消耗自己的切片，未用部分在子结束后自动归还；
+  `fanout` 限制同一父节点同时活跃的子智能体数量。
+- 每次委派携带 `actchain` 令牌链（根为空，逐级追加子 `agent_id`），
+  并作为 `DelegationEvent.actchain` 发布；`revoke_delegation(agent_id)`
+  按 `agent_id in actchain` 级联取消该节点及其整棵子树，并回收切片。
 - 工具继续走相同 Policy；需要审批时转发给父 Trace 的宿主。
 - 接收父 Trace 取消，结束后只返回结果文本。
 

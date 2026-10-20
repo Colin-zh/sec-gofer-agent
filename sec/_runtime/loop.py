@@ -21,10 +21,13 @@ from sec._types.events import (
     CompactionStartEvent,
     ContentDeltaEvent,
     EmptySessionEvent,
+    JudgeEvent,
     MemoryGateEvent,
     MemoryRetrievalEvent,
     MessageBoundaryEvent,
     MessageUpdateEvent,
+    RewriteEvent,
+    RoutingEvent,
     TurnEndEvent,
     CapabilitySnapshotEvent,
 )
@@ -49,10 +52,11 @@ from sec.agent import Agent
 from sec.exceptions import (
     ContextBuildError,
     ContextWindowExceeded,
+    MemoryStoreError,
     ProviderProtocolError,
     TraceLimitExceeded,
 )
-from sec.memory.context_builder import ContextBuilder
+from sec.memory.context_builder import ContextBuilder, build_context_messages
 from sec.memory.gate import MemoryGate
 from sec.memory.retrieval import MemoryRetriever
 from sec._types.memory import MemoryGateDecision, MemoryRetrievalResult
@@ -60,6 +64,8 @@ from sec.policies.rules import DenyAllPolicy
 from sec._types.execution import ToolExecutor
 from sec._types.policy import PolicyEngine
 from sec._types.providers import ModelProvider, StreamingModelProvider
+from sec.providers.router import ModelRouter
+from sec.agent.auxiliary import AuxiliaryBudget, AuxiliaryRuntime
 from sec.agent import Session
 from sec._types.results import TraceResult
 
@@ -84,9 +90,20 @@ async def trace_loop(
     gate: MemoryGate | None = None,
     retriever: MemoryRetriever | None = None,
     initial_messages: tuple[Message, ...] = (),
+    router: ModelRouter | None = None,
+    auxiliary: AuxiliaryRuntime | None = None,
+    resume_existing_turn: bool = False,
 ) -> TraceResult:
-    """逐轮执行 Agent；每轮模型调用受预算限制，follow-up 会开启新预算。"""
+    """逐轮执行 Agent；每轮模型调用受预算限制，follow-up 会开启新预算。
+
+    router 提供 main/small 双 tier 模型选择；auxiliary 为可选的小模型辅助
+    推理组件（意图分类、查询改写、LLM-as-Judge）。二者缺省时行为与单模型一致。
+
+    resume_existing_turn 为真时跳过首轮用户消息追加（重试/重新生成场景：
+    用户消息已存在于会话中，此处仅从该消息之后重新生成）。
+    """
     policy_engine = policy if policy is not None else DenyAllPolicy()
+    summary_provider = router.provider("small") if router is not None else provider
     for message in initial_messages:
         await session._append_message(message)
     start_index = len(session.messages)
@@ -94,6 +111,7 @@ async def trace_loop(
     turn_id = uuid4().hex
     turn_prompt = prompt
     turn_source = "user"
+    skip_user_append = resume_existing_turn
     if capabilities is not None:
         capabilities.context = (control, events)
         capabilities.metrics = metrics
@@ -119,10 +137,34 @@ async def trace_loop(
             capabilities.allowance.model_calls = 0
             capabilities.allowance.tool_calls = 0
         events.publish(EmptySessionEvent("turn_start"))
-        await append_user_message(turn_prompt, turn_source)
+        if skip_user_append:
+            skip_user_append = False
+        else:
+            await append_user_message(turn_prompt, turn_source)
+        aux_budget = (
+            auxiliary.new_budget()
+            if auxiliary is not None and auxiliary.active
+            else None
+        )
+        turn_provider = await _route_turn(
+            auxiliary=auxiliary,
+            router=router,
+            provider=provider,
+            turn_prompt=turn_prompt,
+            events=events,
+            metrics=metrics,
+            aux_budget=aux_budget,
+        )
         turn_memory: MemoryRetrievalResult | None = None
         if gate is not None and retriever is not None:
-            turn_memory = await _retrieve_memory(gate, retriever, turn_prompt, events)
+            query = await _rewrite_query(
+                auxiliary=auxiliary,
+                turn_prompt=turn_prompt,
+                events=events,
+                metrics=metrics,
+                aux_budget=aux_budget,
+            )
+            turn_memory = await _retrieve_memory(gate, retriever, query, events)
         turn_model_calls = 0
         turn_tool_calls = 0
         turn_tool_results: list[ToolResultMessage] = []
@@ -170,6 +212,7 @@ async def trace_loop(
                     procedures=(
                         () if turn_memory is None else turn_memory.procedures
                     ),
+                    memory_enabled=turn_memory is not None,
                 )
                 context_decision = budget.context_pressure(
                     estimated_tokens=prepared_context.estimated_tokens,
@@ -204,7 +247,7 @@ async def trace_loop(
                                 events.publish(MessageUpdateEvent(AssistantStartEvent()))
                                 summary_completion, interrupted_steering = (
                                     await complete_or_interrupt(
-                                        provider=provider,
+                                        provider=summary_provider,
                                         agent=agent,
                                         session=session,
                                         control=control,
@@ -305,6 +348,7 @@ async def trace_loop(
                         procedures=(
                             () if turn_memory is None else turn_memory.procedures
                         ),
+                        memory_enabled=turn_memory is not None,
                     )
                 if request_final and prepared_context.estimated_tokens > (
                     context_builder.input_token_limit
@@ -318,9 +362,25 @@ async def trace_loop(
                 capabilities.allowance.model()
             metrics.model_calls += 1
             events.publish(MessageUpdateEvent(AssistantStartEvent()))
+            if prepared_context is None and turn_memory is not None:
+                model_messages = build_context_messages(
+                    system_prompt=agent.instructions,
+                    session_messages=session.messages,
+                    request_final=request_final,
+                    memories=turn_memory.memories,
+                    episodes=turn_memory.episodes,
+                    procedures=turn_memory.procedures,
+                    memory_enabled=True,
+                )
+            else:
+                model_messages = (
+                    None
+                    if prepared_context is None
+                    else prepared_context.messages
+                )
             try:
                 completion, interrupted_steering = await complete_or_interrupt(
-                    provider=provider,
+                    provider=turn_provider,
                     agent=agent,
                     session=session,
                     control=control,
@@ -330,11 +390,7 @@ async def trace_loop(
                     turn_id=turn_id,
                     hooks=hooks,
                     hook_ctx=hook_ctx,
-                    messages=(
-                        None
-                        if prepared_context is None
-                        else prepared_context.messages
-                    ),
+                    messages=model_messages,
                     tools=tuple(tool.definition for tool in agent.tools),
                 )
             except Exception:
@@ -471,6 +527,14 @@ async def trace_loop(
                         raise ProviderProtocolError(
                             "turn completed without an assistant response"
                         )
+                    await _judge_response(
+                        auxiliary=auxiliary,
+                        turn_prompt=turn_prompt,
+                        final_message=final_message,
+                        events=events,
+                        metrics=metrics,
+                        aux_budget=aux_budget,
+                    )
                     events.publish(TurnEndEvent(final_message, turn_tool_results))
                     break
                 if control.close_if_idle():
@@ -478,6 +542,14 @@ async def trace_loop(
                         raise ProviderProtocolError(
                             "run finished without an assistant response"
                         )
+                    await _judge_response(
+                        auxiliary=auxiliary,
+                        turn_prompt=turn_prompt,
+                        final_message=final_message,
+                        events=events,
+                        metrics=metrics,
+                        aux_budget=aux_budget,
+                    )
                     events.publish(TurnEndEvent(final_message, turn_tool_results))
                     result = TraceResult(
                         final_message=final_message,
@@ -488,6 +560,7 @@ async def trace_loop(
                         retries=metrics.retries,
                         tool_attempts=metrics.tool_attempts,
                         tool_retries=metrics.tool_retries,
+                        aux_model_calls=metrics.aux_calls,
                         usage=metrics.usage(),
                     )
                     agent_messages: list[AgentMessage] = list(result.messages)
@@ -539,7 +612,29 @@ async def _retrieve_memory(
         )
     )
     if not decision.retrieve:
-        return None
+        # 程序记忆强制纳入：即使 gate 判为不检索，USER.md / Skills 仍每轮加载。
+        try:
+            procedures = await retriever.load_procedures(decision.query or prompt)
+        except MemoryStoreError as exc:
+            result = MemoryRetrievalResult(
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        else:
+            result = MemoryRetrievalResult(
+                status="ok" if procedures else "empty",
+                procedures=procedures,
+            )
+        events.publish(
+            MemoryRetrievalEvent(
+                status=result.status,
+                memory_count=0,
+                episode_count=0,
+                procedure_count=len(procedures),
+                error=None,
+            )
+        )
+        return result
     try:
         result = await retriever.retrieve(decision.query or prompt)
     except Exception as exc:
@@ -557,3 +652,112 @@ async def _retrieve_memory(
         )
     )
     return result
+
+
+async def _route_turn(
+    *,
+    auxiliary: AuxiliaryRuntime | None,
+    router: ModelRouter | None,
+    provider: ModelProvider | StreamingModelProvider,
+    turn_prompt: str,
+    events: TraceEventStream,
+    metrics: TraceMetricsAccumulator,
+    aux_budget: AuxiliaryBudget | None,
+) -> ModelProvider | StreamingModelProvider:
+    """意图分类 + 内容路由，决定本轮主回复使用的 Provider；失败回落主模型。"""
+    if (
+        auxiliary is None
+        or not auxiliary.active
+        or auxiliary.intent is None
+        or auxiliary.router is None
+        or router is None
+        or aux_budget is None
+        or not aux_budget.consume()
+    ):
+        return provider
+    metrics.aux_calls += 1
+    try:
+        intent = await auxiliary.intent.classify(turn_prompt)
+    except Exception:
+        return provider
+    decision = auxiliary.router.decide(intent)
+    events.publish(
+        RoutingEvent(
+            intent=intent.label,
+            tier=decision.tier,
+            reason=decision.reason,
+            confidence=intent.confidence,
+        )
+    )
+    return router.provider(decision.tier)
+
+
+async def _rewrite_query(
+    *,
+    auxiliary: AuxiliaryRuntime | None,
+    turn_prompt: str,
+    events: TraceEventStream,
+    metrics: TraceMetricsAccumulator,
+    aux_budget: AuxiliaryBudget | None,
+) -> str:
+    """查询改写，返回更利于检索的 query；失败回退原文。"""
+    if (
+        auxiliary is None
+        or not auxiliary.active
+        or auxiliary.rewriter is None
+        or aux_budget is None
+        or not aux_budget.consume()
+    ):
+        return turn_prompt
+    metrics.aux_calls += 1
+    try:
+        rewrite = await auxiliary.rewriter.rewrite(turn_prompt)
+    except Exception:
+        return turn_prompt
+    events.publish(
+        RewriteEvent(
+            query=turn_prompt,
+            rewritten_query=rewrite.query,
+            changed=rewrite.changed,
+        )
+    )
+    return rewrite.query
+
+
+async def _judge_response(
+    *,
+    auxiliary: AuxiliaryRuntime | None,
+    turn_prompt: str,
+    final_message: AssistantMessage,
+    events: TraceEventStream,
+    metrics: TraceMetricsAccumulator,
+    aux_budget: AuxiliaryBudget | None,
+) -> None:
+    """LLM-as-Judge 判断最终助手输出；仅发布观测事件，不阻断回复。"""
+    if (
+        auxiliary is None
+        or not auxiliary.active
+        or auxiliary.judge is None
+        or aux_budget is None
+        or not aux_budget.consume()
+    ):
+        return
+    metrics.aux_calls += 1
+    try:
+        verdict = await auxiliary.judge.judge(turn_prompt, final_message.text)
+    except Exception as exc:
+        events.publish(
+            JudgeEvent(
+                status="unknown",
+                score=0.0,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        )
+        return
+    events.publish(
+        JudgeEvent(
+            status=verdict.status,
+            score=verdict.score,
+            reason=verdict.reason,
+        )
+    )

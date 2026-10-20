@@ -18,6 +18,16 @@ class DenyAllPolicy:
         return PolicyDecision.deny("Tool call denied by policy.")
 
 
+class AutoApprovePolicy:
+    """全放行所有能力调用，供定时任务等无人值守场景使用。"""
+
+    def decide(self, context: PolicyContext) -> PolicyDecision:
+        """无论能力类型与风险等级，一律放行。"""
+        return PolicyDecision.allow(
+            "Scheduled tasks run unattended with auto-approval."
+        )
+
+
 class AllowListPolicy:
     """仅允许名称出现在白名单中的工具。"""
 

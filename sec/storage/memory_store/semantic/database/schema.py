@@ -15,11 +15,10 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
-    inspect,
 )
 from sqlalchemy.engine import Connection
 
-from sec.storage.memory_store._vector import is_vector_dialect
+from sec.storage.memory_store._vector import is_vector_dialect, reflect_column_names
 
 metadata = MetaData()
 
@@ -35,7 +34,6 @@ memories = Table(
     Column("origin", String(16), nullable=False),
     Column("source_session_id", String(255), nullable=True),
     Column("source_entry_id", String(255), nullable=True),
-    Column("embedding", Text, nullable=True),
     Column("created_at", Float, nullable=False),
     Column("updated_at", Float, nullable=False),
     UniqueConstraint("scope", "kind", "dedup_key", name="uq_sec_memories_dedup"),
@@ -68,7 +66,7 @@ def _ensure_vector_column(
     table_name: str,
     vector_dim: int,
 ) -> None:
-    columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+    columns = reflect_column_names(connection, table_name)
     if VECTOR_COLUMN in columns:
         return
     connection.exec_driver_sql(

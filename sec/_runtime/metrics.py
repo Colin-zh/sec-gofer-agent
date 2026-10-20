@@ -20,6 +20,7 @@ class TraceMetricsAccumulator:
         self.tool_calls = 0
         self.tool_attempts = 0
         self.tool_retries = 0
+        self.aux_calls = 0
         self._input_tokens: int | None = None
         self._output_tokens: int | None = None
         self._reported_responses = 0
@@ -81,6 +82,7 @@ class TraceMetricsAccumulator:
         self.tool_calls += result.tool_calls
         self.tool_attempts += result.tool_attempts
         self.tool_retries += result.tool_retries
+        self.aux_calls += result.aux_model_calls
         usage = result.usage
         if usage.input_tokens is not None:
             self._input_tokens = (self._input_tokens or 0) + usage.input_tokens

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from sec._types.memory import EpisodicStoreProtocol
 from sec.memory.consolidation import MemoryConsolidator
 from sec.memory.gate import MemoryGate
+from sec.memory.procedural_consolidation import ProceduralConsolidator
 from sec.memory.retrieval import MemoryRetriever
 
 
@@ -18,6 +19,7 @@ class MemoryRuntime:
     retriever: MemoryRetriever | None = None
     episodic: EpisodicStoreProtocol | None = None
     consolidator: MemoryConsolidator | None = None
+    procedural_consolidator: ProceduralConsolidator | None = None
 
     @property
     def has_retrieval(self) -> bool:
@@ -25,4 +27,8 @@ class MemoryRuntime:
 
     @property
     def has_post_run(self) -> bool:
-        return self.episodic is not None or self.consolidator is not None
+        return (
+            self.episodic is not None
+            or self.consolidator is not None
+            or self.procedural_consolidator is not None
+        )

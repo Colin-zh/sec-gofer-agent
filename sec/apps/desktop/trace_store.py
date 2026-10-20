@@ -1,17 +1,20 @@
-"""Local, redacted persistence for desktop traces."""
+"""Redacted persistence and event recording for Desktop traces."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, ContextManager, Iterator, Protocol
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from sec.storage.resources.database import Database
 
 from sec._types.events import (
     AgentEndEvent,
@@ -109,7 +112,75 @@ class TraceEventRecord:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
-class TraceStore:
+class _TraceStoreBackend(Protocol):
+    def start_trace(self, trace_id: str, session_id: str, started_at: float) -> None:
+        ...
+
+    def create_span(
+        self,
+        trace_id: str,
+        parent_id: str,
+        kind: str,
+        label: str,
+        started_at: float,
+        *,
+        status: str = "running",
+        details: dict[str, Any] | None = None,
+    ) -> str: ...
+
+    def update_span(
+        self,
+        span_id: str,
+        *,
+        label: str | None = None,
+        status: str | None = None,
+        ended_at: float | None = None,
+        elapsed_ms: float | None = None,
+        approval_wait_ms: float | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def finish_trace(
+        self,
+        trace_id: str,
+        *,
+        finished_at: float,
+        elapsed_ms: float,
+        status: str,
+    ) -> None: ...
+
+    def record_event(
+        self,
+        trace_id: str,
+        span_id: str,
+        event_type: str,
+        occurred_at: float,
+        elapsed_ms: float,
+        payload: dict[str, Any],
+    ) -> None: ...
+
+    def list_traces(
+        self,
+        limit: int = 200,
+        *,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def get_tree(self, trace_id: str) -> list[dict[str, Any]]:
+        ...
+
+    def get_span_events(
+        self,
+        trace_id: str,
+        span_id: str,
+    ) -> list[TraceEventRecord]:
+        ...
+
+    def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        ...
+
+
+class _SQLiteTraceStore:
     """SQLite store scoped to a desktop workspace; no network access is used."""
 
     def __init__(self, path: Path) -> None:
@@ -398,6 +469,160 @@ class TraceStore:
                 (trace_id,),
             ).fetchone()
         return None if row is None else dict(row)
+
+
+class TraceStore:
+    """Select local SQLite or the configured shared database for Desktop traces."""
+
+    def __init__(self, path: Path, *, defer_backend: bool = False) -> None:
+        self.path = Path(path)
+        self._backend: _TraceStoreBackend | None = (
+            None if defer_backend else _SQLiteTraceStore(self.path)
+        )
+        self._configuration_error: Exception | None = None
+
+    async def configure(self, database: Database | None) -> None:
+        """Use the Client database when configured; otherwise use local SQLite."""
+        if database is None:
+            self._backend = _SQLiteTraceStore(self.path)
+            return
+        from sec.apps.desktop.trace_database import DatabaseTraceStore
+
+        backend = DatabaseTraceStore(database, self.path)
+        await backend.initialize()
+        self._backend = backend
+        self._configuration_error = None
+
+    def disable(self, error: Exception) -> None:
+        self._backend = None
+        self._configuration_error = error
+
+    def _require_backend(self) -> Any:
+        backend = self._backend
+        if backend is None:
+            if self._configuration_error is not None:
+                raise RuntimeError(
+                    f"Trace storage is unavailable: {self._configuration_error}"
+                ) from self._configuration_error
+            raise RuntimeError("Trace storage has not been configured")
+        return backend
+
+    def _connect(self) -> ContextManager[sqlite3.Connection]:
+        backend = self._require_backend()
+        connect = getattr(backend, "_connect", None)
+        if not callable(connect):
+            raise RuntimeError("the configured TraceStore has no SQLite connection")
+        return connect()
+
+    def start_trace(self, trace_id: str, session_id: str, started_at: float) -> None:
+        self._require_backend().start_trace(trace_id, session_id, started_at)
+
+    def create_span(
+        self,
+        trace_id: str,
+        parent_id: str,
+        kind: str,
+        label: str,
+        started_at: float,
+        *,
+        status: str = "running",
+        details: dict[str, Any] | None = None,
+    ) -> str:
+        return self._require_backend().create_span(
+            trace_id,
+            parent_id,
+            kind,
+            label,
+            started_at,
+            status=status,
+            details=details,
+        )
+
+    def update_span(
+        self,
+        span_id: str,
+        *,
+        label: str | None = None,
+        status: str | None = None,
+        ended_at: float | None = None,
+        elapsed_ms: float | None = None,
+        approval_wait_ms: float | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._require_backend().update_span(
+            span_id,
+            label=label,
+            status=status,
+            ended_at=ended_at,
+            elapsed_ms=elapsed_ms,
+            approval_wait_ms=approval_wait_ms,
+            details=details,
+        )
+
+    def finish_trace(
+        self,
+        trace_id: str,
+        *,
+        finished_at: float,
+        elapsed_ms: float,
+        status: str,
+    ) -> None:
+        self._require_backend().finish_trace(
+            trace_id,
+            finished_at=finished_at,
+            elapsed_ms=elapsed_ms,
+            status=status,
+        )
+
+    def record_event(
+        self,
+        trace_id: str,
+        span_id: str,
+        event_type: str,
+        occurred_at: float,
+        elapsed_ms: float,
+        payload: dict[str, Any],
+    ) -> None:
+        self._require_backend().record_event(
+            trace_id, span_id, event_type, occurred_at, elapsed_ms, payload,
+        )
+
+    def list_traces(
+        self,
+        limit: int = 200,
+        *,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._backend is None and self._configuration_error is None:
+            return []
+        return self._require_backend().list_traces(limit, session_id=session_id)
+
+    def get_tree(self, trace_id: str) -> list[dict[str, Any]]:
+        if self._backend is None and self._configuration_error is None:
+            return []
+        return self._require_backend().get_tree(trace_id)
+
+    def get_span_events(self, trace_id: str, span_id: str) -> list[TraceEventRecord]:
+        if self._backend is None and self._configuration_error is None:
+            return []
+        return self._require_backend().get_span_events(trace_id, span_id)
+
+    def get_trace(self, trace_id: str) -> dict[str, Any] | None:
+        if self._backend is None and self._configuration_error is None:
+            return None
+        return self._require_backend().get_trace(trace_id)
+
+    async def flush(self) -> None:
+        backend = self._require_backend()
+        flush = getattr(backend, "flush", None)
+        if callable(flush):
+            await flush()
+
+    async def aclose(self) -> None:
+        backend = self._backend
+        close = getattr(backend, "aclose", None)
+        if callable(close):
+            await close()
 
 
 def _usage_data(usage: Any) -> dict[str, Any] | None:

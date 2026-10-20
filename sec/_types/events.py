@@ -191,6 +191,7 @@ class DelegationEvent:
     child_session_id: str
     agent_id: str
     status: Literal["started", "completed", "failed", "cancelled"]
+    actchain: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -423,6 +424,49 @@ class MemoryConsolidationEvent:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class MemoryProceduralConsolidationEvent:
+    type: Literal["memory_procedural_consolidation"] = field(
+        default="memory_procedural_consolidation",
+        init=False,
+    )
+    status: Literal["ok", "empty", "failed"]
+    added_count: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class RoutingEvent:
+    type: Literal["routing"] = field(default="routing", init=False)
+    intent: str
+    tier: Literal["main", "small"]
+    reason: str = ""
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class RewriteEvent:
+    type: Literal["rewrite"] = field(default="rewrite", init=False)
+    query: str
+    rewritten_query: str
+    changed: bool = True
+
+
+@dataclass(frozen=True)
+class JudgeEvent:
+    type: Literal["judge"] = field(default="judge", init=False)
+    status: Literal["pass", "fail", "unknown"]
+    score: float
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class TraceSummaryEvent:
+    type: Literal["trace_summary"] = field(default="trace_summary", init=False)
+    summary: str
+    error: str | None = None
+
+
 SessionEvent: TypeAlias = (
     EmptySessionEvent
     | DelegationEvent
@@ -458,4 +502,9 @@ SessionEvent: TypeAlias = (
     | MemoryRetrievalEvent
     | MemoryIndexEvent
     | MemoryConsolidationEvent
+    | MemoryProceduralConsolidationEvent
+    | RoutingEvent
+    | RewriteEvent
+    | JudgeEvent
+    | TraceSummaryEvent
 )

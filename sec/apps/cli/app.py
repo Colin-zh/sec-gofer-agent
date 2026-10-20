@@ -31,6 +31,7 @@ from sec.apps.cli.chat_commands import (
     ChatCommand,
     ChatCommandOutcome,
     ChatCommandRegistry,
+    CommandHandler,
     create_default_chat_commands,
     format_reload_report,
 )
@@ -54,6 +55,8 @@ from sec.apps.cli.slash_commands import (
 from sec.apps.cli.terminal import TerminalUI
 from sec.extensions import ExtensionLoadError, ExtensionManager
 from sec.policies import PermissionMode, PermissionModePolicy
+from sec._runtime.cron import CronScheduleError
+from sec._runtime.scheduler import CronScheduler, ScheduledJob, ScheduledRunResult
 from sec.tools._builtins import create_builtin_tools
 
 DEFAULT_INSTRUCTIONS = (
@@ -329,6 +332,32 @@ async def _chat_interactive(
     trace_number = 0
     exit_after_active = False
 
+    scheduler: CronScheduler | None = None
+
+    async def fire_scheduled(job: ScheduledJob) -> ScheduledRunResult:
+        trace = await client.run_scheduled(job.prompt, session_id=job.session_id)
+        session_id = trace.session.id
+        try:
+            await trace.result()
+        except asyncio.CancelledError:
+            ui.add_status("info", f"[定时任务 {job.id[:8]}] 已取消")
+            return ScheduledRunResult("skipped", session_id=session_id)
+        except Exception as exc:
+            ui.add_status("error", f"[定时任务 {job.id[:8]}] 失败: {exc}")
+            return ScheduledRunResult(
+                "failed", session_id=session_id,
+                message=f"{type(exc).__name__}: {exc}",
+            )
+        ui.add_status("info", f"[定时任务 {job.id[:8]}] {job.name} 完成")
+        return ScheduledRunResult("completed", session_id=session_id)
+
+    try:
+        scheduler = CronScheduler(Path.cwd(), fire=fire_scheduled)
+        await scheduler.start()
+    except (CronScheduleError, ValueError) as exc:
+        ui.add_status("error", f"定时任务加载失败，已停用调度：{exc}")
+        scheduler = None
+
     commands = create_chat_commands(
         client,
         get_active_trace=lambda: active_run,
@@ -336,6 +365,7 @@ async def _chat_interactive(
         on_session_change=getattr(ui, "set_session_id", None),
         resource_manager=resource_manager,
         refresh_completions=getattr(ui, "set_command_completions", None),
+        scheduler=scheduler,
     )
     ui.set_command_completions(commands.completion_items())
     application_task = asyncio.create_task(ui.run())
@@ -458,6 +488,8 @@ async def _chat_interactive(
 
                 input_task = asyncio.create_task(ui.input_queue.get())
     finally:
+        if scheduler is not None:
+            await scheduler.stop()
         ui.stop()
         if input_task is not None and not input_task.done():
             input_task.cancel()
@@ -527,6 +559,7 @@ def create_chat_commands(
     on_session_change: Callable[[str], None] | None = None,
     resource_manager: CliResourceManager | None = None,
     refresh_completions: Callable[[Sequence[tuple[str, str]]], None] | None = None,
+    scheduler: CronScheduler | None = None,
 ) -> ChatCommandRegistry:
     """Build the shared interactive command registry for a Sec Client."""
     get_run = get_active_trace or (lambda: active_run)
@@ -1039,6 +1072,81 @@ def create_chat_commands(
             display_kind="error",
         )
 
+    async def manage_cron(args: tuple[str, ...]) -> ChatCommandOutcome:
+        if scheduler is None:
+            return ChatCommandOutcome(
+                "Scheduled tasks are unavailable in this client.",
+                display_kind="error",
+            )
+        if not args:
+            return ChatCommandOutcome(await _render_scheduled_jobs(scheduler))
+        action = args[0].casefold()
+        if action == "list" and len(args) == 1:
+            return ChatCommandOutcome(await _render_scheduled_jobs(scheduler))
+        if action in {"add", "create"} and len(args) >= 7:
+            schedule = " ".join(args[1:6])
+            prompt = " ".join(args[6:])
+            name = prompt[:40] or "定时任务"
+            try:
+                job = await scheduler.add_job(name, schedule, prompt)
+            except (CronScheduleError, ValueError) as exc:
+                return ChatCommandOutcome(
+                    f"Could not add scheduled task: {exc}",
+                    display_kind="error",
+                )
+            next_run = job.next_run_at(datetime.now())
+            return ChatCommandOutcome(
+                f"Scheduled task added: {job.id[:8]}\n"
+                f"  schedule: {job.schedule}\n"
+                f"  next run: {next_run:%Y-%m-%d %H:%M}\n"
+                f"  prompt: {job.prompt}"
+            )
+        if action in {"remove", "delete"} and len(args) == 2:
+            if not await scheduler.remove_job(args[1]):
+                return ChatCommandOutcome(
+                    f"Scheduled task {args[1]!r} was not found.",
+                    display_kind="error",
+                )
+            return ChatCommandOutcome("Scheduled task removed.")
+        if action in {"pause", "disable"} and len(args) == 2:
+            if not await scheduler.set_enabled(args[1], False):
+                return ChatCommandOutcome(
+                    f"Scheduled task {args[1]!r} was not found.",
+                    display_kind="error",
+                )
+            return ChatCommandOutcome("Scheduled task paused.")
+        if action in {"resume", "enable"} and len(args) == 2:
+            if not await scheduler.set_enabled(args[1], True):
+                return ChatCommandOutcome(
+                    f"Scheduled task {args[1]!r} was not found.",
+                    display_kind="error",
+                )
+            return ChatCommandOutcome("Scheduled task resumed.")
+        return ChatCommandOutcome(
+            "Usage: /cron [list | add <m> <h> <dom> <mon> <dow> <prompt…> | "
+            "remove <id> | pause <id> | resume <id>]",
+            display_kind="error",
+        )
+
+    additional_commands: dict[str, tuple[str, CommandHandler]] = {
+        "reload": (
+            "Reload Skills/Prompts and list or change enabled Extensions",
+            reload_resources,
+        ),
+        "agents": ("List available Agents and the current selection", list_agents),
+        "agent": ("Select the Agent for this and subsequent Runs", select_agent),
+        "mcp": ("List, enable, disable, or refresh MCP services", manage_mcp),
+        "plugins": ("Configure isolated worker extensions", manage_plugins),
+        "export": ("Export the current Session to JSON", export_session),
+        "import": ("Import a Session from a JSON file", import_session),
+        "copy": ("Copy active conversation text to the clipboard", copy_session),
+    }
+    if scheduler is not None:
+        additional_commands["cron"] = (
+            "List, add, remove, or pause scheduled tasks",
+            manage_cron,
+        )
+
     commands = create_default_chat_commands(
         enqueue_follow_up=enqueue_follow_up,
         enqueue_steering=enqueue_steering,
@@ -1064,19 +1172,7 @@ def create_chat_commands(
             "fork": fork_session,
             "clone": clone_session,
         },
-        additional_commands={
-            "reload": (
-                "Reload Skills/Prompts and list or change enabled Extensions",
-                reload_resources,
-            ),
-            "agents": ("List available Agents and the current selection", list_agents),
-            "agent": ("Select the Agent for this and subsequent Runs", select_agent),
-            "mcp": ("List, enable, disable, or refresh MCP services", manage_mcp),
-            "plugins": ("Configure isolated worker extensions", manage_plugins),
-            "export": ("Export the current Session to JSON", export_session),
-            "import": ("Import a Session from a JSON file", import_session),
-            "copy": ("Copy active conversation text to the clipboard", copy_session),
-        },
+        additional_commands=additional_commands,
         resource_commands=_resource_command_specs(current_resource_manager()),
         help_details=help_details,
     )
@@ -1247,6 +1343,28 @@ def _format_session_tree(
             for child in reversed(children.get(entry.id, []))
         )
     lines.append("* marks the active branch.")
+    return "\n".join(lines)
+
+
+async def _render_scheduled_jobs(scheduler: CronScheduler) -> str:
+    """把定时任务列表渲染成可读文本。"""
+    jobs = await scheduler.list_jobs()
+    if not jobs:
+        return (
+            "No scheduled tasks. Use "
+            "/cron add <m> <h> <dom> <mon> <dow> <prompt…>."
+        )
+    now = datetime.now()
+    lines = ["Scheduled tasks:"]
+    for job in jobs:
+        state = "enabled" if job.enabled else "paused"
+        next_run = job.next_run_at(now)
+        last = job.last_status or "never"
+        lines.append(
+            f"  {job.id[:8]} [{state}] {job.schedule} — {job.name}\n"
+            f"     next: {next_run:%Y-%m-%d %H:%M} · last: {last}"
+        )
+    lines.append("Use /cron add|remove|pause|resume to manage.")
     return "\n".join(lines)
 
 

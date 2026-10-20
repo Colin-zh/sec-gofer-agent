@@ -120,6 +120,22 @@ class Session:
         selected_leaf = entry.id if active_leaf_id is None else active_leaf_id
         await self._append_entries((entry,), selected_leaf)
 
+    def rewind_to(self, entry_id: str) -> None:
+        """把活动叶指针回退到指定条目，让下一次 append 从该节点分支。
+
+        仅修改内存中的父指针，不删除或改写任何历史条目。回退后的活动叶
+        无需是“叶节点”：下一次 ``append`` 会以其为父节点创建新分支，历史
+        分支保持不变。调用方须保证当前没有活动 Trace。
+        """
+        if not any(entry.id == entry_id for entry in self._entries):
+            raise ValueError(f"entry {entry_id!r} not found")
+        with self._lock:
+            if self._active_control is not None:
+                raise SessionBusyError(
+                    f"session {self.id!r} already has an active Trace"
+                )
+            self._active_leaf_id = entry_id
+
     @property
     def version(self) -> int:
         """返回最近一次成功加载或追加的存储版本。"""

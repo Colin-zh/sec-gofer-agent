@@ -98,7 +98,7 @@ class DatabaseSemanticStore(SemanticStoreProtocol):
                     )
                     if existing is not None:
                         return existing
-                    await db.execute(insert(memories).values(_entry_values(entry, embedding_json)))
+                    await db.execute(insert(memories).values(_entry_values(entry)))
                     await self._sync_search(db, entry.id, _searchable(entry), embedding_json)
             except IntegrityError as exc:
                 return await self._resolve_dedup_id(entry, exc)
@@ -177,7 +177,6 @@ class DatabaseSemanticStore(SemanticStoreProtocol):
                             subject=subject,
                             dedup_key=new_dedup,
                             updated_at=time(),
-                            embedding=embedding_json,
                         )
                     )
                     if result.rowcount != 1:
@@ -236,8 +235,8 @@ class DatabaseSemanticStore(SemanticStoreProtocol):
         if self._vector:
             await db.execute(
                 text(
-                    f"UPDATE {memories.name} SET {VECTOR_COLUMN} = CAST(:v AS vector) "
-                    "WHERE id = :id"
+                    f"UPDATE {memories.name} SET {VECTOR_COLUMN} = "
+                    "CAST(CAST(:v AS text) AS vector) WHERE id = :id"
                 ),
                 {"v": embedding_json, "id": memory_id},
             )
@@ -340,7 +339,7 @@ class DatabaseSemanticStore(SemanticStoreProtocol):
         statement = text(
             f"SELECT id FROM {memories.name} "
             f"WHERE {VECTOR_COLUMN} IS NOT NULL {scope_clause} "
-            f"ORDER BY {VECTOR_COLUMN} <=> CAST(:q AS vector) LIMIT :k"
+            f"ORDER BY {VECTOR_COLUMN} <=> CAST(CAST(:q AS text) AS vector) LIMIT :k"
         )
         params = {"q": query_vec, "k": limit}
         if scope is not None:
@@ -352,7 +351,7 @@ class DatabaseSemanticStore(SemanticStoreProtocol):
             raise MemoryStoreError("initialize the MemoryStore before use")
 
 
-def _entry_values(entry: MemoryEntry, embedding_json: str | None) -> dict:
+def _entry_values(entry: MemoryEntry) -> dict:
     return {
         "id": entry.id,
         "scope": entry.scope,
@@ -363,7 +362,6 @@ def _entry_values(entry: MemoryEntry, embedding_json: str | None) -> dict:
         "origin": entry.source.origin,
         "source_session_id": entry.source.session_id,
         "source_entry_id": entry.source.entry_id,
-        "embedding": embedding_json,
         "created_at": entry.created_at,
         "updated_at": entry.updated_at,
     }

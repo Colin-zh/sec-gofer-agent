@@ -103,6 +103,7 @@ class Tool:
     definition: ToolDefinition
     signature: inspect.Signature | None
     retry_safe: bool = False
+    safe_parallel: bool = False
     risk_level: ToolRiskLevel = "unknown"
     source: str = "local"
     workspace_scoped: bool = False
@@ -126,12 +127,13 @@ class Tool:
         name: str | None = None,
         description: str | None = None,
         retry_safe: bool = False,
+        safe_parallel: bool = False,
         risk_level: ToolRiskLevel = "unknown",
         source: str = "local",
         workspace_scoped: bool = False,
         capability_type: PolicyCapabilityType = "tool",
     ) -> Tool:
-        """从 Python 函数签名生成工具 schema，并可声明调用是否安全重试。"""
+        """从 Python 函数签名生成工具 schema，并可声明调用是否安全重试或并行。"""
         signature = inspect.signature(function)
         type_hints = get_type_hints(function)
         properties: dict[str, Any] = {}
@@ -169,6 +171,7 @@ class Tool:
             definition=definition,
             signature=signature,
             retry_safe=retry_safe,
+            safe_parallel=safe_parallel,
             risk_level=risk_level,
             source=source,
             workspace_scoped=workspace_scoped,
@@ -203,6 +206,7 @@ class Tool:
         input_schema: Mapping[str, Any],
         output_schema: Mapping[str, Any] | None = None,
         retry_safe: bool = False,
+        safe_parallel: bool = False,
         risk_level: ToolRiskLevel = "unknown",
         source: str = "local",
         workspace_scoped: bool = False,
@@ -219,6 +223,7 @@ class Tool:
             definition=ToolDefinition(name, description, schemas[0], schemas[1]),
             signature=None,
             retry_safe=retry_safe,
+            safe_parallel=safe_parallel,
             risk_level=risk_level,
             source=source,
             workspace_scoped=workspace_scoped,
@@ -247,6 +252,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     retry_safe: bool = False,
+    safe_parallel: bool = False,
     risk_level: ToolRiskLevel = "unknown",
     source: str = "local",
     workspace_scoped: bool = False,
@@ -260,6 +266,7 @@ def tool(
             name=name,
             description=description,
             retry_safe=retry_safe,
+            safe_parallel=safe_parallel,
             risk_level=risk_level,
             source=source,
             workspace_scoped=workspace_scoped,

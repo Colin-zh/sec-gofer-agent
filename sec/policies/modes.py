@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Literal
 
 from sec._types.policy import PolicyContext, PolicyDecision
+from sec.tools._builtins.management import (
+    MANAGEMENT_READ_TOOL_NAMES,
+    MANAGEMENT_TOOL_SOURCE,
+)
 
 PermissionMode = Literal["plan", "normal", "auto"]
 BUILTIN_WORKSPACE_SOURCE = "sec.builtin.workspace"
@@ -42,8 +46,8 @@ class PermissionModePolicy:
     def decide(self, context: PolicyContext) -> PolicyDecision:
         """根据风险和资源边界生成结构化策略决策。"""
         if (
-            context.source == "sec.capabilities"
-            and context.capability_name in {"skills_load", "capabilities_search"}
+            context.source == MANAGEMENT_TOOL_SOURCE
+            and context.capability_name in MANAGEMENT_READ_TOOL_NAMES
             and context.risk_level == "read"
         ):
             return PolicyDecision.allow("Reading the already-authorized capability catalog.")

@@ -22,8 +22,22 @@ from sec._types.memory import (
     ProceduralSource,
     SemanticStoreProtocol,
 )
-from sec._types.messages import UserMessage
+from sec._types.messages import Message, UserMessage
 from sec.exceptions import MemoryStoreError
+from sec.memory.context_builder import render_memory_context
+from sec.tools.tool import ToolDefinition
+
+
+class _Utf8ByteTokenEstimator:
+    """Use a conservative byte-count budget when no provider tokenizer is injected."""
+
+    def estimate_tokens(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition],
+    ) -> int:
+        del tools
+        return sum(len(message.text.encode("utf-8")) for message in messages)
 
 
 class MemoryRetriever:
@@ -43,14 +57,33 @@ class MemoryRetriever:
             raise ValueError("top_k must be at least 1")
         if token_budget is not None and token_budget < 1:
             raise ValueError("token_budget must be at least 1")
-        if token_budget is not None and token_estimator is None:
-            raise ValueError("token_budget requires a token_estimator")
         self._semantic = semantic
         self._episodic = episodic
         self._procedural_sources = tuple(procedural_sources)
         self._top_k = top_k
         self._token_budget = token_budget
-        self._token_estimator = token_estimator
+        self._token_estimator = (
+            _Utf8ByteTokenEstimator()
+            if token_budget is not None and token_estimator is None
+            else token_estimator
+        )
+
+    async def load_procedures(self, query: str) -> tuple[ProceduralBlock, ...]:
+        """强制加载所有程序性来源，不受 gate 的 retrieve 决策控制。
+
+        USER.md（用户偏好/规则）与匹配的 Skills 属「应该怎么做」，每轮都应
+        纳入上下文；语义/情景仍由 gate 按需检索。
+        """
+        procedures: tuple[ProceduralBlock, ...] = ()
+        errors: list[str] = []
+        for source in self._procedural_sources:
+            try:
+                procedures = (*procedures, *await source.load(query))
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+        if errors:
+            raise MemoryStoreError("; ".join(errors))
+        return procedures
 
     async def retrieve(self, query: str) -> MemoryRetrievalResult:
         if not isinstance(query, str) or not query.strip():
@@ -108,16 +141,29 @@ class MemoryRetriever:
         if self._token_estimator is None or self._token_budget is None:
             return memories, episodes, procedures
 
-        blocks: list[tuple[MemoryEntry | EpisodicRecord | ProceduralBlock, str]] = [
-            (entry, entry.content) for entry in memories
-        ] + [
-            (record, record.text) for record in episodes
-        ] + [
-            (block, block.text) for block in procedures
+        blocks: list[MemoryEntry | EpisodicRecord | ProceduralBlock] = [
+            *memories,
+            *episodes,
+            *procedures,
         ]
 
         def estimate() -> int:
-            text = "\n\n".join(block[1] for block in blocks)
+            selected_memories = tuple(
+                block for block in blocks if isinstance(block, MemoryEntry)
+            )
+            selected_episodes = tuple(
+                block for block in blocks if isinstance(block, EpisodicRecord)
+            )
+            selected_procedures = tuple(
+                block for block in blocks if isinstance(block, ProceduralBlock)
+            )
+            text = render_memory_context(
+                selected_memories,
+                selected_episodes,
+                selected_procedures,
+            )
+            if text is None:
+                return 0
             message = UserMessage(content=[TextContent(text=text)], timestamp=time())
             return self._token_estimator.estimate_tokens((message,), ())
 
@@ -125,12 +171,12 @@ class MemoryRetriever:
             blocks.pop()
 
         kept_memories = tuple(
-            obj for obj, _ in blocks if isinstance(obj, MemoryEntry)
+            block for block in blocks if isinstance(block, MemoryEntry)
         )
         kept_episodes = tuple(
-            obj for obj, _ in blocks if isinstance(obj, EpisodicRecord)
+            block for block in blocks if isinstance(block, EpisodicRecord)
         )
         kept_procedures = tuple(
-            obj for obj, _ in blocks if isinstance(obj, ProceduralBlock)
+            block for block in blocks if isinstance(block, ProceduralBlock)
         )
         return kept_memories, kept_episodes, kept_procedures

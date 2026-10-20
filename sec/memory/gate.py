@@ -20,9 +20,14 @@ _GATE_SYSTEM = (
     "You decide whether long-term memory retrieval would help answer the user's "
     "current message. Reply with ONLY a JSON object: "
     '{"retrieve": true|false, "query": "short keyword search phrase"}. '
-    "Set retrieve to true only when the user references earlier facts, "
-    "preferences, or prior conversation; otherwise false. The query must be a "
-    "short search phrase, not a restatement of the message."
+    "Set retrieve to true when the message could benefit from long-term memory: "
+    "questions about the user's identity, name, or preferences, anything the "
+    "user asks you to remember or recall, references to earlier facts or prior "
+    "conversations, and any message whose answer depends on context you may "
+    "already hold. Set retrieve to false only for self-contained requests with "
+    "no memory relevance (simple greetings, chitchat, or generic how-to "
+    "questions needing no personal context). When in doubt, prefer true. The "
+    "query must be a short search phrase, not a restatement of the message."
 )
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)

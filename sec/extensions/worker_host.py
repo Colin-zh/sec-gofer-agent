@@ -118,6 +118,7 @@ class _Host:
                     "input_schema": dict(tool.definition.input_schema),
                     "output_schema": dict(tool.definition.output_schema),
                     "retry_safe": tool.retry_safe,
+                    "safe_parallel": tool.safe_parallel,
                     "risk_level": tool.risk_level,
                     "source": tool.source,
                     "workspace_scoped": tool.workspace_scoped,

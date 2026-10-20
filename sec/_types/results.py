@@ -43,6 +43,7 @@ class TraceResult:
     retries: int = 0
     tool_attempts: int = 0
     tool_retries: int = 0
+    aux_model_calls: int = 0
     usage: TraceUsage = field(default_factory=TraceUsage)
 
     @property

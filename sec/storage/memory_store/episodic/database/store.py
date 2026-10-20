@@ -23,7 +23,6 @@ from sec.storage.memory_store._search import (
     rrf_fuse,
 )
 from sec.storage.memory_store._vector import (
-    decode_embedding,
     encode_embedding,
     is_vector_dialect,
 )
@@ -114,7 +113,6 @@ class DatabaseEpisodicStore(EpisodicStoreProtocol):
                                     "entry_id": record.entry_id,
                                     "text": record.text,
                                     "timestamp": record.timestamp,
-                                    "embedding": embedding_json,
                                     "kind": record.kind,
                                 }
                             )
@@ -131,7 +129,7 @@ class DatabaseEpisodicStore(EpisodicStoreProtocol):
                             await db.execute(
                                 text(
                                     f"UPDATE {episodes.name} SET {VECTOR_COLUMN} = "
-                                    "CAST(:v AS vector) WHERE id = :id"
+                                    "CAST(CAST(:v AS text) AS vector) WHERE id = :id"
                                 ),
                                 {"v": embedding_json, "id": record.id},
                             )
@@ -154,6 +152,20 @@ class DatabaseEpisodicStore(EpisodicStoreProtocol):
             return tuple(_row_to_record(by_id[i]) for i in ids if i in by_id)
         except SQLAlchemyError as exc:
             raise MemoryStoreError("could not search episodic memory") from exc
+
+    async def list(self, *, limit: int) -> tuple[EpisodicRecord, ...]:
+        _validate_top_k(limit)
+        self._require_initialized()
+        try:
+            async with self._database.session() as db:
+                rows = (await db.execute(
+                    select(episodes)
+                    .order_by(episodes.c.timestamp.desc(), episodes.c.id)
+                    .limit(limit)
+                )).all()
+            return tuple(_row_to_record(row) for row in rows)
+        except SQLAlchemyError as exc:
+            raise MemoryStoreError("could not list episodic memory") from exc
 
     async def delete_session(self, session_id: str) -> None:
         _validate_session_id(session_id)
@@ -236,7 +248,7 @@ class DatabaseEpisodicStore(EpisodicStoreProtocol):
     async def _ann_ids(self, db, query_vec: str, limit: int) -> list[str]:
         statement = text(
             f"SELECT id FROM {episodes.name} WHERE {VECTOR_COLUMN} IS NOT NULL "
-            f"ORDER BY {VECTOR_COLUMN} <=> CAST(:q AS vector) LIMIT :k"
+            f"ORDER BY {VECTOR_COLUMN} <=> CAST(CAST(:q AS text) AS vector) LIMIT :k"
         )
         return list((await db.execute(statement, {"q": query_vec, "k": limit})).scalars())
 
@@ -252,7 +264,6 @@ def _row_to_record(row) -> EpisodicRecord:
         entry_id=row.entry_id,
         text=row.text,
         timestamp=row.timestamp,
-        embedding=decode_embedding(row.embedding),
         kind=row.kind,
     )
 

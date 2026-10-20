@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from hashlib import sha256
 import json
 from uuid import uuid4
 
@@ -27,6 +28,8 @@ from sec._types.events import (
     AgentSettledEvent,
     MemoryConsolidationEvent,
     MemoryIndexEvent,
+    MemoryProceduralConsolidationEvent,
+    TraceSummaryEvent,
 )
 from sec._types.hooks import HookContext, HookHandler, HookName
 from sec.agent import Agent, Trace, Session
@@ -37,10 +40,18 @@ from sec._types.context import TokenEstimator
 from sec._types.execution import ToolExecutor
 from sec._types.policy import PolicyEngine
 from sec._types.providers import ModelProvider, StreamingModelProvider
+from sec.providers.router import ModelRouter
+from sec.agent.auxiliary import AuxiliaryRuntime
 from sec.memory.context_builder import ContextBuilder
-from sec._types.memory import EpisodicKind, EpisodicRecord, MemoryConsolidationResult
+from sec._types.memory import (
+    EpisodicKind,
+    EpisodicRecord,
+    MemoryConsolidationResult,
+    ProceduralConsolidationResult,
+)
 from sec._types.messages import AssistantMessage, Message, ToolResultMessage
 from sec._types.results import TraceResult
+from sec._types.session import MessageEntry
 from sec.memory.runtime import MemoryRuntime
 
 
@@ -61,10 +72,14 @@ class Harness:
         max_output_tokens: int = 4096,
         hooks: Mapping[HookName, tuple[HookHandler, ...]] | None = None,
         memory: MemoryRuntime | None = None,
+        router: ModelRouter | None = None,
+        auxiliary: AuxiliaryRuntime | None = None,
     ) -> None:
         if event_buffer_size < 1:
             raise ValueError("event_buffer_size must be at least 1")
         self._provider = provider
+        self._router = router
+        self._auxiliary = auxiliary
         self._memory = memory
         self._hook_executor = HookExecutor(hooks if hooks is not None else {})
         if policy is not None and not callable(getattr(policy, "decide", None)):
@@ -101,6 +116,9 @@ class Harness:
 
     async def aclose(self) -> None:
         """释放 Provider 的异步客户端资源；无关闭接口时不执行操作。"""
+        if self._router is not None:
+            await self._router.aclose()
+            return
         close = getattr(self._provider, "aclose", None)
         if close is not None:
             await close()
@@ -116,7 +134,16 @@ class Harness:
         if memory is None:
             return
         if memory.episodic is not None:
-            records = _build_episodic_records(session.id, result.messages)
+            entry_ids = {
+                id(entry.message): entry.id
+                for entry in session.entries
+                if isinstance(entry, MessageEntry)
+            }
+            records = _build_episodic_records(
+                session.id,
+                result.messages,
+                entry_ids=entry_ids,
+            )
             if records:
                 try:
                     await memory.episodic.index(records)
@@ -150,6 +177,47 @@ class Harness:
                     error=consolidation.error,
                 )
             )
+        if memory.procedural_consolidator is not None:
+            try:
+                procedural = await memory.procedural_consolidator.consolidate(
+                    result.messages
+                )
+            except Exception as exc:
+                procedural = ProceduralConsolidationResult(
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            events.publish(
+                MemoryProceduralConsolidationEvent(
+                    status=procedural.status,
+                    added_count=len(procedural.added),
+                    error=procedural.error,
+                )
+            )
+
+    async def _post_run_summary(
+        self,
+        result: TraceResult,
+        events: TraceEventStream,
+    ) -> None:
+        """post-run 阶段生成 trace 一句话摘要；失败仅发布事件，不改变结果。"""
+        auxiliary = self._auxiliary
+        if (
+            auxiliary is None
+            or not auxiliary.active
+            or auxiliary.summarizer is None
+        ):
+            return
+        try:
+            summary = await auxiliary.summarizer.summarize(result.messages)
+            events.publish(TraceSummaryEvent(summary=summary))
+        except Exception as exc:
+            events.publish(
+                TraceSummaryEvent(
+                    summary="",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
 
     def run(
         self,
@@ -158,8 +226,13 @@ class Harness:
         *,
         session: Session | None = None,
         capabilities: CapabilityBinding | None = None,
+        policy: PolicyEngine | None = None,
+        resume_existing_turn: bool = False,
     ) -> Trace:
-        """在当前事件循环中启动 Trace，并返回可观察、可控制的句柄。"""
+        """在当前事件循环中启动 Trace，并返回可观察、可控制的句柄。
+
+        ``policy`` 允许单次运行覆盖 Harness 的默认策略（如定时任务的全放行）。
+        """
         loop = asyncio.get_running_loop()
         active_session = session if session is not None else Session()
         event_stream = TraceEventStream(
@@ -185,6 +258,8 @@ class Harness:
                     budget,
                     state,
                     capabilities,
+                    policy,
+                    resume_existing_turn,
                 ),
                 name=f"agent-run-{active_session.id}",
             )
@@ -204,6 +279,8 @@ class Harness:
         budget: Budget,
         state: TraceState,
         capabilities: CapabilityBinding | None = None,
+        policy: PolicyEngine | None = None,
+        resume_existing_turn: bool = False,
     ) -> TraceResult:
         """执行 Agent 循环，并在所有退出路径发布 Trace 终态事件。"""
         try:
@@ -227,7 +304,7 @@ class Harness:
                     control=control,
                     events=event_stream,
                     state=state,
-                    policy=self._policy,
+                    policy=policy if policy is not None else self._policy,
                     executor=self._executor,
                     budget=budget,
                     metrics=metrics,
@@ -239,6 +316,9 @@ class Harness:
                     gate=self._memory.gate if self._memory is not None else None,
                     retriever=self._memory.retriever if self._memory is not None else None,
                     initial_messages=injected,
+                    router=self._router,
+                    auxiliary=self._auxiliary,
+                    resume_existing_turn=resume_existing_turn,
                 )
                 status = "completed"
                 if self._memory is not None and self._memory.has_post_run:
@@ -246,6 +326,12 @@ class Harness:
                         await self._post_run_memory(session, result, event_stream)
                     except Exception:
                         # post-run 记忆整理失败不改变已完成的 Trace 结果。
+                        pass
+                if self._auxiliary is not None and self._auxiliary.active:
+                    try:
+                        await self._post_run_summary(result, event_stream)
+                    except Exception:
+                        # post-run 摘要失败不改变已完成的 Trace 结果。
                         pass
             except asyncio.CancelledError as exc:
                 error = exc
@@ -292,6 +378,8 @@ _MAX_TOOL_TEXT = 2000
 def _build_episodic_records(
     session_id: str,
     messages: Sequence[Message],
+    *,
+    entry_ids: Mapping[int, str] | None = None,
 ) -> list[EpisodicRecord]:
     """把本次 Trace 新增的对话消息与工具活动转成情景索引记录。
 
@@ -303,27 +391,27 @@ def _build_episodic_records(
     结果文本中，可被同一关键字检索命中。
     """
     records: list[EpisodicRecord] = []
-    counter = 0
     for message_index, message in enumerate(messages):
+        entry_id = (entry_ids or {}).get(
+            id(message),
+            f"{session_id}:{message_index}",
+        )
         if isinstance(message, AssistantMessage):
             text = message.text.strip()
             if text:
                 records.append(
-                    _episode(session_id, message_index, counter, "message", text, message.timestamp)
+                    _episode(session_id, entry_id, "message", text, message.timestamp)
                 )
-                counter += 1
             for tool_use in message.tool_uses:
                 records.append(
                     _episode(
                         session_id,
-                        message_index,
-                        counter,
+                        entry_id,
                         "tool_call",
                         _tool_call_text(tool_use.name, tool_use.arguments),
                         message.timestamp,
                     )
                 )
-                counter += 1
             continue
         if isinstance(message, ToolResultMessage):
             text = message.text.strip()
@@ -331,37 +419,34 @@ def _build_episodic_records(
                 records.append(
                     _episode(
                         session_id,
-                        message_index,
-                        counter,
+                        entry_id,
                         "tool_result",
                         _tool_result_text(message.tool_name, text, message.is_error),
                         message.timestamp,
                     )
                 )
-                counter += 1
             continue
         text = message.text.strip()
         if text and message.role in ("user", "assistant"):
             records.append(
-                _episode(session_id, message_index, counter, "message", text, message.timestamp)
+                _episode(session_id, entry_id, "message", text, message.timestamp)
             )
-            counter += 1
     return records
 
 
 def _episode(
     session_id: str,
-    message_index: int,
-    counter: int,
+    entry_id: str,
     kind: EpisodicKind,
     text: str,
     timestamp: float,
 ) -> EpisodicRecord:
-    """构造一条情景索引记录；id 用单调计数器保证唯一，entry_id 引用消息位置。"""
+    """构造幂等情景索引；同一来源重复整理会得到相同 ID。"""
+    identity = f"{session_id}\0{entry_id}\0{kind}\0{timestamp!r}\0{text}"
     return EpisodicRecord(
-        id=f"epi:{session_id}:{counter}",
+        id=f"epi:{session_id}:{sha256(identity.encode('utf-8')).hexdigest()}",
         session_id=session_id,
-        entry_id=f"{session_id}:{message_index}",
+        entry_id=entry_id,
         text=text,
         timestamp=timestamp,
         kind=kind,

@@ -24,12 +24,20 @@ from sec.apps.cli.chat_commands import (
 )
 from sec.apps.cli.resources import CliResourceManager
 from sec.apps.cli.session_io import write_session_file
-from sec.agent import Trace
+from sec.agent import Session, Trace
 from sec.tools import Tool, create_builtin_tools
-from sec.apps.desktop.settings import ExtensionSettings
+from sec.apps.desktop.settings import ExtensionSettings, resolve_trace_store_path
 from sec.apps.desktop.tool_page import ToolEntry, ToolInventory
+from sec._runtime.cron import CronScheduleError
+from sec._runtime.scheduler import CronScheduler, ScheduledJob, ScheduledRunResult
 from sec._types.session import CustomMessageEntry, MessageEntry
 from sec._types.json import JSONObject
+from sec._types.memory import (
+    DEFAULT_SCOPE,
+    MemoryEntry,
+    MemorySource,
+    memory_dedup_key,
+)
 from sec._types.events import AgentSettledEvent
 from sec.apps.desktop.trace_store import TraceRecorder, TraceStore
 
@@ -63,6 +71,14 @@ def _classify_tool(tool: Tool) -> tuple[bool, str | None, str | None, str]:
     return True, None, None, "由 Agent / 技能 提供"
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """原子写入文本文件（USER.md 等），避免留下半截内容。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
 class SecRuntime(QObject):
     """Own an AsyncSecClient on a background asyncio event loop."""
 
@@ -86,6 +102,10 @@ class SecRuntime(QObject):
     run_failed = Signal(str)
     traces_updated = Signal(object, object, object)
     trace_updated = Signal(str)
+    scheduled_tasks_updated = Signal(object)
+    scheduled_task_result = Signal(str, str)
+    memories_updated = Signal(object)
+    memory_result = Signal(str, str)
 
     def __init__(
         self,
@@ -96,7 +116,8 @@ class SecRuntime(QObject):
         super().__init__()
         self.workspace = workspace.expanduser().resolve()
         self._trace_store = TraceStore(
-            self.workspace / ".sec" / "desktop-traces.sqlite3",
+            resolve_trace_store_path(self.workspace),
+            defer_backend=True,
         )
         self.enabled_extensions = enabled_extensions
         self._thread = threading.Thread(
@@ -125,6 +146,7 @@ class SecRuntime(QObject):
         self._queued_resource_inputs: list[tuple[str, str, frozenset[str]]] = []
         self._prompt_task: asyncio.Task[object] | None = None
         self._send_lock: asyncio.Lock | None = None
+        self._scheduler: CronScheduler | None = None
 
     @property
     def trace_store(self) -> TraceStore:
@@ -368,6 +390,32 @@ class SecRuntime(QObject):
             self._session_action(action, session_id, path), self._require_loop()
         )
 
+    def retry_message(self, assistant_index: int) -> None:
+        """重新生成第 ``assistant_index`` 条助手回复（不重复追加用户提问）。"""
+        asyncio.run_coroutine_threadsafe(
+            self._retry_trace(assistant_index), self._require_loop()
+        )
+
+    def fork_session(self, session_id: str, name: str) -> None:
+        """分支当前会话并把新会话命名为旧名称 + "Copy"。"""
+        asyncio.run_coroutine_threadsafe(
+            self._fork_session(session_id, name), self._require_loop()
+        )
+
+    async def _fork_session(self, session_id: str, name: str) -> None:
+        try:
+            client = self._client
+            if client is None:
+                raise RuntimeError("Sec Client is not ready")
+            await client.fork_session(session_id)
+            base = (name or "").strip()
+            new_name = f"{base} Copy" if base else "Copy"
+            await client.rename_session(client.session.id, new_name)
+            self._on_session_changed(client.session.id)
+            await self._refresh_sessions()
+        except Exception as error:
+            self.command_result.emit(f"分支会话失败：{error}", "error")
+
     async def _session_action(
         self, action: str, session_id: str, path: str | None = None,
     ) -> None:
@@ -467,7 +515,16 @@ class SecRuntime(QObject):
             policy=self._policy,
             workspace=self.workspace,
             enabled_extensions=self._extension_settings.resolve(self.enabled_extensions),
+            memory_enabled=True,
         ) as client:
+            try:
+                await self._trace_store.configure(client.database)
+            except Exception as error:
+                self._trace_store.disable(error)
+                self.command_result.emit(
+                    f"Trace 存储初始化失败，已停用 Trace 持久化且不会回退到本地 SQLite：{error}",
+                    "error",
+                )
             self._client = client
             self._resources = client.resources
             self._commands = create_chat_commands(
@@ -484,12 +541,34 @@ class SecRuntime(QObject):
             self._publish_session_history()
             await self._refresh_sessions()
             self._publish_traces()
-            self.ready.emit(str(self.workspace))
-            if self._shutdown_requested.is_set():
-                return
-            await self._shutdown.wait()
-            if self._active_trace is not None and not self._active_trace.done:
-                self._active_trace.cancel()
+            self._scheduler = CronScheduler(self.workspace, fire=self._fire_scheduled)
+            try:
+                try:
+                    await self._scheduler.start()
+                except (CronScheduleError, ValueError) as error:
+                    self._scheduler = None
+                    self.command_result.emit(
+                        f"定时任务加载失败，已停用调度：{error}", "error",
+                    )
+                else:
+                    await self._publish_scheduled_tasks()
+                self.ready.emit(str(self.workspace))
+                if self._shutdown_requested.is_set():
+                    return
+                await self._shutdown.wait()
+                if self._active_trace is not None and not self._active_trace.done:
+                    self._active_trace.cancel()
+            finally:
+                if self._scheduler is not None:
+                    await self._scheduler.stop()
+                    self._scheduler = None
+                try:
+                    await self._trace_store.aclose()
+                except Exception as error:
+                    self.command_result.emit(
+                        f"关闭 Trace 存储失败：{type(error).__name__}: {error}",
+                        "error",
+                    )
         self._client = None
         self._commands = None
 
@@ -581,11 +660,36 @@ class SecRuntime(QObject):
         if client is None:
             self.run_failed.emit("Sec Client is not ready.")
             return
+        await self._wait_for_prompt_cleanup()
         if self._active_trace is not None and not self._active_trace.done:
             self.run_failed.emit("A Sec Trace is already active.")
             return
+        await self._drive_trace(client, client.run(prompt))
 
-        run = client.run(prompt)
+    async def _wait_for_prompt_cleanup(self) -> None:
+        if self._active_trace is not None and not self._active_trace.done:
+            return
+        pending = self._prompt_task
+        if pending is not None and pending is not asyncio.current_task():
+            await asyncio.shield(pending)
+
+    async def _retry_trace(self, assistant_index: int) -> None:
+        client = self._client
+        if client is None:
+            self.run_failed.emit("Sec Client is not ready.")
+            return
+        await self._wait_for_prompt_cleanup()
+        if self._active_trace is not None and not self._active_trace.done:
+            self.run_failed.emit("A Sec Trace is already active.")
+            return
+        try:
+            run = client.regenerate(assistant_index)
+        except Exception as error:
+            self.command_result.emit(f"重新生成失败：{error}", "error")
+            return
+        await self._drive_trace(client, run)
+
+    async def _drive_trace(self, client: AsyncSecClient, run: Trace) -> None:
         self._active_trace = run
         self._prompt_task = asyncio.current_task()
         recorder: TraceRecorder | None = None
@@ -687,23 +791,309 @@ class SecRuntime(QObject):
             if recorder is not None:
                 try:
                     recorder.finish(trace_status)
+                    await self._trace_store.flush()
                 except Exception as error:
                     self.command_result.emit(
-                        f"Trace 完成状态写入失败（{type(error).__name__}）。",
+                        f"Trace 持久化失败（{type(error).__name__}）：{error}",
                         "error",
                     )
             self._queued_resource_inputs.clear()
             self._active_trace = None
-            self._prompt_task = None
             self._pending_approval_id = None
             self._pending_approval_name = None
             self._approval_future = None
             self._approval_cancelled = False
             self._publish_session_history()
             await self._refresh_sessions()
+            try:
+                await self._maybe_auto_title(run.session)
+                await self._publish_memories()
+            finally:
+                if self._prompt_task is asyncio.current_task():
+                    self._prompt_task = None
             self.trace_updated.emit(run.id)
             self._publish_traces()
             self.run_finished.emit()
+
+    def _require_scheduler(self) -> CronScheduler:
+        scheduler = self._scheduler
+        if scheduler is None:
+            raise RuntimeError("定时任务调度器不可用")
+        return scheduler
+
+    async def _publish_scheduled_tasks(self) -> None:
+        scheduler = self._scheduler
+        if scheduler is None:
+            self.scheduled_tasks_updated.emit(())
+            return
+        jobs = await scheduler.list_jobs()
+        self.scheduled_tasks_updated.emit(jobs)
+
+    def list_scheduled_tasks(self) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(self._publish_scheduled_tasks(), loop)
+
+    def add_scheduled_task(self, name: str, schedule: str, prompt: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._add_scheduled_task(name, schedule, prompt), loop,
+        )
+
+    def remove_scheduled_task(self, task_id: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._remove_scheduled_task(task_id), loop,
+        )
+
+    def toggle_scheduled_task(self, task_id: str, enabled: bool) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._toggle_scheduled_task(task_id, enabled), loop,
+        )
+
+    async def _add_scheduled_task(
+        self, name: str, schedule: str, prompt: str,
+    ) -> None:
+        try:
+            scheduler = self._require_scheduler()
+            job = await scheduler.add_job(name, schedule, prompt)
+            self.scheduled_task_result.emit(f"已添加定时任务「{job.name}」。", "info")
+        except Exception as error:
+            self.scheduled_task_result.emit(f"添加定时任务失败：{error}", "error")
+        finally:
+            await self._publish_scheduled_tasks()
+
+    async def _remove_scheduled_task(self, task_id: str) -> None:
+        try:
+            scheduler = self._require_scheduler()
+            if not await scheduler.remove_job(task_id):
+                raise ValueError("任务不存在")
+            self.scheduled_task_result.emit("已删除定时任务。", "info")
+        except Exception as error:
+            self.scheduled_task_result.emit(f"删除定时任务失败：{error}", "error")
+        finally:
+            await self._publish_scheduled_tasks()
+
+    async def _toggle_scheduled_task(self, task_id: str, enabled: bool) -> None:
+        try:
+            scheduler = self._require_scheduler()
+            if not await scheduler.set_enabled(task_id, enabled):
+                raise ValueError("任务不存在")
+            self.scheduled_task_result.emit(
+                "定时任务已" + ("启用" if enabled else "停用") + "。", "info",
+            )
+        except Exception as error:
+            self.scheduled_task_result.emit(f"更新定时任务失败：{error}", "error")
+        finally:
+            await self._publish_scheduled_tasks()
+
+    async def _fire_scheduled(self, job: ScheduledJob) -> ScheduledRunResult:
+        client = self._client
+        if client is None:
+            return ScheduledRunResult(
+                "failed", session_id=job.session_id, message="Sec Client is not ready",
+            )
+        try:
+            trace = await client.run_scheduled(
+                job.prompt, session_id=job.session_id, agent_id=job.agent_id,
+            )
+        except Exception as error:
+            return ScheduledRunResult(
+                "failed", session_id=job.session_id,
+                message=f"{type(error).__name__}: {error}",
+            )
+        session_id = trace.session.id
+        recorder: TraceRecorder | None = None
+        try:
+            recorder = TraceRecorder(self._trace_store, trace.id, session_id)
+        except Exception:
+            recorder = None
+        status = "failed"
+        try:
+            async for event in trace.events():
+                if recorder is not None:
+                    try:
+                        recorder.record(event)
+                    except Exception:
+                        recorder = None
+                if isinstance(event, AgentSettledEvent):
+                    status = event.status
+            await trace.result()
+            if status in {"cancelled", "limit_reached"}:
+                return ScheduledRunResult("skipped", session_id=session_id)
+            self.scheduled_task_result.emit(
+                f"定时任务「{job.name}」已完成。", "info",
+            )
+            return ScheduledRunResult("completed", session_id=session_id)
+        except asyncio.CancelledError:
+            return ScheduledRunResult("skipped", session_id=session_id)
+        except Exception as error:
+            self.scheduled_task_result.emit(
+                f"定时任务「{job.name}」失败：{error}", "error",
+            )
+            return ScheduledRunResult(
+                "failed", session_id=session_id,
+                message=f"{type(error).__name__}: {error}",
+            )
+        finally:
+            if recorder is not None:
+                try:
+                    recorder.finish(status)
+                    await self._trace_store.flush()
+                except Exception as error:
+                    self.scheduled_task_result.emit(
+                        f"定时任务 Trace 持久化失败：{type(error).__name__}: {error}",
+                        "error",
+                    )
+            self.trace_updated.emit(trace.id)
+            await self._publish_scheduled_tasks()
+
+    def list_memories(self) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(self._publish_memories(), loop)
+
+    def add_memory(self, subject: str, content: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(self._add_memory(subject, content), loop)
+
+    def update_memory(self, memory_id: str, subject: str, content: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(
+            self._update_memory(memory_id, subject, content), loop,
+        )
+
+    def delete_memory(self, memory_id: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(self._delete_memory(memory_id), loop)
+
+    def save_procedural(self, text: str) -> None:
+        loop = self._require_loop()
+        asyncio.run_coroutine_threadsafe(self._save_procedural(text), loop)
+
+    def _require_memory_store(self):
+        client = self._client
+        if client is None:
+            raise RuntimeError("Sec Client is not ready")
+        store = client.memory_store
+        if store is None:
+            raise RuntimeError("长期记忆未启用")
+        return store
+
+    async def _publish_memories(self) -> None:
+        try:
+            self.memories_updated.emit(await self._gather_memories())
+        except Exception as error:
+            self.memories_updated.emit({
+                "available": False,
+                "semantic": (),
+                "episodic": (),
+                "procedural": {"path": "", "content": ""},
+            })
+            self.memory_result.emit(f"读取记忆失败：{error}", "error")
+
+    async def _gather_memories(self) -> dict:
+        client = self._client
+        store = client.memory_store if client is not None else None
+        procedural_path = (
+            client.memory_user_profile_path if client is not None else None
+        )
+        procedural_content = ""
+        if procedural_path is not None:
+            try:
+                procedural_content = procedural_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                pass
+        base = {
+            "available": store is not None,
+            "semantic": (),
+            "episodic": (),
+            "procedural": {
+                "path": str(procedural_path) if procedural_path is not None else "",
+                "content": procedural_content,
+            },
+        }
+        if store is None:
+            return base
+        semantic = await store.semantic.list(limit=500)
+        episodic = await store.episodic.list(limit=500)
+        base["semantic"] = tuple(
+            (entry.id, entry.subject, entry.content, entry.source.origin, entry.updated_at)
+            for entry in semantic
+        )
+        base["episodic"] = tuple(
+            (record.id, record.kind, record.text, record.timestamp, record.session_id)
+            for record in episodic
+        )
+        return base
+
+    async def _add_memory(self, subject: str, content: str) -> None:
+        try:
+            store = self._require_memory_store()
+            subject = subject.strip() or None
+            content = content.strip()
+            if not content:
+                raise ValueError("记忆内容不能为空")
+            now = time()
+            entry = MemoryEntry(
+                id=uuid4().hex,
+                content=content,
+                kind="semantic",
+                source=MemorySource(origin="explicit"),
+                created_at=now,
+                updated_at=now,
+                dedup_key=memory_dedup_key(subject, content),
+                subject=subject,
+                scope=DEFAULT_SCOPE,
+            )
+            await store.semantic.add(entry)
+            self.memory_result.emit("已添加记忆。", "info")
+        except Exception as error:
+            self.memory_result.emit(f"添加记忆失败：{error}", "error")
+        finally:
+            await self._publish_memories()
+
+    async def _update_memory(self, memory_id: str, subject: str, content: str) -> None:
+        try:
+            store = self._require_memory_store()
+            subject = subject.strip() or None
+            content = content.strip()
+            if not content:
+                raise ValueError("记忆内容不能为空")
+            if not await store.semantic.update(
+                memory_id, content=content, subject=subject,
+            ):
+                raise ValueError("记忆不存在")
+            self.memory_result.emit("已更新记忆。", "info")
+        except Exception as error:
+            self.memory_result.emit(f"更新记忆失败：{error}", "error")
+        finally:
+            await self._publish_memories()
+
+    async def _delete_memory(self, memory_id: str) -> None:
+        try:
+            store = self._require_memory_store()
+            if not await store.semantic.delete(memory_id):
+                raise ValueError("记忆不存在")
+            self.memory_result.emit("已删除记忆。", "info")
+        except Exception as error:
+            self.memory_result.emit(f"删除记忆失败：{error}", "error")
+        finally:
+            await self._publish_memories()
+
+    async def _save_procedural(self, text: str) -> None:
+        try:
+            client = self._client
+            if client is None:
+                raise RuntimeError("Sec Client is not ready")
+            path = client.memory_user_profile_path
+            if path is None:
+                raise RuntimeError("USER.md path is not configured")
+            await asyncio.to_thread(_write_text_atomic, path, text)
+            self.memory_result.emit("已保存程序记忆。", "info")
+        except Exception as error:
+            self.memory_result.emit(f"保存程序记忆失败：{error}", "error")
+        finally:
+            await self._publish_memories()
 
     def _on_session_changed(self, session_id: str) -> None:
         self.session_changed.emit(session_id)
@@ -964,10 +1354,44 @@ class SecRuntime(QObject):
             (summary.session_id, summary.name, summary.updated_at)
             for summary in summaries
         ]
-        if current.id not in {item[0] for item in items} and current.messages:
+        if current.id not in {item[0] for item in items}:
             summary = SessionSummary.from_snapshot(current.snapshot)
             items.insert(0, (summary.session_id, summary.name, summary.updated_at))
         self.sessions_updated.emit(tuple(items))
+
+    async def _maybe_auto_title(self, session: Session) -> None:
+        """首条输入后，用小模型为尚无名称的会话生成并写入一个短标题。"""
+        client = self._client
+        if client is None or client.session is not session or session.is_busy:
+            return
+        summary = SessionSummary.from_snapshot(session.snapshot)
+        if summary.name:
+            return
+        first_user = ""
+        for entry in session.snapshot.active_path:
+            if (
+                isinstance(entry, MessageEntry)
+                and entry.message.role == "user"
+                and entry.message.text.strip()
+            ):
+                first_user = entry.message.text.strip()
+                break
+        if not first_user:
+            return
+        title = await client.generate_session_title(first_user)
+        if not title:
+            return
+        if (
+            client.session is not session
+            or session.is_busy
+            or SessionSummary.from_snapshot(session.snapshot).name
+        ):
+            return
+        try:
+            await client.rename_session(session.id, title)
+        except Exception:
+            return
+        await self._refresh_sessions()
 
     async def _request_approval(
         self,

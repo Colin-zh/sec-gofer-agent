@@ -13,6 +13,7 @@ from sec.apis.client import (
 )
 from sec.config import (
     AgentSettings,
+    AuxiliarySettings,
     Config,
     ConfigError,
     ContextSettings,
@@ -42,6 +43,14 @@ from sec.exceptions import (
 )
 from sec.agent import Trace, Session
 from sec.agent.card import AgentCard
+from sec.agent.auxiliary import AuxiliaryBudget, AuxiliaryRuntime
+from sec.agent.entity import EntityExtraction, EntityExtractor
+from sec.agent.intent import IntentClassification, IntentClassifier
+from sec.agent.judge import JudgeVerdict, OutputJudge
+from sec.agent.rewrite import QueryRewriter, RewriteResult
+from sec.agent.router import ContentRouter, RoutingDecision
+from sec.agent.summary import TraceSummarizer
+from sec.providers.router import ModelRouter, ModelTier
 from sec.resources.agents import AgentCatalog
 from sec._runtime.capabilities import ReloadReport
 from sec.tools.tool import ToolOutput
@@ -62,9 +71,10 @@ from sec._types.approvals import (
 )
 from sec._types.events import (
     CapabilitySnapshotEvent, DelegationEvent,
-    MemoryConsolidationEvent, MemoryGateEvent, MemoryIndexEvent,
+    JudgeEvent, MemoryConsolidationEvent, MemoryGateEvent, MemoryIndexEvent,
     MemoryRetrievalEvent,
-    ModelRequestEndEvent, ModelRequestStartEvent, SessionEvent,
+    ModelRequestEndEvent, ModelRequestStartEvent, RewriteEvent, RoutingEvent,
+    SessionEvent, TraceSummaryEvent,
 )
 from sec._types.embedding import Embedder, Embedding
 from sec._types.limits import Limits, validate_timeout
@@ -140,6 +150,7 @@ from sec._types.storage import ObjectStore, SessionStoreProtocol
 from sec.executors import LocalToolExecutor
 from sec.policies import (
     AllowListPolicy,
+    AutoApprovePolicy,
     DenyAllPolicy,
     PermissionMode,
     PermissionModePolicy,
@@ -175,6 +186,7 @@ __all__ = [
     "AgentSettings",
     "ApprovalOutcome",
     "AllowListPolicy",
+    "AutoApprovePolicy",
     "BashExecutionMessage",
     "BranchSummaryMessage",
     "Config",
@@ -298,4 +310,24 @@ __all__ = [
     "message_to_dict",
     "tool",
     "validate_timeout",
+    "AuxiliaryBudget",
+    "AuxiliaryRuntime",
+    "AuxiliarySettings",
+    "ContentRouter",
+    "EntityExtraction",
+    "EntityExtractor",
+    "IntentClassification",
+    "IntentClassifier",
+    "JudgeEvent",
+    "JudgeVerdict",
+    "ModelRouter",
+    "ModelTier",
+    "OutputJudge",
+    "QueryRewriter",
+    "RewriteEvent",
+    "RewriteResult",
+    "RoutingDecision",
+    "RoutingEvent",
+    "TraceSummarizer",
+    "TraceSummaryEvent",
 ]

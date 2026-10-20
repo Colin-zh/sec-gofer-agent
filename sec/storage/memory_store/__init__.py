@@ -5,24 +5,31 @@ MemoryStore 不拥有共享 Database 与注入的 Embedder；应用负责其创�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from sec._types.embedding import Embedder
 from sec.storage.memory_store.episodic import (
     DatabaseEpisodicStore,
+    FileEpisodicStore,
     InMemoryEpisodicStore,
 )
 from sec.storage.memory_store.semantic import (
     DatabaseSemanticStore,
+    FileSemanticStore,
     InMemorySemanticStore,
 )
 from sec.storage.resources.database import Database
 
-MemoryStoreBackend = Literal["in_memory", "database"]
+MemoryStoreBackend = Literal["in_memory", "database", "file"]
 
 
 class MemoryStore:
-    """按后端配置创建 semantic/episodic adapters，并统一初始化与关闭。"""
+    """按后端配置创建 semantic/episodic adapters，并统一初始化与关闭。
+
+    ``file`` 后端将记忆以 JSON 落盘到 ``workspace/.sec/``，供无数据库时在
+    本地工作区持久化长期记忆。
+    """
 
     def __init__(
         self,
@@ -31,6 +38,7 @@ class MemoryStore:
         database: Database | None = None,
         embedder: Embedder | None = None,
         vector_dim: int = 1536,
+        workspace: Path | None = None,
     ) -> None:
         if backend == "in_memory":
             if database is not None:
@@ -39,6 +47,16 @@ class MemoryStore:
                 raise ValueError("embedder is only valid for the database backend")
             self._semantic = InMemorySemanticStore()
             self._episodic = InMemoryEpisodicStore()
+        elif backend == "file":
+            if workspace is None:
+                raise ValueError("file backend requires a workspace path")
+            if database is not None or embedder is not None:
+                raise ValueError(
+                    "database and embedder are only valid for the database backend"
+                )
+            root = Path(workspace) / ".sec"
+            self._semantic = FileSemanticStore(root / "memory-semantic.json")
+            self._episodic = FileEpisodicStore(root / "memory-episodic.json")
         elif backend == "database":
             if not isinstance(database, Database):
                 raise TypeError("database backend requires a Database instance")
@@ -75,6 +93,8 @@ class MemoryStore:
 __all__ = [
     "DatabaseEpisodicStore",
     "DatabaseSemanticStore",
+    "FileEpisodicStore",
+    "FileSemanticStore",
     "InMemoryEpisodicStore",
     "InMemorySemanticStore",
     "MemoryStore",
