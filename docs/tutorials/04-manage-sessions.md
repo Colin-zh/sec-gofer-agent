@@ -11,7 +11,7 @@ Session 保存一段对话历史。CLI 启动时会创建新 Session，也可通
 - `/clone` 复制完整分支树到新 Session。
 - `/new` 创建新 Session；`/resume [session-id]` 恢复已有 Session。
 
-切换、fork 或 clone 前必须先结束活动 Run。
+切换、fork 或 clone 前必须先结束活动 Trace。
 
 ## 导入与导出
 

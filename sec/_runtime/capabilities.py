@@ -9,12 +9,12 @@ import json
 
 from sec.agent import Agent
 from sec.agent.card import AgentCard
-from sec.exceptions import RecoverableToolError, RunLimitExceeded
+from sec.exceptions import RecoverableToolError, TraceLimitExceeded
 from sec.resources.markdown import CliResource
 from sec.tools.tool import Tool
-from sec._runtime.control import RunControl
-from sec._runtime.event_stream import RunEventStream
-from sec._runtime.metrics import RunMetricsAccumulator
+from sec._runtime.control import TraceControl
+from sec._runtime.event_stream import TraceEventStream
+from sec._runtime.metrics import TraceMetricsAccumulator
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class CapabilitySnapshot:
 
 
 @dataclass
-class RunAllowance:
+class TraceAllowance:
     """One turn allowance shared by a root task and all of its descendants."""
 
     max_model_calls: int
@@ -68,12 +68,12 @@ class RunAllowance:
 
     def model(self) -> None:
         if self.model_calls >= self.max_model_calls:
-            raise RunLimitExceeded("agent tree reached its total model-call limit")
+            raise TraceLimitExceeded("agent tree reached its total model-call limit")
         self.model_calls += 1
 
     def tools(self, count: int) -> None:
         if self.tool_calls + count > self.max_tool_calls:
-            raise RunLimitExceeded("agent tree reached its total tool-call limit")
+            raise TraceLimitExceeded("agent tree reached its total tool-call limit")
         self.tool_calls += count
 
 
@@ -90,12 +90,12 @@ def permitted(tool: Tool, card: AgentCard) -> bool:
 
 @dataclass
 class CapabilityBinding:
-    """Per-Run state; each resolve freezes both schemas and callable bindings."""
+    """Per-Trace state; each resolve freezes both schemas and callable bindings."""
 
     latest: Callable[[], CapabilitySnapshot]
     agent_id: str
     fallback: Agent
-    allowance: RunAllowance
+    allowance: TraceAllowance
     revoked: set[str]
     delegate: Callable[[str, str, CapabilityBinding], Awaitable[str]] | None = None
     depth: int = 0
@@ -105,9 +105,9 @@ class CapabilityBinding:
     discovered: set[str] = field(default_factory=set)
     generation: int = 0
     card_digest: str = ""
-    context: tuple[RunControl, RunEventStream] | None = None
-    metrics: RunMetricsAccumulator | None = None
-    # Identity changes are Run-boundary operations, even when catalog data reloads.
+    context: tuple[TraceControl, TraceEventStream] | None = None
+    metrics: TraceMetricsAccumulator | None = None
+    # Identity changes are Trace-boundary operations, even when catalog data reloads.
     identity: AgentCard | None = None
     initialize: Callable[[], Awaitable[None]] | None = None
     finalize: Callable[[], Awaitable[None]] | None = None

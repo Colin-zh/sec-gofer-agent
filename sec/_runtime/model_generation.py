@@ -9,6 +9,8 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from sec._types.content import TextContent
+from sec._types.hooks import HookContext
+from sec._runtime.hooks import HookExecutor
 from sec._types.json import JSONObject
 from sec._types.messages import AssistantMessage, Message, SystemMessage, message_to_dict
 from sec._types.events import (
@@ -20,12 +22,12 @@ from sec._types.events import (
     RetryStartEvent,
 )
 from sec._runtime.budget import Budget
-from sec._runtime.control import RunControl
-from sec._runtime.event_stream import RunEventStream
-from sec._runtime.metrics import RunMetricsAccumulator
+from sec._runtime.control import TraceControl
+from sec._runtime.event_stream import TraceEventStream
+from sec._runtime.metrics import TraceMetricsAccumulator
 from sec.agent import Agent
 from sec.exceptions import ProviderProtocolError, RetryableProviderError
-from sec._types.providers import ModelProvider, StreamingModelProvider
+from sec._types.providers import ModelProvider, ModelRequestOptions, StreamingModelProvider
 from sec.agent import Session
 from sec.tools.tool import ToolDefinition
 from sec._types.streaming import ModelResponseCompleted, ModelTextDelta
@@ -36,25 +38,38 @@ async def complete_or_interrupt(
     provider: ModelProvider | StreamingModelProvider,
     agent: Agent,
     session: Session,
-    control: RunControl,
-    events: RunEventStream,
+    control: TraceControl,
+    events: TraceEventStream,
     budget: Budget,
-    metrics: RunMetricsAccumulator,
+    metrics: TraceMetricsAccumulator,
     turn_id: str,
+    hooks: HookExecutor,
+    hook_ctx: HookContext,
     messages: tuple[Message, ...] | None = None,
     tools: tuple[ToolDefinition, ...] | None = None,
     publish_text: bool = True,
 ) -> tuple[AssistantMessage | None, str | None]:
     """等待模型响应，或因 steering/取消中断尚未提交的生成。"""
     control.raise_if_stopped()
+    await hooks.before_drive("trace" if publish_text else "compaction", hook_ctx)
 
     request_messages = messages
+    system_prompt = agent.instructions
     if request_messages is None:
         system_message = SystemMessage(
             content=[TextContent(text=agent.instructions)],
             timestamp=time(),
         )
         request_messages = (system_message, *session.messages)
+    request_messages, system_prompt = await hooks.transform_context(
+        request_messages, system_prompt, hook_ctx
+    )
+    if (
+        system_prompt != agent.instructions
+        and request_messages
+        and isinstance(request_messages[0], SystemMessage)
+    ):
+        request_messages[0].content = [TextContent(text=system_prompt)]
     request_tools = (
         tuple(tool.definition for tool in agent.tools)
         if tools is None
@@ -71,6 +86,8 @@ async def complete_or_interrupt(
         publish_text=publish_text,
         turn_id=turn_id,
         purpose="response" if publish_text else "compaction",
+        hooks=hooks,
+        hook_ctx=hook_ctx,
     )
     completion_task = asyncio.create_task(
         completion,
@@ -119,17 +136,20 @@ async def _complete_with_retries(
     provider: ModelProvider | StreamingModelProvider,
     messages: tuple[Message, ...],
     tools: tuple[ToolDefinition, ...],
-    events: RunEventStream,
+    events: TraceEventStream,
     budget: Budget,
-    metrics: RunMetricsAccumulator,
+    metrics: TraceMetricsAccumulator,
     publish_text: bool,
     turn_id: str,
     purpose: Literal["response", "compaction"],
+    hooks: HookExecutor,
+    hook_ctx: HookContext,
 ) -> AssistantMessage:
     """对单个逻辑模型请求执行有限 attempt，并隔离流式增量。"""
     retry_started = False
     request_id = uuid4().hex
     for attempt_number in range(1, budget.model_retries.max_attempts + 1):
+        options = await hooks.before_request(ModelRequestOptions(), hook_ctx)
         request_input: JSONObject = {
             "messages": [message_to_dict(message) for message in messages],
             "tools": [
@@ -142,6 +162,7 @@ async def _complete_with_retries(
                 for tool in tools
             ],
         }
+        request_input = await hooks.before_payload(request_input, hook_ctx)
         events.publish(ModelRequestStartEvent(
             request_id=request_id,
             turn_id=turn_id,
@@ -179,9 +200,10 @@ async def _complete_with_retries(
                     tools=tools,
                     events=events,
                     publish_text=publish_text,
+                    options=options,
                 )
             else:
-                response = await provider.complete(messages, tools)
+                response = await provider.complete(messages, tools, options)
             if not isinstance(response, AssistantMessage):
                 raise ProviderProtocolError(
                     "model provider must return an assistant message"
@@ -257,6 +279,7 @@ async def _complete_with_retries(
                 )
             raise
         else:
+            response = await hooks.after_response(response, hook_ctx)
             status: Literal["completed", "failed", "cancelled"] = (
                 "cancelled" if response.stop_reason == "aborted"
                 else "failed" if response.stop_reason == "error"
@@ -278,13 +301,14 @@ async def _collect_streamed_response(
     provider: StreamingModelProvider,
     messages: tuple[Message, ...],
     tools: tuple[ToolDefinition, ...],
-    events: RunEventStream,
+    events: TraceEventStream,
     publish_text: bool,
+    options: ModelRequestOptions,
 ) -> AssistantMessage:
     """发布文本增量并收集最终完整消息；增量本身不写入 Session。"""
     text_parts: list[str] = []
     response: AssistantMessage | None = None
-    async for item in provider.stream(messages, tools):
+    async for item in provider.stream(messages, tools, options):
         if response is not None:
             raise ProviderProtocolError(
                 "model stream emitted an event after its completed response"

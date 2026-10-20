@@ -107,6 +107,7 @@ class TerminalUI:
         self._spinner_handle: asyncio.TimerHandle | None = None
         self._escape_handle: asyncio.TimerHandle | None = None
         self._confirmation_future: asyncio.Future[bool] | None = None
+        self._prompt_future: asyncio.Future[str] | None = None
 
     async def run(self) -> None:
         if os.name == "nt" or termios is None or tty is None:
@@ -171,6 +172,8 @@ class TerminalUI:
         if self._confirmation_future is not None:
             if not self._confirmation_future.done():
                 self._confirmation_future.set_result(False)
+        if self._prompt_future is not None and not self._prompt_future.done():
+            self._prompt_future.set_result("")
         self._flush_pending_stream()
         self._erase_frame()
         self._write("\n")
@@ -212,6 +215,27 @@ class TerminalUI:
         finally:
             if self._confirmation_future is future:
                 self._confirmation_future = None
+
+    async def prompt(self, title: str) -> str | None:
+        """阻塞等待用户输入一行文本；Trace 停止时返回空串。"""
+        if self._prompt_future is not None:
+            raise RuntimeError("a terminal prompt is already pending")
+        future = asyncio.get_running_loop().create_future()
+        self._prompt_future = future
+        self.add_status("prompt", f"{title}")
+        try:
+            answer = await future
+            return answer if answer.strip() else None
+        finally:
+            if self._prompt_future is future:
+                self._prompt_future = None
+
+    def resolve_prompt(self, answer: str) -> bool:
+        future = self._prompt_future
+        if future is None or future.done():
+            return False
+        future.set_result(answer)
+        return True
 
     def resolve_confirmation(self, answer: str) -> bool:
         future = self._confirmation_future

@@ -1,6 +1,6 @@
-"""提供基于持久事件循环线程的同步 Client 与 Run 流适配器。
+"""提供基于持久事件循环线程的同步 Client 与 Trace 流适配器。
 
-该模块只桥接 sec 已有的异步 Client/Run API；模型、工具、预算和 Session
+该模块只桥接 sec 已有的异步 Client/Trace API；模型、工具、预算和 Session
 编排仍由 sec 异步运行时执行。
 """
 
@@ -12,11 +12,11 @@ from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import Future
 from typing import Any, Coroutine, TypeVar
 
-from sec.agent import Run
+from sec.agent import Trace
 from sec.apis.client import _SecClientCore
 from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
 from sec._types.events import SessionEvent
-from sec._types.results import RunResult
+from sec._types.results import TraceResult
 from sec._runtime.capabilities import ReloadReport
 from collections.abc import Iterable
 
@@ -125,10 +125,10 @@ class SecClient(_SecClientCore):
         """同步关闭 Client 持有的异步资源和事件循环线程。"""
         self.close()
 
-    def run(self, prompt: str) -> RunResult:
+    def run(self, prompt: str) -> TraceResult:
         """运行一轮对话，阻塞至结果完成并返回结果对象。"""
-        async def run_and_wait() -> RunResult:
-            return await self._start_run(prompt).result()
+        async def run_and_wait() -> TraceResult:
+            return await self._start_trace(prompt).result()
 
         return self._blocking_call(run_and_wait())
 
@@ -169,10 +169,10 @@ class SecClient(_SecClientCore):
     def revoke_capability(self, name: str) -> None:
         self._blocking_call(self._revoke_capability(name))
 
-    def stream(self, prompt: str) -> SyncRunStream:
-        """创建同步事件流上下文；实际启动 Run 发生在进入上下文时。"""
+    def stream(self, prompt: str) -> SyncTraceStream:
+        """创建同步事件流上下文；实际启动 Trace 发生在进入上下文时。"""
         self._require_worker()
-        return SyncRunStream(self, prompt)
+        return SyncTraceStream(self, prompt)
 
     def close(self) -> None:
         """关闭 Client；重复调用安全，注入资源仍由调用方拥有。"""
@@ -208,28 +208,28 @@ class SecClient(_SecClientCore):
     async def _begin_stream(
         self,
         prompt: str,
-    ) -> tuple[Run, AsyncIterator[SessionEvent]]:
-        run = self._start_run(prompt)
+    ) -> tuple[Trace, AsyncIterator[SessionEvent]]:
+        run = self._start_trace(prompt)
         return run, run.events()
 
 
-class SyncRunStream(Iterator[SessionEvent]):
-    """把 Run 异步事件迭代器包装为同步上下文管理器和迭代器。"""
+class SyncTraceStream(Iterator[SessionEvent]):
+    """把 Trace 异步事件迭代器包装为同步上下文管理器和迭代器。"""
 
     def __init__(self, client: SecClient, prompt: str) -> None:
         self._client = client
         self._prompt = prompt
-        self._run: Run | None = None
+        self._run: Trace | None = None
         self._events: AsyncIterator[SessionEvent] | None = None
         self._entered = False
         self._exhausted = False
         self._result_requested = False
-        self._result: RunResult | None = None
+        self._result: TraceResult | None = None
 
-    def __enter__(self) -> SyncRunStream:
-        """启动 Run 并立即订阅其事件流。"""
+    def __enter__(self) -> SyncTraceStream:
+        """启动 Trace 并立即订阅其事件流。"""
         if self._entered:
-            raise RuntimeError("a SyncRunStream can only be entered once")
+            raise RuntimeError("a SyncTraceStream can only be entered once")
         worker = self._client._require_worker()
         self._run, self._events = worker.submit(
             self._client._begin_stream(self._prompt)
@@ -243,7 +243,7 @@ class SyncRunStream(Iterator[SessionEvent]):
         exc: BaseException | None,
         traceback: object | None,
     ) -> None:
-        """在提前退出时取消 Run；正常结束时传播其最终异常。"""
+        """在提前退出时取消 Trace；正常结束时传播其最终异常。"""
         if self._run is None or self._events is None:
             return
         worker = self._client._require_worker()
@@ -256,23 +256,23 @@ class SyncRunStream(Iterator[SessionEvent]):
             )
         ).result()
 
-    def __iter__(self) -> SyncRunStream:
+    def __iter__(self) -> SyncTraceStream:
         return self
 
     def __next__(self) -> SessionEvent:
         """按需从异步事件流取出下一条事件。"""
         if not self._entered or self._events is None:
-            raise RuntimeError("SyncRunStream must be entered before iteration")
+            raise RuntimeError("SyncTraceStream must be entered before iteration")
         event = self._client._blocking_call(_next_event(self._events))
         if event is None:
             self._exhausted = True
             raise StopIteration
         return event
 
-    def result(self) -> RunResult:
-        """等待当前 Run 的最终结果；失败异常与异步 API 一致地传播。"""
+    def result(self) -> TraceResult:
+        """等待当前 Trace 的最终结果；失败异常与异步 API 一致地传播。"""
         if not self._entered or self._run is None:
-            raise RuntimeError("SyncRunStream must be entered before reading result")
+            raise RuntimeError("SyncTraceStream must be entered before reading result")
         self._result_requested = True
         if self._result is None:
             self._result = self._client._blocking_call(self._run.result())
@@ -289,7 +289,7 @@ async def _next_event(
 
 
 async def _finish_stream(
-    run: Run,
+    run: Trace,
     events: AsyncIterator[SessionEvent],
     *,
     cancel: bool,

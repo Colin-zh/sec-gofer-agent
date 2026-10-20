@@ -1,4 +1,4 @@
-"""管理单个 sec Run 的线程安全运行控制消息。
+"""管理单个 sec Trace 的线程安全运行控制消息。
 
 本模块将取消、当前 turn 的 steering 和后续 follow-up 投递到所属事件循环，
 并保证 Session 结束运行后不再接收新控制请求。
@@ -10,6 +10,7 @@ import asyncio
 import threading
 from dataclasses import dataclass
 
+from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
 from sec._types.approvals import ToolApprovalDecision, ToolApprovalRequest
 from sec._types.messages import Message
 
@@ -23,8 +24,18 @@ class _PendingToolApproval:
     resolved: bool = False
 
 
-class RunControl:
-    """管理单个 Run 的线程安全取消、steering、follow-up 和工具审批。"""
+@dataclass
+class _PendingUI:
+    """保存待回传的扩展 UI 请求及其响应 Future。"""
+
+    request_id: str
+    request: ExtensionUIRequest
+    future: asyncio.Future[ExtensionUIResponse]
+    resolved: bool = False
+
+
+class TraceControl:
+    """管理单个 Trace 的线程安全取消、steering、follow-up 和工具审批。"""
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -33,6 +44,7 @@ class RunControl:
         self._stop_requested = False
         self._pending_callbacks = 0
         self._pending_approval: _PendingToolApproval | None = None
+        self._pending_ui: _PendingUI | None = None
         self.stop_event = asyncio.Event()
         self.steering: asyncio.Queue[str] = asyncio.Queue()
         self.follow_ups: asyncio.Queue[str] = asyncio.Queue()
@@ -44,7 +56,7 @@ class RunControl:
             return self._stop_requested
 
     def raise_if_stopped(self) -> None:
-        """Run 已收到取消请求时抛出协作式取消异常。"""
+        """Trace 已收到取消请求时抛出协作式取消异常。"""
         if self.stop_requested:
             raise asyncio.CancelledError
 
@@ -86,7 +98,7 @@ class RunControl:
         )
 
     def begin_tool_approval(self, request: ToolApprovalRequest) -> bool:
-        """登记待审批调用；已停止或关闭的 Run 拒绝新审批。"""
+        """登记待审批调用；已停止或关闭的 Trace 拒绝新审批。"""
         if not isinstance(request, ToolApprovalRequest):
             raise TypeError("approval request must be a ToolApprovalRequest")
         if asyncio.get_running_loop() is not self._loop:
@@ -95,7 +107,7 @@ class RunControl:
             if self._closed or self._stop_requested:
                 return False
             if self._pending_approval is not None:
-                raise RuntimeError("a Run can only wait for one tool approval at a time")
+                raise RuntimeError("a Trace can only wait for one tool approval at a time")
             self._pending_approval = _PendingToolApproval(
                 request=request,
                 future=self._loop.create_future(),
@@ -106,7 +118,7 @@ class RunControl:
         self,
         tool_call_id: str,
     ) -> ToolApprovalDecision | None:
-        """等待审批响应；Run 被停止时返回 None。"""
+        """等待审批响应；Trace 被停止时返回 None。"""
         with self._lock:
             pending = self._pending_approval
             if pending is None or pending.request.tool_call_id != tool_call_id:
@@ -212,6 +224,102 @@ class RunControl:
             ):
                 pending.future.set_result(response)
 
+    def begin_ui_request(self, request_id: str, request: ExtensionUIRequest) -> bool:
+        """登记待回传的扩展 UI 请求；已停止或关闭的 Trace 拒绝新请求。"""
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("UI request ID must not be empty")
+        if not isinstance(request, dict):
+            raise TypeError("UI request must be an ExtensionUIRequest")
+        if asyncio.get_running_loop() is not self._loop:
+            raise RuntimeError("UI request must begin on its owning event loop")
+        with self._lock:
+            if self._closed or self._stop_requested:
+                return False
+            if self._pending_ui is not None:
+                raise RuntimeError("a Trace can only wait for one UI request at a time")
+            self._pending_ui = _PendingUI(
+                request_id=request_id,
+                request=request,
+                future=self._loop.create_future(),
+            )
+            return True
+
+    async def wait_for_ui_response(
+        self,
+        request_id: str,
+    ) -> ExtensionUIResponse | None:
+        """等待宿主回传 UI 响应；Trace 被停止时返回 None。"""
+        with self._lock:
+            pending = self._pending_ui
+            if pending is None or pending.request_id != request_id:
+                raise RuntimeError("extension UI request is not active")
+
+        stop_task = asyncio.create_task(self.wait_for_stop())
+        try:
+            done, _ = await asyncio.wait(
+                {pending.future, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done or self.stop_requested:
+                return None
+            return pending.future.result()
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            with self._lock:
+                if self._pending_ui is pending:
+                    self._pending_ui = None
+
+    def respond_ui(self, request_id: str, response: ExtensionUIResponse) -> bool:
+        """回传匹配 ID 的活动扩展 UI 请求的响应。"""
+        if not isinstance(request_id, str):
+            raise TypeError("UI request ID must be a string")
+        if not isinstance(response, dict):
+            raise TypeError("UI response must be an ExtensionUIResponse")
+        with self._lock:
+            pending = self._pending_ui
+            if (
+                pending is None
+                or pending.request_id != request_id
+                or pending.resolved
+                or self._closed
+                or self._stop_requested
+            ):
+                return False
+            pending.resolved = True
+            if self._is_running_loop():
+                pending.future.set_result(response)
+                return True
+
+            self._pending_callbacks += 1
+            try:
+                self._loop.call_soon_threadsafe(
+                    self._deliver_ui,
+                    pending,
+                    response,
+                )
+            except RuntimeError:
+                self._pending_callbacks -= 1
+                pending.resolved = False
+                raise
+            return True
+
+    def _deliver_ui(
+        self,
+        pending: _PendingUI,
+        response: ExtensionUIResponse,
+    ) -> None:
+        with self._lock:
+            self._pending_callbacks -= 1
+            if (
+                not self._closed
+                and not self._stop_requested
+                and self._pending_ui is pending
+                and not pending.future.done()
+            ):
+                pending.future.set_result(response)
+
     def take_steering_nowait(self) -> str | None:
         try:
             return self.steering.get_nowait()
@@ -237,12 +345,17 @@ class RunControl:
             self._pending_approval = None
             if pending is not None and not pending.future.done():
                 pending.future.cancel()
+            pending_ui = self._pending_ui
+            self._pending_ui = None
+            if pending_ui is not None and not pending_ui.future.done():
+                pending_ui.future.cancel()
 
     def close_if_idle(self) -> bool:
         with self._lock:
             if (
                 self._pending_callbacks
                 or self._pending_approval is not None
+                or self._pending_ui is not None
                 or not self.steering.empty()
                 or not self.follow_ups.empty()
             ):

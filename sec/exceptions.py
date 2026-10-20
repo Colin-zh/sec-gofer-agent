@@ -1,6 +1,6 @@
 """定义 sec SDK 对外报告的运行时异常类型。
 
-异常用于区分协议违规、Run 预算耗尽和 Session 并发冲突等可处理失败；
+异常用于区分协议违规、Trace 预算耗尽和 Session 并发冲突等可处理失败；
 调用方应据异常类型决定下一步，而不是依赖错误文本匹配。
 """
 
@@ -63,8 +63,8 @@ class ToolExecutorProtocolError(SecError):
     """Executor 未返回与请求匹配的规范化工具结果时抛出。"""
 
 
-class RunLimitExceeded(SecError):
-    """Run 达到配置的调用上限时抛出。"""
+class TraceLimitExceeded(SecError):
+    """Trace 达到配置的调用上限时抛出。"""
 
 
 class ContextBuildError(SecError):
@@ -76,7 +76,7 @@ class ContextWindowExceeded(ContextBuildError):
 
 
 class SessionBusyError(SecError):
-    """同一 Session 被多个活动 Run 并发使用时抛出。"""
+    """同一 Session 被多个活动 Trace 并发使用时抛出。"""
 
 
 class SecSubscriptionOverflow(SecError):
@@ -119,3 +119,11 @@ class ObjectStoreError(SecError):
 
 class ObjectNotFoundError(ObjectStoreError):
     """请求读取的对象不存在时抛出。"""
+
+
+class MemoryStoreError(SecError):
+    """Memory 仓储无法完成读取、写入、检索或删除操作时抛出。"""
+
+
+class EmbedderError(SecError):
+    """embedding 生成器无法完成向量化时抛出。"""

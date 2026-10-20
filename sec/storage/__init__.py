@@ -4,6 +4,7 @@ SessionStore adapter 按领域分组；resources 管理共享 SQLAlchemy 资源�
 关闭。导入本包不会创建数据库连接或全局实例。
 """
 
+from sec.storage.memory_store import MemoryStore
 from sec.storage.resources.database import Database
 from sec.storage.session_store import (
     DatabaseSessionStore,
@@ -15,5 +16,6 @@ __all__ = [
     "Database",
     "DatabaseSessionStore",
     "InMemorySessionStore",
+    "MemoryStore",
     "SessionStore",
 ]

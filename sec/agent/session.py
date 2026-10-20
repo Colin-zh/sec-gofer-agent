@@ -1,6 +1,6 @@
-"""保存跨 Run 的会话条目树，并管理同一 Session 的活动 Run 控制权。
+"""保存跨 Trace 的会话条目树，并管理同一 Session 的活动 Trace 控制权。
 
-Session 负责活动分支消息投影、并发占用检查和可选持久化；每次 Run 结束时释放控制权。
+Session 负责活动分支消息投影、并发占用检查和可选持久化；每次 Trace 结束时释放控制权。
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import threading
 from collections.abc import Iterable, Sequence
 from uuid import uuid4
 
-from sec._runtime.control import RunControl
+from sec._runtime.control import TraceControl
 from sec._runtime.recovery import build_interrupted_tool_result_message
 from sec._types.messages import Message
 from sec._types.session import (
@@ -23,7 +23,7 @@ from sec.exceptions import SessionBusyError, SessionStoreError
 
 
 class Session:
-    """持有跨 Run 的会话树，并保证同一时刻至多一个活动 Run。
+    """持有跨 Trace 的会话树，并保证同一时刻至多一个活动 Trace。
 
     可选的 SessionStore 会在消息加入内存历史前先持久化该消息。
     """
@@ -60,11 +60,11 @@ class Session:
             self._active_leaf_id = self._entries[-1].id
         self._needs_restore = False
         self._lock = threading.Lock()
-        self._active_control: RunControl | None = None
+        self._active_control: TraceControl | None = None
 
     @classmethod
     async def restore(cls, store: SessionStoreProtocol, session_id: str) -> Session:
-        """从存储恢复历史，并封闭中断 Run 留下的未配对工具调用。
+        """从存储恢复历史，并封闭中断 Trace 留下的未配对工具调用。
 
         未配对调用的结果无法确定，因此恢复时不重放工具，而是追加错误结果，
         让后续模型请求看到明确的中断状态。
@@ -127,26 +127,26 @@ class Session:
 
     @property
     def is_busy(self) -> bool:
-        """指示当前是否有 Run 占用此 Session。"""
+        """指示当前是否有 Trace 占用此 Session。"""
         with self._lock:
             return self._active_control is not None
 
     def steer(self, text: str) -> bool:
-        """向当前活动 Run 提交 steering 指令。"""
+        """向当前活动 Trace 提交 steering 指令。"""
         control = self._current_control()
         return control.steer(text) if control is not None else False
 
     def follow_up(self, text: str) -> bool:
-        """向当前活动 Run 提交下一轮 follow-up。"""
+        """向当前活动 Trace 提交下一轮 follow-up。"""
         control = self._current_control()
         return control.follow_up(text) if control is not None else False
 
     def cancel(self) -> bool:
-        """请求取消当前活动 Run。"""
+        """请求取消当前活动 Trace。"""
         control = self._current_control()
         return control.cancel() if control is not None else False
 
-    def _begin_run(self) -> RunControl:
+    def _begin_trace(self) -> TraceControl:
         loop = asyncio.get_running_loop()
         with self._lock:
             if self._needs_restore:
@@ -155,13 +155,13 @@ class Session:
                 )
             if self._active_control is not None:
                 raise SessionBusyError(
-                    f"session {self.id!r} already has an active Run"
+                    f"session {self.id!r} already has an active Trace"
                 )
-            control = RunControl(loop)
+            control = TraceControl(loop)
             self._active_control = control
             return control
 
-    def _finish_run(self, control: RunControl) -> None:
+    def _finish_trace(self, control: TraceControl) -> None:
         with self._lock:
             if self._active_control is control:
                 self._active_control = None
@@ -228,7 +228,7 @@ class Session:
             self._active_leaf_id,
         )
 
-    def _current_control(self) -> RunControl | None:
+    def _current_control(self) -> TraceControl | None:
         with self._lock:
             return self._active_control
 

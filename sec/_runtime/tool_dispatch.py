@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from time import time
 
 from sec._types.approvals import ToolApprovalRequest
 from sec._types.content import TextContent, ToolUseContent
+from sec._types.hooks import HookContext
 from sec._types.events import (
     ToolApprovalRequestedEvent,
     ToolApprovalResolvedEvent,
@@ -18,14 +20,15 @@ from sec._types.events import (
 )
 from sec._types.messages import ToolResultMessage
 from sec._runtime.budget import Budget
-from sec._runtime.metrics import RunMetricsAccumulator
-from sec._runtime.control import RunControl
-from sec._runtime.event_stream import RunEventStream
-from sec._runtime.state import RunState
+from sec._runtime.hooks import HookExecutor
+from sec._runtime.metrics import TraceMetricsAccumulator
+from sec._runtime.control import TraceControl
+from sec._runtime.event_stream import TraceEventStream
+from sec._runtime.state import TraceState
 from sec.exceptions import (
     RecoverableToolError,
     RetryableToolError,
-    RunLimitExceeded,
+    TraceLimitExceeded,
     ToolExecutorProtocolError,
 )
 from sec._types.execution import ToolExecutor
@@ -43,13 +46,15 @@ async def execute_tool_batch(
     agent_name: str,
     policy: PolicyEngine,
     executor: ToolExecutor,
-    control: RunControl,
-    state: RunState,
+    control: TraceControl,
+    state: TraceState,
     remaining_tool_calls: int,
-    events: RunEventStream,
+    events: TraceEventStream,
     turn_id: str,
     budget: Budget,
-    metrics: RunMetricsAccumulator,
+    metrics: TraceMetricsAccumulator,
+    hooks: HookExecutor,
+    hook_ctx: HookContext,
     is_revoked: Callable[[str], bool] | None = None,
     consume_tool: Callable[[], None] | None = None,
 ) -> tuple[list[ToolResultMessage], int, Exception | None, bool]:
@@ -89,7 +94,7 @@ async def execute_tool_batch(
             calls_limit=remaining_tool_calls,
         )
         if call_decision.action == "stop":
-            failure = RunLimitExceeded(
+            failure = TraceLimitExceeded(
                 "run reached its configured limit of tool calls"
             )
             results.append(
@@ -103,7 +108,7 @@ async def execute_tool_batch(
         if consume_tool is not None:
             try:
                 consume_tool()
-            except RunLimitExceeded as error:
+            except TraceLimitExceeded as error:
                 failure = error
                 results.append(_error_result(
                     tool_use, str(error), error_kind="tool_call_limit",
@@ -122,6 +127,8 @@ async def execute_tool_batch(
                 turn_id,
                 budget,
                 metrics,
+                hooks,
+                hook_ctx,
                 is_revoked,
             )
         except Exception as exc:
@@ -152,12 +159,14 @@ async def _execute_one_tool(
     agent_name: str,
     policy: PolicyEngine,
     executor: ToolExecutor,
-    control: RunControl,
-    state: RunState,
-    events: RunEventStream,
+    control: TraceControl,
+    state: TraceState,
+    events: TraceEventStream,
     turn_id: str,
     budget: Budget,
-    metrics: RunMetricsAccumulator,
+    metrics: TraceMetricsAccumulator,
+    hooks: HookExecutor,
+    hook_ctx: HookContext,
     is_revoked: Callable[[str], bool] | None = None,
 ) -> tuple[ToolResultMessage, bool]:
     """校验并授权工具调用，必要时等待审批，再委托 Executor 执行。"""
@@ -184,6 +193,17 @@ async def _execute_one_tool(
             "correct the arguments and issue a new tool call.",
             error_kind="invalid_arguments",
         ), False
+    args, block = await hooks.before_tool(
+        tool_use.id, tool_use.name, tool_use.arguments, hook_ctx
+    )
+    if block is not None:
+        return _error_result(
+            tool_use,
+            block.reason or "Tool call blocked by extension.",
+            error_kind="extension_blocked",
+        ), block.terminate
+    if args != tool_use.arguments:
+        tool_use = replace(tool_use, arguments=args)
     mode_name = getattr(policy, "mode_name", None)
     if mode_name is not None and not isinstance(mode_name, str):
         raise TypeError("policy mode_name must be a string or None")
@@ -223,7 +243,7 @@ async def _execute_one_tool(
         if not control.begin_tool_approval(request):
             return _error_result(
                 tool_use,
-                "Tool call was not approved because the Run was stopped.",
+                "Tool call was not approved because the Trace was stopped.",
                 error_kind="cancelled",
             ), True
         events.publish(
@@ -242,12 +262,12 @@ async def _execute_one_tool(
                     tool_call_id=tool_use.id,
                     tool_name=tool_use.name,
                     outcome="cancelled",
-                    reason="Run stopped before tool approval completed.",
+                    reason="Trace stopped before tool approval completed.",
                 )
             )
             return _error_result(
                 tool_use,
-                "Tool call was not approved because the Run was stopped.",
+                "Tool call was not approved because the Trace was stopped.",
                 error_kind="cancelled",
             ), True
         if approval.outcome == "denied":
@@ -395,6 +415,9 @@ async def _execute_one_tool(
                 attempt=attempt,
             )
         )
+    result, terminate = await hooks.after_tool(
+        tool_use.id, tool_use.name, tool_use.arguments, result, hook_ctx
+    )
     events.publish(
         ToolExecutionEndEvent(
             tool_call_id=tool_use.id,
@@ -403,7 +426,7 @@ async def _execute_one_tool(
             is_error=result.is_error,
         )
     )
-    return result, False
+    return result, terminate
 
 
 def _recoverable_feedback(message: str) -> str:

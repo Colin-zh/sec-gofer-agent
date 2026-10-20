@@ -19,7 +19,7 @@ Sec 的工具通过函数签名生成输入 schema，调用前会校验模型提
 
 通过启动参数 `--mode` 或聊天命令 `/mode` 切换。`/trust on` 只在当前聊天期间切换到 `auto`，不是持久授权。
 
-如果策略结果为 `ask`，SDK 会发出审批事件。宿主可用 `Run.approve_tool(tool_call_id)` 或 `Run.deny_tool(tool_call_id, reason)` 响应；拒绝不会调用工具执行器，而会将错误结果返回给模型。
+如果策略结果为 `ask`，SDK 会发出审批事件。宿主可用 `Trace.approve_tool(tool_call_id)` 或 `Trace.deny_tool(tool_call_id, reason)` 响应；拒绝不会调用工具执行器，而会将错误结果返回给模型。
 
 ## 安全边界
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias
 
+from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
 from .content import ToolUseContent
 from .json import JSONObject, JSONValue
 from .messages import AgentMessage, AssistantMessage, ToolResultMessage, Usage
@@ -12,7 +13,7 @@ from .models import ThinkingLevel
 from .session import SessionEntry
 
 CompactionReason: TypeAlias = Literal["manual", "threshold", "overflow"]
-RunTerminalStatus: TypeAlias = Literal[
+TraceTerminalStatus: TypeAlias = Literal[
     "completed",
     "failed",
     "limit_reached",
@@ -110,7 +111,7 @@ class EmptySessionEvent:
 @dataclass(frozen=True)
 class AgentSettledEvent:
     type: Literal["agent_settled"] = field(default="agent_settled", init=False)
-    status: RunTerminalStatus
+    status: TraceTerminalStatus
 
 
 @dataclass(frozen=True)
@@ -185,8 +186,8 @@ class ToolExecutionStartEvent:
 @dataclass(frozen=True)
 class DelegationEvent:
     type: Literal["agent_delegation"] = field(default="agent_delegation", init=False)
-    parent_run_id: str
-    child_run_id: str
+    parent_trace_id: str
+    child_trace_id: str
     child_session_id: str
     agent_id: str
     status: Literal["started", "completed", "failed", "cancelled"]
@@ -362,6 +363,66 @@ class BashExecutionUpdateEvent:
     id: str | None = None
 
 
+@dataclass(frozen=True)
+class ExtensionUIRequestedEvent:
+    type: Literal["extension_ui_requested"] = field(
+        default="extension_ui_requested",
+        init=False,
+    )
+    request_id: str
+    extension_name: str
+    request: ExtensionUIRequest
+
+
+@dataclass(frozen=True)
+class ExtensionUIResolvedEvent:
+    type: Literal["extension_ui_resolved"] = field(
+        default="extension_ui_resolved",
+        init=False,
+    )
+    request_id: str
+    outcome: Literal["resolved", "cancelled"]
+    response: ExtensionUIResponse | None = None
+
+
+@dataclass(frozen=True)
+class MemoryGateEvent:
+    type: Literal["memory_gate"] = field(default="memory_gate", init=False)
+    status: Literal["ok", "failed"]
+    retrieve: bool
+    query: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryRetrievalEvent:
+    type: Literal["memory_retrieval"] = field(default="memory_retrieval", init=False)
+    status: Literal["ok", "empty", "failed"]
+    memory_count: int
+    episode_count: int
+    procedure_count: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryIndexEvent:
+    type: Literal["memory_index"] = field(default="memory_index", init=False)
+    status: Literal["ok", "empty", "failed"]
+    indexed: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MemoryConsolidationEvent:
+    type: Literal["memory_consolidation"] = field(
+        default="memory_consolidation",
+        init=False,
+    )
+    status: Literal["ok", "empty", "failed"]
+    added_ids: tuple[str, ...] = ()
+    error: str | None = None
+
+
 SessionEvent: TypeAlias = (
     EmptySessionEvent
     | DelegationEvent
@@ -391,4 +452,10 @@ SessionEvent: TypeAlias = (
     | CompactionRetryAttemptEvent
     | BranchRetryAttemptEvent
     | BashExecutionUpdateEvent
+    | ExtensionUIRequestedEvent
+    | ExtensionUIResolvedEvent
+    | MemoryGateEvent
+    | MemoryRetrievalEvent
+    | MemoryIndexEvent
+    | MemoryConsolidationEvent
 )

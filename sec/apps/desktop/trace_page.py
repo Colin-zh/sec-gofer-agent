@@ -1,4 +1,4 @@
-"""Trace browser for persisted desktop Runs."""
+"""Trace browser for persisted desktop Traces."""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ _STATUS_NAMES = {
     "interrupted": "已中断",
 }
 _KIND_NAMES = {
-    "run": "Run",
+    "trace": "Trace",
     "turn": "轮次",
     "model": "模型",
     "tool": "工具",
@@ -210,37 +210,37 @@ class TracePayloadView(QWidget):
 
 
 class TracePage(QWidget):
-    """Resizable event tree and detail tabs for current and historical Runs."""
+    """Resizable event tree and detail tabs for current and historical Traces."""
 
     def __init__(self, store: TraceStore, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = store
-        self._selected_run_id: str | None = None
-        self._loaded_run_id: str | None = None
-        self._node_by_id: dict[str, dict[str, Any]] = {}
-        self._items: dict[str, QTreeWidgetItem] = {}
+        self._selected_trace_id: str | None = None
+        self._loaded_trace_id: str | None = None
+        self._span_by_id: dict[str, dict[str, Any]] = {}
+        self._span_items: dict[str, QTreeWidgetItem] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
         toolbar = QHBoxLayout()
-        heading = QLabel("轨迹 / Trajectory")
+        heading = QLabel("Trace / 调用树")
         heading.setObjectName("traceTitle")
         toolbar.addWidget(heading)
         toolbar.addStretch(1)
-        toolbar.addWidget(QLabel("本会话 Run"))
-        self._runs = _trace_combo()
-        self._runs.setMinimumWidth(280)
-        self._runs.setMinimumContentsLength(30)
-        self._runs.setPlaceholderText("当前 Session 暂无 Run")
-        self._runs.setSizeAdjustPolicy(
+        toolbar.addWidget(QLabel("本会话 Trace"))
+        self._traces = _trace_combo()
+        self._traces.setMinimumWidth(280)
+        self._traces.setMinimumContentsLength(30)
+        self._traces.setPlaceholderText("当前 Session 暂无 Trace")
+        self._traces.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
-        self._runs.setAccessibleName("选择当前会话的 Run")
-        self._runs.setToolTip("仅显示当前 Session 下的运行记录")
-        self._runs.currentIndexChanged.connect(self._run_selection_changed)
-        toolbar.addWidget(self._runs)
+        self._traces.setAccessibleName("选择当前会话的 Trace")
+        self._traces.setToolTip("仅显示当前 Session 下的 Trace")
+        self._traces.currentIndexChanged.connect(self._trace_selection_changed)
+        toolbar.addWidget(self._traces)
         layout.addLayout(toolbar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -251,7 +251,7 @@ class TracePage(QWidget):
         tree_layout.setContentsMargins(0, 0, 0, 0)
         tree_toolbar = QHBoxLayout()
         self._search = QLineEdit()
-        self._search.setPlaceholderText("搜索节点、类型或状态")
+        self._search.setPlaceholderText("搜索 Span、类型或状态")
         self._search.setClearButtonEnabled(True)
         self._search.setAccessibleName("搜索执行树")
         self._search.textChanged.connect(self._filter_tree)
@@ -266,13 +266,13 @@ class TracePage(QWidget):
         tree_layout.addLayout(tree_toolbar)
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["执行树", "耗时", "状态"])
-        self._tree.setAccessibleName("Run 执行树")
+        self._tree.setAccessibleName("Trace 执行树")
         self._tree.setIndentation(16)
         self._tree.setColumnWidth(0, 215)
         self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._tree.currentItemChanged.connect(self._node_selection_changed)
+        self._tree.currentItemChanged.connect(self._span_selection_changed)
         tree_layout.addWidget(self._tree, 1)
         self._tree_hint = QLabel()
         self._tree_hint.setObjectName("traceMuted")
@@ -284,24 +284,24 @@ class TracePage(QWidget):
         detail_layout.setContentsMargins(12, 0, 0, 0)
         detail_layout.setSpacing(12)
         detail_header = QHBoxLayout()
-        self._node_title = QLabel()
-        self._node_title.setObjectName("traceTitle")
-        self._node_title.setWordWrap(True)
-        self._node_title.setTextFormat(Qt.TextFormat.PlainText)
-        self._node_title.setTextInteractionFlags(
+        self._span_title = QLabel()
+        self._span_title.setObjectName("traceTitle")
+        self._span_title.setWordWrap(True)
+        self._span_title.setTextFormat(Qt.TextFormat.PlainText)
+        self._span_title.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        detail_header.addWidget(self._node_title, 1)
+        detail_header.addWidget(self._span_title, 1)
         self._previous = QPushButton("↑")
         self._previous.setFixedSize(32, 32)
-        self._previous.setAccessibleName("上一个节点")
-        self._previous.setToolTip("上一个可见节点")
-        self._previous.clicked.connect(self._previous_node)
+        self._previous.setAccessibleName("上一个 Span")
+        self._previous.setToolTip("上一个可见 Span")
+        self._previous.clicked.connect(self._previous_span)
         self._next = QPushButton("↓")
         self._next.setFixedSize(32, 32)
-        self._next.setAccessibleName("下一个节点")
-        self._next.setToolTip("下一个可见节点")
-        self._next.clicked.connect(self._next_node)
+        self._next.setAccessibleName("下一个 Span")
+        self._next.setToolTip("下一个可见 Span")
+        self._next.clicked.connect(self._next_span)
         detail_header.addWidget(self._previous)
         detail_header.addWidget(self._next)
         self._tree.itemExpanded.connect(self._update_navigation)
@@ -399,52 +399,52 @@ class TracePage(QWidget):
         )
         self._show_empty()
 
-    def refresh_runs(
+    def refresh_traces(
         self,
-        runs: list[dict[str, Any]],
-        preferred_run_id: str | None = None,
+        traces: list[dict[str, Any]],
+        preferred_trace_id: str | None = None,
         session_id: str | None = None,
     ) -> None:
-        selected = preferred_run_id or self._selected_run_id
-        self._runs.blockSignals(True)
-        self._runs.clear()
-        visible_runs = [
-            run for run in runs
-            if session_id is None or run["session_id"] == session_id
+        selected = preferred_trace_id or self._selected_trace_id
+        self._traces.blockSignals(True)
+        self._traces.clear()
+        visible_traces = [
+            trace for trace in traces
+            if session_id is None or trace["session_id"] == session_id
         ]
-        for run in visible_runs:
-            started = datetime.fromtimestamp(run["started_at"]).astimezone()
-            status = _STATUS_NAMES.get(run["status"], run["status"])
+        for trace in visible_traces:
+            started = datetime.fromtimestamp(trace["started_at"]).astimezone()
+            status = _STATUS_NAMES.get(trace["status"], trace["status"])
             title = (
                 f"{started:%m-%d %H:%M:%S}  {status}  "
-                f"{_duration(run['elapsed_ms'])}  #{run['run_id'][:8]}"
+                f"{_duration(trace['elapsed_ms'])}  #{trace['trace_id'][:8]}"
             )
-            self._runs.addItem(title, run["run_id"])
-            self._runs.setItemData(
-                self._runs.count() - 1,
-                f"Run ID: {run['run_id']}\nSession ID: {run['session_id']}",
+            self._traces.addItem(title, trace["trace_id"])
+            self._traces.setItemData(
+                self._traces.count() - 1,
+                f"Trace ID: {trace['trace_id']}\nSession ID: {trace['session_id']}",
                 Qt.ItemDataRole.ToolTipRole,
             )
         target = next(
             (
                 index
-                for index in range(self._runs.count())
-                if self._runs.itemData(index) == selected
+                for index in range(self._traces.count())
+                if self._traces.itemData(index) == selected
             ),
-            0 if self._runs.count() else -1,
+            0 if self._traces.count() else -1,
         )
-        self._runs.setCurrentIndex(target)
-        self._runs.blockSignals(False)
-        run_id = self._runs.currentData()
-        self._selected_run_id = run_id if isinstance(run_id, str) else None
-        if self._selected_run_id is None:
+        self._traces.setCurrentIndex(target)
+        self._traces.blockSignals(False)
+        trace_id = self._traces.currentData()
+        self._selected_trace_id = trace_id if isinstance(trace_id, str) else None
+        if self._selected_trace_id is None:
             self._show_empty()
         else:
-            self._load_run()
+            self._load_trace()
 
-    def refresh_run(self, run_id: str) -> None:
-        if self._selected_run_id == run_id:
-            self._load_run()
+    def refresh_trace(self, trace_id: str) -> None:
+        if self._selected_trace_id == trace_id:
+            self._load_trace()
 
     def resizeEvent(self, event: Any) -> None:
         self._splitter.setOrientation(
@@ -454,92 +454,92 @@ class TracePage(QWidget):
         )
         super().resizeEvent(event)
 
-    def _run_selection_changed(self, _index: int) -> None:
-        run_id = self._runs.currentData()
-        self._selected_run_id = run_id if isinstance(run_id, str) else None
-        if self._selected_run_id is None:
+    def _trace_selection_changed(self, _index: int) -> None:
+        trace_id = self._traces.currentData()
+        self._selected_trace_id = trace_id if isinstance(trace_id, str) else None
+        if self._selected_trace_id is None:
             self._show_empty()
         else:
-            self._load_run()
+            self._load_trace()
 
-    def _load_run(self) -> None:
-        run_id = self._selected_run_id
-        if run_id is None:
+    def _load_trace(self) -> None:
+        trace_id = self._selected_trace_id
+        if trace_id is None:
             self._show_empty()
             return
-        old_node_id = self._selected_node_id()
-        same_run = self._loaded_run_id == run_id
-        expanded = {key for key, item in self._items.items() if item.isExpanded()}
+        old_span_id = self._selected_span_id()
+        same_trace = self._loaded_trace_id == trace_id
+        expanded = {key for key, item in self._span_items.items() if item.isExpanded()}
         scroll = self._tree.verticalScrollBar().value()
-        roots = self._store.get_tree(run_id)
+        roots = self._store.get_tree(trace_id)
         self._tree.blockSignals(True)
         self._tree.clear()
-        self._node_by_id.clear()
-        self._items.clear()
+        self._span_by_id.clear()
+        self._span_items.clear()
         for root in roots:
-            self._add_node(None, root)
-        if same_run:
+            self._add_span(None, root)
+        if same_trace:
             for key in expanded:
-                if key in self._items:
-                    self._items[key].setExpanded(True)
+                if key in self._span_items:
+                    self._span_items[key].setExpanded(True)
         else:
             self._tree.expandAll()
-        self._loaded_run_id = run_id
+        self._loaded_trace_id = trace_id
         self._filter_tree()
-        selected = self._find_tree_item(old_node_id) or self._tree.topLevelItem(0)
+        selected = self._find_span_item(old_span_id) or self._tree.topLevelItem(0)
         if selected is not None:
             self._tree.setCurrentItem(selected)
         self._tree.blockSignals(False)
         if selected is not None:
-            self._show_node(self._node_by_id[selected.data(0, Qt.ItemDataRole.UserRole)])
-            self._tree.verticalScrollBar().setValue(scroll if same_run else 0)
+            self._show_span(self._span_by_id[selected.data(0, Qt.ItemDataRole.UserRole)])
+            self._tree.verticalScrollBar().setValue(scroll if same_trace else 0)
         else:
             self._show_empty()
 
-    def _add_node(
+    def _add_span(
         self,
         parent: QTreeWidgetItem | None,
-        node: dict[str, Any],
+        span: dict[str, Any],
     ) -> None:
         item = QTreeWidgetItem([
-            node["label"], _duration(node["elapsed_ms"]),
-            _STATUS_NAMES.get(node["status"], node["status"]),
+            span["label"], _duration(span["elapsed_ms"]),
+            _STATUS_NAMES.get(span["status"], span["status"]),
         ])
-        item.setData(0, Qt.ItemDataRole.UserRole, node["node_id"])
+        item.setData(0, Qt.ItemDataRole.UserRole, span["span_id"])
         item.setIcon(0, control_icon("trace"))
-        item.setToolTip(0, f"{node['kind']} · {node['label']}\n{node['node_id']}")
-        item.setToolTip(2, node["status"])
+        item.setToolTip(0, f"{span['kind']} · {span['label']}\n{span['span_id']}")
+        item.setToolTip(2, span["status"])
         item.setForeground(1, QColor("#687384"))
-        item.setForeground(2, QColor(_STATUS_COLORS.get(node["status"], "#687384")))
-        self._node_by_id[node["node_id"]] = node
-        self._items[node["node_id"]] = item
+        item.setForeground(2, QColor(_STATUS_COLORS.get(span["status"], "#687384")))
+        self._span_by_id[span["span_id"]] = span
+        self._span_items[span["span_id"]] = item
         if parent is None:
             self._tree.addTopLevelItem(item)
         else:
             parent.addChild(item)
-        for child in node["children"]:
-            self._add_node(item, child)
+        for child in span["children"]:
+            self._add_span(item, child)
 
-    def _selected_node_id(self) -> str | None:
+    def _selected_span_id(self) -> str | None:
         item = self._tree.currentItem()
         if item is None:
             return None
         value = item.data(0, Qt.ItemDataRole.UserRole)
         return value if isinstance(value, str) else None
 
-    def _find_tree_item(self, node_id: str | None) -> QTreeWidgetItem | None:
-        return self._items.get(node_id) if node_id is not None else None
+    def _find_span_item(self, span_id: str | None) -> QTreeWidgetItem | None:
+        return self._span_items.get(span_id) if span_id is not None else None
 
     def _filter_tree(self, _text: str | None = None) -> None:
         query = self._search.text().strip().casefold()
 
         def visit(item: QTreeWidgetItem, ancestor_matches: bool = False) -> bool:
-            node = self._node_by_id[item.data(0, Qt.ItemDataRole.UserRole)]
+            span = self._span_by_id[item.data(0, Qt.ItemDataRole.UserRole)]
             matches = not query or query in " ".join(
                 (
-                    node["label"], node["kind"], node["status"], node["node_id"],
-                    _KIND_NAMES.get(node["kind"], ""),
-                    _STATUS_NAMES.get(node["status"], ""),
+                    span["label"], span["kind"], span["status"], span["span_id"],
+                    _KIND_NAMES.get(span["kind"], ""),
+                    _STATUS_NAMES.get(span["status"], ""),
                 )
             ).casefold()
             children = [
@@ -554,9 +554,9 @@ class TracePage(QWidget):
 
         for index in range(self._tree.topLevelItemCount()):
             visit(self._tree.topLevelItem(index))
-        count = sum(not item.isHidden() for item in self._items.values())
+        count = sum(not item.isHidden() for item in self._span_items.values())
         self._tree_hint.setText(
-            f"{count} / {len(self._items)} 个节点" if count else "没有匹配的节点"
+            f"{count} / {len(self._span_items)} 个 Span" if count else "没有匹配的 Span"
         )
         self._update_navigation()
 
@@ -576,7 +576,7 @@ class TracePage(QWidget):
         return visible
 
     def _update_navigation(self, _item: QTreeWidgetItem | None = None) -> None:
-        branches = [item for item in self._items.values() if item.childCount()]
+        branches = [item for item in self._span_items.values() if item.childCount()]
         collapsed = bool(branches) and not any(item.isExpanded() for item in branches)
         self._tree_toggle.setChecked(collapsed)
         self._tree_toggle.setEnabled(bool(branches))
@@ -601,13 +601,13 @@ class TracePage(QWidget):
         self._tree.blockSignals(False)
         self._update_navigation()
 
-    def _previous_node(self) -> None:
-        self._navigate_node(-1)
+    def _previous_span(self) -> None:
+        self._navigate_span(-1)
 
-    def _next_node(self) -> None:
-        self._navigate_node(1)
+    def _next_span(self) -> None:
+        self._navigate_span(1)
 
-    def _navigate_node(self, offset: int) -> None:
+    def _navigate_span(self, offset: int) -> None:
         items = self._visible_items()
         current = self._tree.currentItem()
         if current in items:
@@ -616,34 +616,34 @@ class TracePage(QWidget):
                 self._tree.setCurrentItem(items[index])
                 self._tree.scrollToItem(items[index])
 
-    def _node_selection_changed(
+    def _span_selection_changed(
         self,
         current: QTreeWidgetItem | None,
         _previous: QTreeWidgetItem | None,
     ) -> None:
-        if current is None or self._selected_run_id is None:
+        if current is None or self._selected_trace_id is None:
             return
-        node_id = current.data(0, Qt.ItemDataRole.UserRole)
-        node = self._node_by_id.get(node_id)
-        if node is None:
+        span_id = current.data(0, Qt.ItemDataRole.UserRole)
+        span = self._span_by_id.get(span_id)
+        if span is None:
             self._show_empty()
             return
-        self._show_node(node)
+        self._show_span(span)
 
-    def _show_node(self, node: dict[str, Any]) -> None:
-        events = self._store.get_node_events(self._selected_run_id or "", node["node_id"])
+    def _show_span(self, span: dict[str, Any]) -> None:
+        events = self._store.get_span_events(self._selected_trace_id or "", span["span_id"])
         event_data = [_event_data(event) for event in events]
-        self._node_title.setText(node["label"])
-        details = node["details"]
+        self._span_title.setText(span["label"])
+        details = span["details"]
         fields = self._metadata_fields
-        fields["status"].setText(_STATUS_NAMES.get(node["status"], node["status"]))
+        fields["status"].setText(_STATUS_NAMES.get(span["status"], span["status"]))
         fields["status"].setStyleSheet(
-            f"color: {_STATUS_COLORS.get(node['status'], '#687384')}; font-weight: 600;"
+            f"color: {_STATUS_COLORS.get(span['status'], '#687384')}; font-weight: 600;"
         )
-        fields["duration"].setText(_duration(node["elapsed_ms"]))
-        fields["started"].setText(format_wall_time(node["started_at"]))
-        fields["approval"].setText(_duration(node["approval_wait_ms"]))
-        fields["approval"].parentWidget().setVisible(node["approval_wait_ms"] is not None)
+        fields["duration"].setText(_duration(span["elapsed_ms"]))
+        fields["started"].setText(format_wall_time(span["started_at"]))
+        fields["approval"].setText(_duration(span["approval_wait_ms"]))
+        fields["approval"].parentWidget().setVisible(span["approval_wait_ms"] is not None)
         usage = details.get("usage")
         has_usage = isinstance(usage, dict)
 
@@ -663,17 +663,17 @@ class TracePage(QWidget):
         for key in ("tokens", "cache"):
             fields[key].parentWidget().setVisible(has_usage)
         self._metadata.setVisible(True)
-        self._metadata.setToolTip(f"Run: {node['run_id']}\nNode: {node['node_id']}")
+        self._metadata.setToolTip(f"Trace: {span['trace_id']}\nSpan: {span['span_id']}")
         self._update_navigation()
         overview = [
-            f"类型：{node['kind']}",
-            f"状态：{node['status']}",
-            f"开始时间：{format_wall_time(node['started_at'])}",
-            f"结束时间：{format_wall_time(node['ended_at'])}",
-            f"执行耗时：{_duration(node['elapsed_ms'])}",
+            f"类型：{span['kind']}",
+            f"状态：{span['status']}",
+            f"开始时间：{format_wall_time(span['started_at'])}",
+            f"结束时间：{format_wall_time(span['ended_at'])}",
+            f"执行耗时：{_duration(span['elapsed_ms'])}",
         ]
-        if node["kind"] == "approval":
-            overview.append(f"审批等待：{_duration(node['approval_wait_ms'])}")
+        if span["kind"] == "approval":
+            overview.append(f"审批等待：{_duration(span['approval_wait_ms'])}")
         for key, value in details.items():
             if key in {"input", "output", "partial_output"}:
                 continue
@@ -691,14 +691,14 @@ class TracePage(QWidget):
                 f"{event['type']}\n{_pretty(event['payload'])}"
                 for event in event_data
             )
-            or "当前节点尚无事件记录。",
+            or "当前 Span 尚无事件记录。",
         )
         _set_text(
             self._detail_tabs[2],
             json.dumps(
                 {
-                    "node": {
-                        key: value for key, value in node.items() if key != "children"
+                    "span": {
+                        key: value for key, value in span.items() if key != "children"
                     },
                     "events": event_data,
                 },
@@ -711,10 +711,10 @@ class TracePage(QWidget):
         self._tree.blockSignals(True)
         self._tree.clear()
         self._tree.blockSignals(False)
-        self._node_by_id.clear()
-        self._items.clear()
-        self._loaded_run_id = None
-        self._node_title.setText("选择一个 Run 或执行树节点查看详情。")
+        self._span_by_id.clear()
+        self._span_items.clear()
+        self._loaded_trace_id = None
+        self._span_title.setText("选择一个 Trace 或 Span 查看详情。")
         self._metadata.hide()
         for value in self._metadata_fields.values():
             value.clear()
@@ -722,6 +722,6 @@ class TracePage(QWidget):
         self._input_view.set_value(None)
         self._output_view.set_value(None)
         self._update_navigation()
-        self._detail_tabs[0].setPlainText("选择一个 Run 或执行树节点查看详情。")
+        self._detail_tabs[0].setPlainText("选择一个 Trace 或 Span 查看详情。")
         for tab in self._detail_tabs[1:]:
             tab.setPlainText(_MISSING)

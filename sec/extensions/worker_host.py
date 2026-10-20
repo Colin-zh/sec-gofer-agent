@@ -47,13 +47,7 @@ class _ToolsOnlyAPI(ExtensionAPI):
     def register_command(self, *args: Any, **kwargs: Any) -> None:
         self._reject("command")
 
-    def register_before_run_hook(self, *args: Any, **kwargs: Any) -> None:
-        self._reject("hook")
-
-    def register_after_run_hook(self, *args: Any, **kwargs: Any) -> None:
-        self._reject("hook")
-
-    def register_run_event_hook(self, *args: Any, **kwargs: Any) -> None:
+    def register_hook(self, *args: Any, **kwargs: Any) -> None:
         self._reject("hook")
 
 

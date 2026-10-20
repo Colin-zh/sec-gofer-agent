@@ -25,7 +25,7 @@ def create_bash_tool(workspace_root: Path) -> Tool:
         workspace_scoped=False,
     )
     async def bash(command: str) -> dict[str, Any]:
-        """Run an explicitly approved Bash command with a timeout and output cap."""
+        """Trace an explicitly approved Bash command with a timeout and output cap."""
         if not command.strip() or len(command) > MAX_BASH_COMMAND_LENGTH:
             raise ValueError("bash command must contain 1 to 8192 characters")
         executable = shutil.which("bash")

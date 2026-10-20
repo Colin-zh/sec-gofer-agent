@@ -86,15 +86,18 @@ commands contributed by enabled extensions. Type `/` for completion.
   The header's right side contains only the observation and compact controls.
   Click the conversation name above the Session ID to rename the current Session
   using the same dialog as the recent-session menu. Message refreshes preserve it.
-- The sidebar has icon-assisted primary entries: 新对话、快捷指令、定时任务、记忆、工具.
-  记忆 opens a placeholder page for episodic, semantic, and procedural memory;
-  no memory read/write/delete operations are connected yet.
-  定时任务 is a disabled placeholder. Tool categories are
-  智能体、提示词模板、技能、插件、MCP. Agent identity uses core AgentCards;
+- The sidebar has icon-assisted primary entries: 新对话、快捷指令、定时任务、
+  知识与记忆、扩展能力.
+  知识与记忆 expands (like 扩展能力) into a two-item submenu: 知识管理 and 长期记忆.
+  知识管理 is a placeholder with datalink and 工作区知识库配置 sections; 长期记忆 is a
+  three-layer placeholder for episodic, semantic, and procedural memory. No memory
+  read/write/delete operations are connected yet.
+  定时任务 is a disabled placeholder. 扩展能力 categories are
+  智能体、提示词库、工具、技能、MCP、插件. Agent identity uses core AgentCards;
   prompt templates remain explicit one-shot input resources.
   Composer controls appear as help, agent, mode, reload with equal spacing;
   agent opens the AgentCard selector after the runtime is ready.
-  Selection preserves the Session; changes during a Run queue for the next Run.
+  Selection preserves the Session; changes during a Trace queue for the next Trace.
   Controls use content-sized icon/text bounds without native menu padding.
   Reserved agent/timer icons retain their source colors while disabled.
   The icon to the left of the conversation title collapses/expands the sidebar,
@@ -109,12 +112,16 @@ commands contributed by enabled extensions. Type `/` for completion.
   The conversation's left-side tick navigation previews user inputs on hover
   and jumps to them on click. When reading earlier messages, a 回到底部 button
   returns to the latest output and resumes automatic following.
-  工具 starts collapsed; click its row (with a right-aligned more icon) to
+  扩展能力 starts collapsed; click its row (with a right-aligned more icon) to
   expand/collapse the indented, softly shaded submenu without leaving chat.
-  Under 工具, text-only category entries show the available
-  count (including disabled resources) on the lower right in gray.
+  Its text-only category entries show the available count (including disabled
+  resources) on the lower right in gray.
   Selecting a category opens a preview and activation page; 返回对话 preserves
   the current Session, messages, draft, and running task.
+  The 工具 category lists the currently available tools: built-in workspace tools
+  (read/write/edit/ls/find/grep/bash) are shown read-only with no toggle, while
+  tools contributed by MCP services or extensions are toggled by enabling or
+  disabling their source.
 - Skill/prompt activation immediately removes or restores its slash command and
   completion. Full text and source paths remain available for preview. These
   prompt bodies are expanded explicitly. Skill summaries are automatically
@@ -136,8 +143,8 @@ commands contributed by enabled extensions. Type `/` for completion.
   normal asks for every tool, plan permits only built-in workspace reads, and auto
   auto-approves workspace file operations while retaining shell/remote approval.
   Activation never grants blanket approval. Global permissions and in-process
-  extensions require an idle Run; skills, prompts, MCP and worker tools can
-  publish new generations at safe request boundaries during a Run.
+  extensions require an idle Trace; skills, prompts, MCP and worker tools can
+  publish new generations at safe request boundaries during a Trace.
   Permission mode is shared with chat commands and starts in normal on restart.
   Its selector and popup use the same light palette, rounded corners, and
   selection highlight as the rest of the desktop UI, with a muted disabled state.
@@ -162,7 +169,7 @@ commands contributed by enabled extensions. Type `/` for completion.
   Rename, delete confirmation, export, and error dialogs share the desktop's
   light palette, rounded controls, and consistent button styling. Export uses a
   non-native styled file picker; cancel/close never performs a destructive action.
-- Session mutations are rejected while a Run is active. Built-in memory and
+- Session mutations are rejected while a Trace is active. Built-in memory and
   database stores support version-checked deletion (database deletion is
   transactional). Third-party stores without deletion report an explicit error.
   The async Client exposes `rename_session(id, name)`, `delete_session(id)`,
@@ -173,9 +180,9 @@ commands contributed by enabled extensions. Type `/` for completion.
   slash commands remain supported.
 - Send is a split control: the left submits using the selected mode, while the
   right menu selects 停止当前后发送 (default), steer, or followup. Default mode
-  cancels an active Run and waits for its cleanup before starting the new turn
+  cancels an active Trace and waits for its cleanup before starting the new turn
   in the same Session; idle sends start immediately. Steer/followup require an
-  active Run and preserve the draft otherwise.
+  active Trace and preserve the draft otherwise.
   The send and stop buttons are combined: while running, an empty input shows
   停止 with a white button group; entering text restores the selected send action
   and dark styling. When idle it shows the
@@ -183,12 +190,12 @@ commands contributed by enabled extensions. Type `/` for completion.
   Command/Ctrl+Enter selects default send, +Shift+Enter selects steer, and
   +Alt+Enter selects followup, including when an empty draft is not submitted.
   The `mode` menu directly selects normal/plan/auto, reflects changes from the
-  tool page or `/mode`, and is disabled while a Run is active. The button opens
+  tool page or `/mode`, and is disabled while a Trace is active. The button opens
   this menu on click without displaying a dropdown arrow.
 - Desktop shortcuts (use Command on macOS, Ctrl elsewhere): Command/Ctrl+Enter
-  sends, Command/Ctrl+Shift+Enter steers the active Run, and
+  sends, Command/Ctrl+Shift+Enter steers the active Trace, and
   Command/Ctrl+Alt+Enter queues a follow-up. Enter alone inserts a newline.
-  Steering/follow-up preserve quotes and multiline input. If no Run is active,
+  Steering/follow-up preserve quotes and multiline input. If no Trace is active,
   they show a notice and preserve the draft. `/follow` and `/follow-up` are
   aliases of `/followup`. The CLI's existing Alt+S / Alt+F shortcuts are unchanged.
 - New chat, commands, tools, pin, refresh, and send/stop
@@ -202,11 +209,11 @@ commands contributed by enabled extensions. Type `/` for completion.
 - **悬浮球**: click the circular icon (hover: “切换悬浮球”) to collapse the chat to a draggable, always-on-top
   icon. Click it to restore; right-click to restore or quit.
 - Switching preserves the Session, unsent input, window geometry, and active
-  Run. The ball's position is remembered; startup uses focus mode.
+  Trace. The ball's position is remembered; startup uses focus mode.
 - Tool approvals and runtime errors restore the chat so they cannot stay hidden.
 - Tool approval requests appear as in-conversation cards with 拒绝 / 允许本次
   actions instead of blocking popups. A choice disables both buttons immediately;
-  it is saved before being submitted to the Run. Requests, decisions, and
+  it is saved before being submitted to the Trace. Requests, decisions, and
   cancellations are stored as display-only Session entries, outside model context.
   Reopening a Session shows read-only records, never active approval buttons.
   Tool calls, arguments, and persisted results also appear in the conversation.
@@ -222,26 +229,26 @@ commands contributed by enabled extensions. Type `/` for completion.
   record time as `HH:MM:SS`, with the full local date/time on hover. These times
   survive reopening; legacy records without timing are not assigned invented times.
 - The header's icon-only **观测** control (with a tooltip and accessible name)
-  toggles between chat and the Run Trace browser, highlighting while Trace is
+  toggles between chat and the Trace browser, highlighting while Trace is
   visible. Trace has no separate back button; clicking a recent Session also
   returns to chat and clears the observation highlight. Leaving Trace for another
   page keeps the control state synchronized. Trace controls use the desktop's
   neutral backgrounds, rounded corners, and muted blue-gray selection palette.
   Its adjustable execution
-  tree groups each local Run, turn, observed model response, tool execution,
-  approval wait, and retry from the SDK's actual Run events. The searchable tree
+  tree groups each local Trace, turn, observed model response, tool execution,
+  approval wait, and retry from the SDK's actual Trace events. The searchable tree
   shows duration and color-coded status, with one icon-only expand/collapse toggle and
-  previous/next navigation through visible nodes. The toggle shows a downward
+  previous/next navigation through visible spans. The toggle shows a downward
   triangle while expanded; collapse switches it to a left-pointing triangle with
   the same active background as pin/sidebar. Clicking again expands the tree.
   The detail header shows the
-  selected node's status, duration, timestamp, and recorded token/cache counts in
+  selected span's status, duration, timestamp, and recorded token/cache counts in
   separate labeled fields. Session is not repeated inside the current-session
   trace browser; detailed usage and IDs remain available in the overview/JSON.
   The default preview displays input and output together; structured payloads
   support expandable fields, JSON text, and copying the sanitized payload.
   Separate tabs retain the overview, observed events, and sanitized raw JSON.
-  Live refreshes preserve the selected node, tree expansion, and detail tab.
+  Live refreshes preserve the selected span, tree expansion, and detail tab.
   Trace data is stored locally in `.sec/desktop-traces.sqlite3` and remains
   available after restarting the desktop app; it is not uploaded. Sensitive
   field names and common credential formats are redacted, and each stored JSON

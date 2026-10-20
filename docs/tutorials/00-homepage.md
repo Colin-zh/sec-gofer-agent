@@ -19,7 +19,7 @@
 
 1. [构建同步 Client](07-build-a-sync-client.md)
 2. [构建异步与流式 Client](08-build-an-async-streaming-client.md)
-3. [控制 Run 并处理事件](09-control-runs-and-consume-events.md)
+3. [控制 Trace 并处理事件](09-control-traces-and-consume-events.md)
 4. [持久化和迁移 Sessions](10-persist-and-transfer-sessions.md)
 
 ### 我想扩展 Sec 或调优运行行为

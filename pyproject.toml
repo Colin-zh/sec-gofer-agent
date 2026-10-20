@@ -1,6 +1,6 @@
 [project]
 name = "sec-gofer-agent"
-version = "0.1.1"
+version = "0.2.0"
 description = "Your gofer. A second you, in a second."
 readme = "README.md"
 authors = [

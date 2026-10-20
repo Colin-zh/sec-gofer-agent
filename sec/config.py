@@ -283,11 +283,79 @@ class StorageSettings:
 
 
 @dataclass(frozen=True)
+class MemorySettings:
+    """保存长期记忆的开关、后端与检索预算配置。
+
+    backend 取值 auto/in_memory/database；auto 跟随 SessionStore 后端并复用
+    同一 Database。gate 与 consolidation 依赖模型 provider，额外消耗模型调用，
+    因此整体默认关闭，需通过 SEC_MEMORY_ENABLED=true 显式开启。
+    """
+
+    enabled: bool = False
+    backend: str = "auto"
+    top_k: int = 5
+    token_budget: int | None = None
+    user_md_path: str | None = None
+    gate_enabled: bool = True
+    consolidation_enabled: bool = True
+    vector_dim: int = 1536
+
+    def __post_init__(self) -> None:
+        if self.backend not in {"auto", "in_memory", "database"}:
+            raise ConfigError("memory backend must be auto, in_memory, or database")
+        if self.top_k < 1:
+            raise ConfigError("memory top_k must be at least 1")
+        if self.token_budget is not None and self.token_budget < 1:
+            raise ConfigError("memory token_budget must be at least 1")
+        if self.vector_dim < 1:
+            raise ConfigError("memory vector_dim must be at least 1")
+        if self.user_md_path is not None and (
+            not isinstance(self.user_md_path, str) or not self.user_md_path.strip()
+        ):
+            raise ConfigError("SEC_MEMORY_USER_MD_PATH must not be empty")
+
+
+@dataclass(frozen=True)
+class EmbeddingSettings:
+    """保存自托管 OpenAI 兼容 embedding 服务的连接配置。
+
+    仅当记忆后端为向量方言（opengauss）时需要；SQLite 后端只做 FTS5，
+    无需 embedding 服务。
+    """
+
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    request_timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        for key, value in (
+            ("SEC_EMBEDDING_BASE_URL", self.base_url),
+            ("SEC_EMBEDDING_MODEL", self.model),
+        ):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ConfigError(f"{key} must not be empty")
+        if self.api_key is not None and not isinstance(self.api_key, str):
+            raise ConfigError("SEC_EMBEDDING_API_KEY must be text")
+        if (
+            not math.isfinite(self.request_timeout_seconds)
+            or self.request_timeout_seconds <= 0
+        ):
+            raise ConfigError(
+                "embedding request timeout must be a positive finite number"
+            )
+        if (self.base_url is None) != (self.model is None):
+            raise ConfigError(
+                "SEC_EMBEDDING_BASE_URL and SEC_EMBEDDING_MODEL must be set together"
+            )
+
+
+@dataclass(frozen=True)
 class Config:
     """封装 sec 的分层配置值。
 
     可由 from_env() 加载环境配置，也可通过 Config(...) 完全显式构造；
-    Agent 预算、事件容量、重试策略、上下文和存储配置均有默认值。
+    Agent 预算、事件容量、重试策略、上下文、存储和记忆配置均有默认值。
     """
 
     provider: ProviderSettings
@@ -297,6 +365,8 @@ class Config:
     context: ContextSettings = field(default_factory=ContextSettings)
     tool_retry: ToolRetrySettings = field(default_factory=ToolRetrySettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
+    embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
 
     @classmethod
     def from_env(
@@ -332,6 +402,8 @@ class Config:
             context=_load_context_settings(values),
             tool_retry=_load_tool_retry_settings(values),
             storage=_load_storage_settings(values, storage_backends),
+            memory=_load_memory_settings(values),
+            embedding=_load_embedding_settings(values),
         )
 
 
@@ -518,6 +590,36 @@ def _load_storage_settings(
     )
 
 
+def _load_memory_settings(values: Mapping[str, str]) -> MemorySettings:
+    return MemorySettings(
+        enabled=_boolean(values, "SEC_MEMORY_ENABLED", default=False),
+        backend=_nonempty(values, "SEC_MEMORY_BACKEND", default="auto").lower(),
+        top_k=_positive_int(values, "SEC_MEMORY_TOP_K", default=5),
+        token_budget=_optional_positive_int(values, "SEC_MEMORY_TOKEN_BUDGET"),
+        user_md_path=_optional_raw(values, "SEC_MEMORY_USER_MD_PATH"),
+        gate_enabled=_boolean(values, "SEC_MEMORY_GATE_ENABLED", default=True),
+        consolidation_enabled=_boolean(
+            values,
+            "SEC_MEMORY_CONSOLIDATION_ENABLED",
+            default=True,
+        ),
+        vector_dim=_positive_int(values, "SEC_MEMORY_VECTOR_DIM", default=1536),
+    )
+
+
+def _load_embedding_settings(values: Mapping[str, str]) -> EmbeddingSettings:
+    return EmbeddingSettings(
+        base_url=_first_nonempty(values, "SEC_EMBEDDING_BASE_URL"),
+        model=_first_nonempty(values, "SEC_EMBEDDING_MODEL"),
+        api_key=_optional_raw(values, "SEC_EMBEDDING_API_KEY"),
+        request_timeout_seconds=_positive_float(
+            values,
+            "SEC_EMBEDDING_REQUEST_TIMEOUT_SECONDS",
+            default=60.0,
+        ),
+    )
+
+
 # 配置读取辅助函数仅返回变量名相关错误，绝不将配置值写入错误文本。
 def _first_nonempty(values: Mapping[str, str], *keys: str) -> str | None:
     for key in keys:
@@ -542,6 +644,23 @@ def _nonempty(
 ) -> str:
     value = _first_nonempty(values, key)
     return default if value is None else value
+
+
+def _boolean(
+    values: Mapping[str, str],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    value = _first_nonempty(values, key)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{key} must be a boolean (true/false)")
 
 
 def _positive_int(

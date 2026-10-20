@@ -16,14 +16,14 @@ with SecClient("assistant", "遵循用户指令。") as client:
     print("Session:", client.session.id)
 ```
 
-同一个 Client 管理同一个 Session；上述两次 `run()` 是连续两轮对话，第二轮会带上第一轮已提交的历史。每次 `run()` 返回成功的 `RunResult`，常用字段如下：
+同一个 Client 管理同一个 Session；上述两次 `run()` 是连续两轮对话，第二轮会带上第一轮已提交的历史。每次 `run()` 返回成功的 `TraceResult`，常用字段如下：
 
 - `text`：最终回答文本；也可读取完整的 `final_message` 和 `messages`。
 - `model_calls`、`tool_calls`：逻辑调用计数；attempt 和重试次数另有独立字段。
 - `usage`：Provider 报告的 token 用量；无法确认的用量保持未知。
 - `stop_reason`：Provider 提供的停止原因，可能为空。
 
-模型、工具或存储执行失败会抛出异常，不会返回一个伪装成功的 `RunResult`。上下文管理器退出时会清理 Client 自己创建的资源。
+模型、工具或存储执行失败会抛出异常，不会返回一个伪装成功的 `TraceResult`。上下文管理器退出时会清理 Client 自己创建的资源。
 
 先按[Provider 配置教程](02-configure-providers.md)配置模型和凭据。常用构造参数：
 

@@ -22,7 +22,7 @@ from sec import (
     AsyncSecClient,
     ConfigError,
     MessageEntry,
-    Run,
+    Trace,
     SessionEntry,
     SessionStoreError,
     SessionSummary,
@@ -256,7 +256,7 @@ async def _chat_noninteractive(
             except Exception as exc:
                 output.print(f"\nRun event stream failed: {exc}", markup=False)
             output.print(
-                f"\n[Run completed: {result.model_calls} model call(s), "
+                f"\n[Trace completed: {result.model_calls} model call(s), "
                 f"{result.tool_calls} tool call(s)]",
                 markup=False,
             )
@@ -270,7 +270,7 @@ async def _chat_noninteractive(
 
 async def _consume_noninteractive_events(
     output: Console,
-    run: Run,
+    run: Trace,
 ) -> None:
     async for event in run.events():
         show_noninteractive_event(output, run, event)
@@ -283,7 +283,7 @@ async def _chat_interactive(
     resource_manager: CliResourceManager | None = None,
     enabled_extensions: Sequence[str] = (),
 ) -> None:
-    """启动旧版 Rich 输入体验，并把输入映射到原生 Run 控制接口。"""
+    """启动旧版 Rich 输入体验，并把输入映射到原生 Trace 控制接口。"""
     home = str(Path.cwd())
     model = _configured_model()
     if resource_manager is None:
@@ -324,14 +324,14 @@ async def _chat_interactive(
         )
     )
 
-    active_run: Run | None = None
+    active_run: Trace | None = None
     active_task: asyncio.Task[None] | None = None
-    trace_id = 0
+    trace_number = 0
     exit_after_active = False
 
     commands = create_chat_commands(
         client,
-        get_active_run=lambda: active_run,
+        get_active_trace=lambda: active_run,
         permission_policy=mode_policy,
         on_session_change=getattr(ui, "set_session_id", None),
         resource_manager=resource_manager,
@@ -341,14 +341,14 @@ async def _chat_interactive(
     application_task = asyncio.create_task(ui.run())
 
     def start_run(prompt: str) -> None:
-        nonlocal active_run, active_task, trace_id
-        trace_id += 1
+        nonlocal active_run, active_task, trace_number
+        trace_number += 1
         run = client.run(prompt)
         active_run = run
         ui.set_working(True)
-        ui.add_status("trace", f"[Run #{trace_id}] started")
+        ui.add_status("trace", f"[Trace #{trace_number}] started")
         active_task = asyncio.create_task(
-            _watch_run(ui, run, trace_id=trace_id)
+            _watch_run(ui, run, trace_number=trace_number)
         )
 
     input_task: asyncio.Task[str] | None = asyncio.create_task(
@@ -387,6 +387,9 @@ async def _chat_interactive(
                 if ui.resolve_confirmation(user_message):
                     input_task = asyncio.create_task(ui.input_queue.get())
                     continue
+                if ui.resolve_prompt(user_message):
+                    input_task = asyncio.create_task(ui.input_queue.get())
+                    continue
 
                 if user_message.strip():
                     ui.add_user_message(user_message)
@@ -418,7 +421,7 @@ async def _chat_interactive(
                             active_run.cancel()
                             ui.add_status(
                                 "info",
-                                "Cancelling the active Run before exit.",
+                                "Cancelling the active Trace before exit.",
                             )
                         elif outcome.run_prompt is not None:
                             if exit_after_active:
@@ -430,7 +433,7 @@ async def _chat_interactive(
                                 if not active_run.follow_up(outcome.run_prompt):
                                     ui.add_status(
                                         "error",
-                                        "The active Run no longer accepts follow-up input.",
+                                        "The active Trace no longer accepts follow-up input.",
                                     )
                             else:
                                 start_run(outcome.run_prompt)
@@ -448,7 +451,7 @@ async def _chat_interactive(
                         else:
                             ui.add_status(
                                 "error",
-                                "The active Run no longer accepts follow-up input.",
+                                "The active Trace no longer accepts follow-up input.",
                             )
                     else:
                         start_run(user_message)
@@ -469,13 +472,13 @@ async def _chat_interactive(
 
 async def _watch_run(
     ui: TerminalUI,
-    run: Run,
+    run: Trace,
     *,
-    trace_id: int,
+    trace_number: int,
 ) -> None:
-    """并行观察 Run 结果与事件，并报告两条通道各自的错误。"""
+    """并行观察 Trace 结果与事件，并报告两条通道各自的错误。"""
     events_task = asyncio.create_task(
-        _consume_events(ui, run, trace_id=trace_id)
+        _consume_events(ui, run, trace_number=trace_number)
     )
     try:
         result = await run.result()
@@ -485,12 +488,12 @@ async def _watch_run(
         raise
     except Exception as exc:
         ui.finish_turn()
-        ui.add_status("error", f"[Run #{trace_id}] failed: {exc}")
+        ui.add_status("error", f"[Trace #{trace_number}] failed: {exc}")
     else:
         ui.finish_turn()
         ui.add_status(
             "trace",
-            f"[Run #{trace_id}] complete: {result.model_calls} model call(s), "
+            f"[Trace #{trace_number}] complete: {result.model_calls} model call(s), "
             f"{result.tool_calls} tool call(s).",
         )
     try:
@@ -501,32 +504,32 @@ async def _watch_run(
         ui.finish_turn()
         ui.add_status(
             "error",
-            f"[Run #{trace_id}] event stream failed: {exc}",
+            f"[Trace #{trace_number}] event stream failed: {exc}",
         )
 
 
 async def _consume_events(
     ui: TerminalUI,
-    run: Run,
+    run: Trace,
     *,
-    trace_id: int,
+    trace_number: int,
 ) -> None:
     async for event in run.events():
-        await show_event(ui, run, event, trace_id=trace_id)
+        await show_event(ui, run, event, trace_number=trace_number)
 
 
 def create_chat_commands(
     client: AsyncSecClient,
     *,
-    active_run: Run | None = None,
-    get_active_run: Callable[[], Run | None] | None = None,
+    active_run: Trace | None = None,
+    get_active_trace: Callable[[], Trace | None] | None = None,
     permission_policy: PermissionModePolicy | None = None,
     on_session_change: Callable[[str], None] | None = None,
     resource_manager: CliResourceManager | None = None,
     refresh_completions: Callable[[Sequence[tuple[str, str]]], None] | None = None,
 ) -> ChatCommandRegistry:
     """Build the shared interactive command registry for a Sec Client."""
-    get_run = get_active_run or (lambda: active_run)
+    get_run = get_active_trace or (lambda: active_run)
     if resource_manager is None:
         if getattr(client, "agent_cards", ()):
             resource_manager = client.resources
@@ -550,13 +553,13 @@ def create_chat_commands(
         run = get_run()
         if run is None or not run.steer(text):
             return None
-        return "Steering message submitted to the active Run."
+        return "Steering message submitted to the active Trace."
 
     def request_stop() -> str | None:
         run = get_run()
         if run is None or not run.cancel():
             return None
-        return "Cancellation requested for the active Run."
+        return "Cancellation requested for the active Trace."
 
     async def new_session(args: tuple[str, ...]) -> ChatCommandOutcome:
         if args:
@@ -634,7 +637,7 @@ def create_chat_commands(
         active = get_run()
         if active is not None and not active.done:
             return ChatCommandOutcome(
-                "Finish or stop the active Run before renaming the Session.",
+                "Finish or stop the active Trace before renaming the Session.",
                 display_kind="error",
             )
         name = " ".join(args).strip()
@@ -756,7 +759,7 @@ def create_chat_commands(
         active_run = get_run()
         if args and active_run is not None and not active_run.done:
             return ChatCommandOutcome(
-                "Finish or stop the active Run before changing Extensions.",
+                "Finish or stop the active Trace before changing Extensions.",
                 display_kind="error",
             )
 
@@ -887,7 +890,7 @@ def create_chat_commands(
         for card in cards:
             marker = " (selected)" if card.id == selected else ""
             if card.id == pending:
-                marker += " (queued for next Run)"
+                marker += " (queued for next Trace)"
             lines.append(f"  {card.id}{marker} — {card.name}: {card.description}")
         lines.append("Use /agent <id> to select an Agent.")
         return ChatCommandOutcome("\n".join(lines))
@@ -907,7 +910,7 @@ def create_chat_commands(
             return ChatCommandOutcome(f"Could not select Agent: {exc}", display_kind="error")
         pending = getattr(client, "pending_agent_id", None)
         if pending == args[0]:
-            return ChatCommandOutcome(f"Agent {args[0]} queued for the next Run.")
+            return ChatCommandOutcome(f"Agent {args[0]} queued for the next Trace.")
         return ChatCommandOutcome(f"Agent {args[0]} selected.")
 
     def mcp_status_line(status: object) -> str:
@@ -1250,11 +1253,11 @@ def _format_session_tree(
 def _change_permission_mode(
     policy: PermissionModePolicy,
     mode: str,
-    active_run: Run | None,
+    active_run: Trace | None,
 ) -> str:
-    """切换工具权限模式；活动 Run 中不改变正在使用的授权规则。"""
+    """切换工具权限模式；活动 Trace 中不改变正在使用的授权规则。"""
     if active_run is not None and not active_run.done:
-        return "Finish or stop the active Run before changing permission mode."
+        return "Finish or stop the active Trace before changing permission mode."
     if mode == "plan":
         policy.set_mode("plan")
     elif mode == "normal":

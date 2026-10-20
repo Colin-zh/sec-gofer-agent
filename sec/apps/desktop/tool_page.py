@@ -10,10 +10,10 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QSplitter, QStyle, QVBoxLayout, QWidget,
 )
 
-ToolKind = Literal["agent", "prompt", "skill", "extension", "mcp"]
+ToolKind = Literal["agent", "prompt", "tool", "skill", "extension", "mcp"]
 TOOL_CATEGORIES: tuple[tuple[ToolKind, str], ...] = (
-    ("agent", "智能体"), ("prompt", "提示词模板"), ("skill", "技能"),
-    ("extension", "插件"), ("mcp", "MCP"),
+    ("agent", "智能体"), ("prompt", "提示词库"), ("tool", "工具"),
+    ("skill", "技能"), ("mcp", "MCP"), ("extension", "插件"),
 )
 
 
@@ -25,6 +25,9 @@ class ToolEntry:
     content: str
     enabled: bool
     execution_mode: Literal["in_process", "worker"] = "in_process"
+    builtin: bool = False
+    origin_kind: str | None = None
+    origin_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +94,7 @@ class ToolPage(QWidget):
         actions = QHBoxLayout()
         actions.addStretch()
         self._reload = QPushButton("重新加载")
-        self._reload.setToolTip("重新发现工作区资源、Agent 与 MCP 服务；运行中的 Run 保持原能力快照")
+        self._reload.setToolTip("重新发现工作区资源、Agent 与 MCP 服务；运行中的 Trace 保持原能力快照")
         self._reload.clicked.connect(self.reload_requested)
         actions.addWidget(self._reload)
         layout.addLayout(actions)
@@ -169,9 +172,12 @@ class ToolPage(QWidget):
         self._explanation.setText(
             "MCP 服务状态与启用配置由 Sec Client 管理；启用的工具仍须逐项审批。"
             if kind == "mcp" else
-            "选择当前 Agent；运行期间的切换会排队，并在下一次 Run 生效。"
+            "选择当前 Agent；运行期间的切换会排队，并在下一次 Trace 生效。"
             if kind == "agent" else
-            "提示词模板只在显式调用时展开；技能目录自动提供给当前 Agent，"
+            "内置工具固定可用、不可停用；自定义工具来自扩展与 MCP，"
+            "通过启停其来源来增减。"
+            if kind == "tool" else
+            "提示词库只在显式调用时展开；技能目录自动提供给当前 Agent，"
             "匹配的 required 技能会在模型请求前加载，其余按需使用。"
         )
         self.set_inventory(self._inventory)
@@ -189,11 +195,13 @@ class ToolPage(QWidget):
             if entry.kind == "agent":
                 state = (
                     "下一轮生效"
-                    if "下一次 Run" in entry.description
+                    if "下一次 Trace" in entry.description
                     else "当前"
                     if entry.enabled
                     else "可选"
                 )
+            elif entry.kind == "tool" and entry.builtin:
+                state = "内置"
             else:
                 state = "已启用" if entry.enabled else "已停用"
             item = QListWidgetItem(f"{entry.name}  {state}")
@@ -250,16 +258,21 @@ class ToolPage(QWidget):
         editable = self._ready and not self._pending
         selected = self._list.currentItem()
         entry = None if selected is None else selected.data(Qt.ItemDataRole.UserRole)
+        is_builtin_tool = self._kind == "tool" and entry is not None and entry.builtin
+        origin_kind = entry.origin_kind if self._kind == "tool" and entry is not None else None
         resource_editable = (
             editable
             and selected is not None
             and entry.kind != "agent"
+            and not is_builtin_tool
             and (
-                not self._inventory.busy or entry.kind in {"skill", "prompt", "mcp"}
+                not self._inventory.busy
+                or entry.kind in {"skill", "prompt", "mcp"}
+                or origin_kind in {"mcp", "worker"}
                 or entry.kind == "extension" and self._execution_mode.currentData() == "worker"
             )
         )
-        self._enabled.setVisible(self._kind != "agent")
+        self._enabled.setVisible(self._kind != "agent" and not is_builtin_tool)
         self._enabled.setEnabled(resource_editable)
         self._execution_mode.setVisible(self._kind == "extension")
         self._execution_mode.setEnabled(editable and entry is not None and not entry.enabled)
@@ -271,12 +284,15 @@ class ToolPage(QWidget):
         if item is None:
             return
         entry: ToolEntry = item.data(Qt.ItemDataRole.UserRole)
-        if entry.kind == "agent":
+        if entry.kind == "agent" or (entry.kind == "tool" and entry.builtin):
             self._enabled.setChecked(False)
             return
         self._enabled.setChecked(entry.enabled)
         self._pending = True
         self._update_controls()
+        if entry.kind == "tool":
+            self.activation_requested.emit(entry.origin_kind, entry.origin_name, checked)
+            return
         kind = (
             "worker" if entry.kind == "extension"
             and self._execution_mode.currentData() == "worker" else entry.kind

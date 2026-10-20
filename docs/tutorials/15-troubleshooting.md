@@ -66,6 +66,6 @@ uv sync --extra desktop --no-editable \
 
 检查当前权限模式、工具风险元数据和审批结果。管道式 CLI 没有交互审批界面，需要确认的工具会被拒绝。`auto` 不会自动批准 Bash；本地执行器也不是安全沙箱。
 
-## Run 事件订阅溢出
+## Trace 事件订阅溢出
 
 事件订阅有界；如果消费速度跟不上事件发布，会抛出 `SecSubscriptionOverflow`。及时迭代事件，或按需增大 `event_buffer_size`。事件历史不是持久化审计日志。

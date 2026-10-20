@@ -22,7 +22,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import NoSuchModuleError
 
 from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
-from sec.agent import Agent, Run, Session
+from sec.agent import Agent, Trace, Session
 from sec.config import (
     Config,
     ConfigError,
@@ -34,19 +34,28 @@ from sec.extensions import ExtensionCatalog, ExtensionManager
 from sec.extensions.api import ProviderFactory, StorageFactory
 from sec._types.context import TokenEstimator
 from sec._types.execution import ToolExecutor
-from sec._types.extensions import AfterRunHook, BeforeRunHook, RunEventHook
+from sec._types.hooks import HookContext, HookHandler, HookName
 from sec._types.policy import PolicyEngine
+from sec._types.embedding import Embedder
 from sec._types.providers import ModelProvider, StreamingModelProvider
 from sec._types.session import SessionEntry, SessionInfoEntry, SessionSnapshot, SessionSummary
 from sec._types.storage import SessionStoreProtocol
-from sec.storage import Database, SessionStore
+from sec.storage import Database, MemoryStore, SessionStore
+from sec.memory import (
+    MemoryConsolidator,
+    MemoryGate,
+    MemoryRetriever,
+    MemoryRuntime,
+    SkillSource,
+    UserProfile,
+)
 from sec.exceptions import RecoverableToolError, SecUIHandlerError
 from sec.tools import Tool, tool
 from sec.agent.card import AgentCard
 from sec.resources.agents import AgentCatalog
-from sec.resources.markdown import ResourceManager
+from sec.resources.markdown import CliResource, ResourceManager
 from sec._runtime.capabilities import (
-    CapabilityBinding, CapabilitySnapshot, ReloadReport, RunAllowance,
+    CapabilityBinding, CapabilitySnapshot, ReloadReport, TraceAllowance,
 )
 from sec._types.session import CustomEntry
 from sec._runtime.resource_settings import (
@@ -163,6 +172,109 @@ def create_session_store(
     return SessionStore(backend="database", database=database)
 
 
+def create_embedder(config: Config) -> Embedder | None:
+    """按 embedding 配置创建自托管 OpenAI 兼容 Embedder；未配置返回 None。"""
+    settings = config.embedding
+    if settings.base_url is None or settings.model is None:
+        return None
+    from sec.providers.embedding import OpenAICompatibleEmbedder
+
+    return OpenAICompatibleEmbedder(
+        base_url=settings.base_url,
+        model=settings.model,
+        api_key=settings.api_key,
+        timeout=settings.request_timeout_seconds,
+    )
+
+
+def _resolve_memory_backend(config: Config) -> str:
+    """解析记忆后端；auto 跟随 SessionStore 后端并复用同一 Database。"""
+    backend = config.memory.backend
+    if backend != "auto":
+        return backend
+    return (
+        "database"
+        if config.storage.session_store_backend == "database"
+        else "in_memory"
+    )
+
+
+def create_memory_store(
+    config: Config,
+    *,
+    database: Database | None = None,
+    embedder: Embedder | None = None,
+) -> MemoryStore:
+    """按记忆配置创建 MemoryStore；数据库后端须注入应用持有的 Database。"""
+    backend = _resolve_memory_backend(config)
+    if backend == "database":
+        if database is None:
+            raise ConfigError(
+                "create and inject a Database for the database memory backend"
+            )
+        return MemoryStore(
+            backend="database",
+            database=database,
+            embedder=embedder,
+            vector_dim=config.memory.vector_dim,
+        )
+    return MemoryStore(backend="in_memory")
+
+
+def create_memory_runtime(
+    config: Config,
+    provider: ModelProvider | StreamingModelProvider | None,
+    memory_store: MemoryStore | None,
+    *,
+    token_estimator: TokenEstimator | None = None,
+    skills_provider: Callable[[], tuple[CliResource, ...]] | None = None,
+) -> MemoryRuntime | None:
+    """将 gate/retriever/consolidator 打包为可注入 Harness 的 MemoryRuntime。
+
+    skills_provider 惰性返回当前已发现的 Skill 快照（首次装配时 capabilities
+    可能尚未载入，检索时才取最新值），用于把 Skill 统一进程序性记忆来源。
+    """
+    if memory_store is None or provider is None:
+        return None
+    settings = config.memory
+    can_complete = callable(getattr(provider, "complete", None))
+    gate = (
+        MemoryGate(provider, enabled=settings.gate_enabled)
+        if can_complete
+        else None
+    )
+    consolidator = (
+        MemoryConsolidator(
+            provider,
+            memory_store.semantic,
+            enabled=settings.consolidation_enabled,
+        )
+        if can_complete
+        else None
+    )
+    procedural_sources = []
+    if settings.user_md_path is not None:
+        procedural_sources.append(UserProfile(settings.user_md_path))
+    if skills_provider is not None:
+        procedural_sources.append(
+            SkillSource(skills_provider, top_k=settings.top_k)
+        )
+    retriever = MemoryRetriever(
+        memory_store.semantic,
+        memory_store.episodic,
+        procedural_sources=procedural_sources,
+        top_k=settings.top_k,
+        token_budget=settings.token_budget,
+        token_estimator=token_estimator,
+    )
+    return MemoryRuntime(
+        gate=gate,
+        retriever=retriever,
+        episodic=memory_store.episodic,
+        consolidator=consolidator,
+    )
+
+
 def create_agent(
     config: Config,
     name: str,
@@ -187,11 +299,15 @@ def create_harness(
     executor: ToolExecutor | None = None,
     token_estimator: TokenEstimator | None = None,
     providers: Mapping[str, ProviderFactory] | None = None,
-    before_run_hooks: tuple[BeforeRunHook, ...] = (),
-    after_run_hooks: tuple[AfterRunHook, ...] = (),
-    run_event_hooks: tuple[RunEventHook, ...] = (),
+    hooks: Mapping[HookName, tuple[HookHandler, ...]] | None = None,
+    provider: ModelProvider | StreamingModelProvider | None = None,
+    memory: MemoryRuntime | None = None,
 ) -> Harness:
-    """创建应用 Harness；运行结束后需调用 aclose() 释放 Provider。"""
+    """创建应用 Harness；运行结束后需调用 aclose() 释放 Provider。
+
+    传入 provider 可复用调用方已创建（并可能为记忆组件共享）的 Provider；
+    否则按配置创建。memory 为长期记忆运行时组件，缺省时不注入。
+    """
     if (config.context.context_window_tokens is None) != (token_estimator is None):
         raise ConfigError(
             "context compression requires both context_window_tokens and "
@@ -209,8 +325,13 @@ def create_harness(
         raise ConfigError(
             "max_output_tokens must be less than context_window_tokens"
         )
+    resolved_provider = (
+        create_provider(config, providers=providers)
+        if provider is None
+        else provider
+    )
     return Harness(
-        create_provider(config, providers=providers),
+        resolved_provider,
         policy=policy,
         executor=executor,
         event_buffer_size=config.runtime.event_buffer_size,
@@ -219,9 +340,8 @@ def create_harness(
         context_settings=config.context,
         token_estimator=token_estimator,
         max_output_tokens=config.provider.max_output_tokens,
-        before_run_hooks=before_run_hooks,
-        after_run_hooks=after_run_hooks,
-        run_event_hooks=run_event_hooks,
+        hooks=hooks,
+        memory=memory,
     )
 
 
@@ -296,10 +416,13 @@ class _SecClientCore:
         self._database = database
         self._owns_database = False
         self._owns_store = False
+        self._memory_store: MemoryStore | None = None
+        self._embedder: Embedder | None = None
+        self._owns_embedder = False
         self._harness: Harness | None = None
         self._agent: Agent | None = None
         self._config: Config | None = None
-        self._active_run: Run | None = None
+        self._active_trace: Trace | None = None
         self._session_switching = False
         self._enabled_extensions = tuple(enabled_extensions)
         self._extension_manager = ExtensionManager()
@@ -428,6 +551,19 @@ class _SecClientCore:
                     if self._session_id is not None
                     else Session(store=self._store)
                 )
+            if config.memory.enabled:
+                self._embedder = create_embedder(config)
+                self._owns_embedder = self._embedder is not None
+                self._memory_store = create_memory_store(
+                    config,
+                    database=self._database,
+                    embedder=self._embedder,
+                )
+                initialize = getattr(self._memory_store, "initialize", None)
+                if initialize is not None:
+                    initialized = initialize()
+                    if inspect.isawaitable(initialized):
+                        await initialized
             self._agent, self._harness = self._build_run_resources(
                 config,
                 self._extension_catalog,
@@ -487,7 +623,7 @@ class _SecClientCore:
             self._session_switching = False
 
     async def rename_session(self, session_id: str, name: str) -> None:
-        """重命名已存储会话，不改变当前会话；活动 Run 期间禁止修改。"""
+        """重命名已存储会话，不改变当前会话；活动 Trace 期间禁止修改。"""
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session ID must not be empty")
         if not isinstance(name, str) or not name.strip():
@@ -886,7 +1022,7 @@ class _SecClientCore:
             ToolExecutionStartEvent, ToolExecutionEndEvent,
         )
         if self._harness is None or parent.context is None or parent.identity is None:
-            raise RuntimeError("delegation requires an active parent Run")
+            raise RuntimeError("delegation requires an active parent Trace")
         if not task.strip():
             raise ValueError("delegation task must not be empty")
         ancestors = (*parent.ceiling, parent.identity)
@@ -902,12 +1038,25 @@ class _SecClientCore:
         )
         control, events = parent.context
         child_session = Session(store=self._store)
+        navigation = await self._harness._hook_executor.before_navigation(
+            agent_id,
+            HookContext(
+                trace_id=events.trace_id,
+                session_id=child_session.id,
+                agent_name=self.agent.name,
+                ui=None,
+            ),
+        )
+        if navigation.decline:
+            return "Agent delegation was declined."
+        if navigation.summary is not None:
+            return navigation.summary
         async def initialize_child() -> None:
             await child_session.append_entry(CustomEntry(
                 id=uuid4().hex, parent_id=child_session.active_leaf_id,
                 timestamp=time.time(), custom_type="sec.agent_selection",
                 data={"agent_id": agent_id, "digest": card.digest,
-                      "parent_run_id": events.run_id},
+                      "parent_trace_id": events.trace_id},
             ))
         binding.initialize = initialize_child
         child = self._harness.run(
@@ -915,7 +1064,7 @@ class _SecClientCore:
         )
         def publish(status: Literal["started", "completed", "failed", "cancelled"]) -> None:
             events.publish(DelegationEvent(
-                parent_run_id=events.run_id, child_run_id=child.id,
+                parent_trace_id=events.trace_id, child_trace_id=child.id,
                 child_session_id=child_session.id, agent_id=agent_id, status=status,
             ))
         publish("started")
@@ -948,7 +1097,7 @@ class _SecClientCore:
                     events.publish(replace(event, input={
                         **event.input,
                         "delegation": event.input.get(
-                            "delegation", {"child_run_id": child.id, "agent_id": agent_id},
+                            "delegation", {"child_trace_id": child.id, "agent_id": agent_id},
                         ),
                     }))
                 elif isinstance(event, (
@@ -1142,15 +1291,25 @@ class _SecClientCore:
                 ) for registered in catalog.tools),
             ),
         )
+        provider = create_provider(config, providers=catalog.providers)
+        memory = create_memory_runtime(
+            config,
+            provider,
+            self._memory_store,
+            token_estimator=self._token_estimator,
+            skills_provider=lambda: (
+                () if self._capabilities is None else self._capabilities.skills
+            ),
+        )
         harness = create_harness(
             config,
             policy=policy,
             executor=self._executor,
             token_estimator=self._token_estimator,
             providers=catalog.providers,
-            before_run_hooks=catalog.before_run_hooks,
-            after_run_hooks=catalog.after_run_hooks,
-            run_event_hooks=catalog.run_event_hooks,
+            hooks=catalog.hooks,
+            provider=provider,
+            memory=memory,
         )
         return agent, harness
 
@@ -1172,19 +1331,19 @@ class _SecClientCore:
         except Exception as error:
             raise SecUIHandlerError(handler_name) from error
 
-    def _start_run(self, prompt: str) -> Run:
-        """启动一轮对话并返回可观察、可控制的 Run 句柄。"""
+    def _start_trace(self, prompt: str) -> Trace:
+        """启动一轮对话并返回可观察、可控制的 Trace 句柄。"""
         if self._session_switching:
-            raise RuntimeError("cannot start a Run while switching Sessions")
+            raise RuntimeError("cannot start a Trace while switching Sessions")
         if self._closed or self._harness is None:
-            raise RuntimeError("SecClient must be entered before starting a Run")
+            raise RuntimeError("SecClient must be entered before starting a Trace")
         capabilities = None
         if self._capabilities is not None:
             target = self._pending_agent_id or self._selected_agent_id
             card = self._capabilities.card(target)
             capabilities = CapabilityBinding(
                 latest=self._current_capabilities, agent_id=target, fallback=self.agent,
-                allowance=RunAllowance(
+                allowance=TraceAllowance(
                     min(card.max_model_calls, self.agent.max_model_calls),
                     min(card.max_tool_calls, self.agent.max_tool_calls),
                 ),
@@ -1200,7 +1359,7 @@ class _SecClientCore:
         run = self._harness.run(
             self.agent, prompt, session=self.session, capabilities=capabilities,
         )
-        self._active_run = run
+        self._active_trace = run
         return run
 
     def _require_idle_session_switch(self) -> None:
@@ -1209,9 +1368,9 @@ class _SecClientCore:
         if self._session_switching:
             raise RuntimeError("a Session switch is already in progress")
         if self._session.is_busy or (
-            self._active_run is not None and not self._active_run.done
+            self._active_trace is not None and not self._active_trace.done
         ):
-            raise RuntimeError("finish or stop the active Run before switching Sessions")
+            raise RuntimeError("finish or stop the active Trace before switching Sessions")
 
     def _require_session_store(self) -> SessionStoreProtocol:
         if self._store is None:
@@ -1274,15 +1433,15 @@ class _SecClientCore:
             self._session_switching = False
 
     async def _close(self) -> None:
-        """取消尚未完成的 Run，并关闭 Client 自行创建的资源。"""
+        """取消尚未完成的 Trace，并关闭 Client 自行创建的资源。"""
         if self._closed:
             return
         self._closed = True
         errors: list[BaseException] = []
-        if self._active_run is not None and not self._active_run.done:
-            self._active_run.cancel()
+        if self._active_trace is not None and not self._active_trace.done:
+            self._active_trace.cancel()
             try:
-                await self._active_run.result()
+                await self._active_trace.result()
             except asyncio.CancelledError:
                 pass
             except BaseException as error:
@@ -1303,6 +1462,10 @@ class _SecClientCore:
                         await closed
 
                 await _attempt_cleanup(errors, close_owned_store)
+        if self._memory_store is not None:
+            await _attempt_cleanup(errors, self._memory_store.aclose)
+        if self._owns_embedder and self._embedder is not None:
+            await _attempt_cleanup(errors, self._embedder.aclose)
         if self._owns_database and self._database is not None:
             await _attempt_cleanup(errors, self._database.aclose)
         await _attempt_cleanup(errors, self._extension_manager.aclose)
@@ -1311,7 +1474,7 @@ class _SecClientCore:
 
 
 class AsyncSecClient(_SecClientCore):
-    """异步装配单段对话，并以异步 Run 句柄提供观测和控制能力。"""
+    """异步装配单段对话，并以异步 Trace 句柄提供观测和控制能力。"""
 
     async def __aenter__(self) -> AsyncSecClient:
         await self._initialize()
@@ -1326,7 +1489,7 @@ class AsyncSecClient(_SecClientCore):
         await self._close()
 
     async def set_enabled_extensions(self, enabled: Iterable[str]) -> None:
-        """Replace active extensions for future Runs; refuse changes during a Run."""
+        """Replace active extensions for future Runs; refuse changes during a Trace."""
         async with self._resource_mutation_lock:
             await self._set_enabled_extensions(enabled)
 
@@ -1351,9 +1514,9 @@ class AsyncSecClient(_SecClientCore):
     async def revoke_capability(self, name: str) -> None:
         await self._revoke_capability(name)
 
-    def run(self, prompt: str) -> Run:
-        """启动一轮对话并返回异步 Run 句柄。"""
-        return self._start_run(prompt)
+    def run(self, prompt: str) -> Trace:
+        """启动一轮对话并返回异步 Trace 句柄。"""
+        return self._start_trace(prompt)
 
     async def handle_ui_request(
         self,
@@ -1385,5 +1548,6 @@ __all__ = [
     "AsyncSecClient",
     "SecClient",
     "create_database",
+    "create_memory_store",
     "create_session_store",
 ]

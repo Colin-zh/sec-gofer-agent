@@ -189,7 +189,7 @@ def create_default_chat_commands(
     resource_commands: Sequence[tuple[str, str, str, CommandHandler]] = (),
     help_details: Callable[[], str] | None = None,
 ) -> ChatCommandRegistry:
-    """将内建聊天命令绑定到当前活动 Run。"""
+    """将内建聊天命令绑定到当前活动 Trace。"""
     commands = ChatCommandRegistry()
 
     def show_help(args: tuple[str, ...]) -> ChatCommandOutcome:
@@ -198,7 +198,7 @@ def create_default_chat_commands(
         details = "" if help_details is None else help_details()
         if args:
             details = (
-                "Shortcuts: Ctrl+C cancels the active Run; Ctrl+D exits; "
+                "Shortcuts: Ctrl+C cancels the active Trace; Ctrl+D exits; "
                 "Tab completes commands; Ctrl+O opens this expanded help.\n\n"
                 + details
             )
@@ -214,10 +214,10 @@ def create_default_chat_commands(
         if not args:
             return ChatCommandOutcome(f"Usage: /{command_name} <message>")
         if enqueue is None:
-            return ChatCommandOutcome(f"/{command_name} requires an active Run.")
+            return ChatCommandOutcome(f"/{command_name} requires an active Trace.")
         status = enqueue(" ".join(args))
         if status is None:
-            return ChatCommandOutcome(f"/{command_name} requires an active Run.")
+            return ChatCommandOutcome(f"/{command_name} requires an active Trace.")
         display_kind: CommandDisplayKind = (
             "follow_up" if command_name == "followup" else "steer"
         )
@@ -233,10 +233,10 @@ def create_default_chat_commands(
         if args:
             return ChatCommandOutcome("Usage: /stop", display_kind="error")
         if request_stop is None:
-            return ChatCommandOutcome("/stop requires an active Run.")
+            return ChatCommandOutcome("/stop requires an active Trace.")
         status = request_stop()
         if status is None:
-            return ChatCommandOutcome("/stop requires an active Run.")
+            return ChatCommandOutcome("/stop requires an active Trace.")
         return ChatCommandOutcome(status, display_kind="should_stop")
 
     def exit_chat(args: tuple[str, ...]) -> ChatCommandOutcome:
@@ -312,7 +312,7 @@ def create_default_chat_commands(
     commands.register(
         ChatCommand("steer", "Steer the active assistant turn", steer)
     )
-    commands.register(ChatCommand("stop", "Cancel the active Run", stop))
+    commands.register(ChatCommand("stop", "Cancel the active Trace", stop))
     if get_permission_mode is not None and change_permission_mode is not None:
         commands.register(
             ChatCommand(

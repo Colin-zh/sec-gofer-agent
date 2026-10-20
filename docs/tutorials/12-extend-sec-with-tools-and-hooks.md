@@ -33,9 +33,40 @@ class MyExtension:
 - `register_policy(name, policy)`：增加 Policy；通过 `policy_name` 选择。
 - `register_storage_backend(name, factory)`：增加 SessionStore 后端；通过存储配置选择。
 - `register_ui_handler(name, handler)`：供应用通过 Client 的 UI handler 接口调用。
-- `register_before_run_hook`、`register_after_run_hook`、`register_run_event_hook`：接入 Run 生命周期。
+- `register_hook(name, handler)`：注册变换型 hook（见下）。
 
-Run event hook 必须同步且快速；before/after hooks 可为同步或异步回调。Hook 抛出异常会使 Run 失败，不会静默忽略。扩展应只释放自己拥有的资源，不要关闭宿主注入的 Database 等资源。
+扩展应只释放自己拥有的资源，不要关闭宿主注入的 Database 等资源。
+
+## 变换型 Hook
+
+`api.register_hook(name, handler)` 注册可改写 Trace 数据的 hook（与 pi-main 的
+`on()` 对齐）。`handler(event, ctx)` 可同步或异步，返回对应 hook 的 result
+类型或 `None`；多个 handler 按注册顺序执行，聚合语义由运行时的
+`HookExecutor` 施加：
+
+| hook | 语义 | 可改写 |
+|---|---|---|
+| `before_trace` | collect | 注入消息 |
+| `before_drive` | fail-closed | 无（异常即中断） |
+| `before_trace_end` | collect | 追加 follow-up |
+| `transform_context` | 链式 | 上下文消息、系统提示 |
+| `before_request` | 链式 | 请求选项 |
+| `before_payload` | 链式 | wire payload（脱敏等） |
+| `after_response` | 链式 | 模型响应消息 |
+| `before_tool` | 链式 + block | 工具参数 / 拦截 |
+| `after_tool` | 链式 | 工具结果 / terminate |
+| `before_compaction` | first-wins | decline / 自定义摘要 |
+| `before_navigation` | first-wins | decline / 自定义摘要 |
+
+- **链式**：前一个 handler 的输出作为后一个的输入。
+- **fail-closed**：任一 handler 抛异常即向上传播，使 Trace 失败，不静默忽略。
+- **first-wins**：第一个返回有效结果的 handler 生效，其余跳过。
+- **collect**：汇总所有 handler 的注入/follow-up。
+
+`ctx.ui` 提供阻塞 UI 原语（`select` / `confirm` / `input` / `editor` /
+`notify`），扩展可在 hook 内阻塞等待宿主（CLI / Desktop）渲染并回传响应。
+工具拦截是两层 HITL：`before_tool` 先运行（可改写参数，`block` 则直接短路，
+不再询问 Policy），随后才由 `PolicyEngine.decide` 门控。
 
 开发完成后可构建 wheel 并在隔离环境中验证 entry point；仓库的 Extension 安装烟雾测试可用：
 

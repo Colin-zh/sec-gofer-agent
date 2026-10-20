@@ -1,4 +1,4 @@
-"""Local, redacted persistence for desktop Run traces."""
+"""Local, redacted persistence for desktop traces."""
 
 from __future__ import annotations
 
@@ -120,18 +120,18 @@ class TraceStore:
                 """
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
-                CREATE TABLE IF NOT EXISTS trace_runs (
-                    run_id TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS traces (
+                    trace_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     started_at REAL NOT NULL,
                     finished_at REAL,
                     elapsed_ms REAL,
                     status TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS trace_nodes (
-                    node_id TEXT PRIMARY KEY,
-                    run_id TEXT NOT NULL REFERENCES trace_runs(run_id) ON DELETE CASCADE,
-                    parent_id TEXT REFERENCES trace_nodes(node_id) ON DELETE CASCADE,
+                CREATE TABLE IF NOT EXISTS trace_spans (
+                    span_id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
+                    parent_id TEXT REFERENCES trace_spans(span_id) ON DELETE CASCADE,
                     kind TEXT NOT NULL,
                     label TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -141,19 +141,19 @@ class TraceStore:
                     approval_wait_ms REAL,
                     details_json TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS trace_nodes_run_order
-                    ON trace_nodes(run_id, started_at, node_id);
+                CREATE INDEX IF NOT EXISTS trace_spans_order
+                    ON trace_spans(trace_id, started_at, span_id);
                 CREATE TABLE IF NOT EXISTS trace_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL REFERENCES trace_runs(run_id) ON DELETE CASCADE,
-                    node_id TEXT REFERENCES trace_nodes(node_id) ON DELETE SET NULL,
+                    trace_id TEXT NOT NULL REFERENCES traces(trace_id) ON DELETE CASCADE,
+                    span_id TEXT REFERENCES trace_spans(span_id) ON DELETE SET NULL,
                     event_type TEXT NOT NULL,
                     occurred_at REAL NOT NULL,
                     elapsed_ms REAL NOT NULL,
                     payload_json TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS trace_events_run_order
-                    ON trace_events(run_id, event_id);
+                CREATE INDEX IF NOT EXISTS trace_events_order
+                    ON trace_events(trace_id, event_id);
                 """
             )
 
@@ -167,35 +167,35 @@ class TraceStore:
         finally:
             connection.close()
 
-    def start_run(self, run_id: str, session_id: str, started_at: float) -> None:
+    def start_trace(self, trace_id: str, session_id: str, started_at: float) -> None:
         details = {"session_id": session_id}
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO trace_runs(run_id, session_id, started_at, status)
+                INSERT INTO traces(trace_id, session_id, started_at, status)
                 VALUES (?, ?, ?, 'running')
                 """,
-                (run_id, session_id, started_at),
+                (trace_id, session_id, started_at),
             )
             connection.execute(
                 """
-                INSERT INTO trace_nodes(
-                    node_id, run_id, parent_id, kind, label, status, started_at,
+                INSERT INTO trace_spans(
+                    span_id, trace_id, parent_id, kind, label, status, started_at,
                     details_json
-                ) VALUES (?, ?, NULL, 'run', ?, 'running', ?, ?)
+                ) VALUES (?, ?, NULL, 'trace', ?, 'running', ?, ?)
                 """,
                 (
-                    run_id,
-                    run_id,
-                    f" Run · {run_id[:8]}",
+                    trace_id,
+                    trace_id,
+                    f" Trace · {trace_id[:8]}",
                     started_at,
                     _json_text(details),
                 ),
             )
 
-    def create_node(
+    def create_span(
         self,
-        run_id: str,
+        trace_id: str,
         parent_id: str,
         kind: str,
         label: str,
@@ -204,18 +204,18 @@ class TraceStore:
         status: str = "running",
         details: dict[str, Any] | None = None,
     ) -> str:
-        node_id = uuid4().hex
+        span_id = uuid4().hex
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO trace_nodes(
-                    node_id, run_id, parent_id, kind, label, status, started_at,
+                INSERT INTO trace_spans(
+                    span_id, trace_id, parent_id, kind, label, status, started_at,
                     details_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    node_id,
-                    run_id,
+                    span_id,
+                    trace_id,
                     parent_id,
                     kind,
                     label,
@@ -224,11 +224,11 @@ class TraceStore:
                     _json_text(details or {}),
                 ),
             )
-        return node_id
+        return span_id
 
-    def update_node(
+    def update_span(
         self,
-        node_id: str,
+        span_id: str,
         *,
         label: str | None = None,
         status: str | None = None,
@@ -239,24 +239,24 @@ class TraceStore:
     ) -> None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT details_json FROM trace_nodes WHERE node_id = ?",
-                (node_id,),
+                "SELECT details_json FROM trace_spans WHERE span_id = ?",
+                (span_id,),
             ).fetchone()
             if row is None:
-                raise KeyError(f"Trace node not found: {node_id}")
+                raise KeyError(f"Trace span not found: {span_id}")
             current = json.loads(row["details_json"])
             if details:
                 current.update(details)
             connection.execute(
                 """
-                UPDATE trace_nodes
+                UPDATE trace_spans
                 SET label = COALESCE(?, label),
                     status = COALESCE(?, status),
                     ended_at = COALESCE(?, ended_at),
                     elapsed_ms = COALESCE(?, elapsed_ms),
                     approval_wait_ms = COALESCE(?, approval_wait_ms),
                     details_json = ?
-                WHERE node_id = ?
+                WHERE span_id = ?
                 """,
                 (
                     label,
@@ -265,13 +265,13 @@ class TraceStore:
                     elapsed_ms,
                     approval_wait_ms,
                     _json_text(current),
-                    node_id,
+                    span_id,
                 ),
             )
 
-    def finish_run(
+    def finish_trace(
         self,
-        run_id: str,
+        trace_id: str,
         *,
         finished_at: float,
         elapsed_ms: float,
@@ -280,25 +280,25 @@ class TraceStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                UPDATE trace_runs
+                UPDATE traces
                 SET finished_at = ?, elapsed_ms = ?, status = ?
-                WHERE run_id = ?
+                WHERE trace_id = ?
                 """,
-                (finished_at, elapsed_ms, status, run_id),
+                (finished_at, elapsed_ms, status, trace_id),
             )
             connection.execute(
                 """
-                UPDATE trace_nodes
+                UPDATE trace_spans
                 SET status = ?, ended_at = ?, elapsed_ms = ?
-                WHERE node_id = ?
+                WHERE span_id = ?
                 """,
-                (status, finished_at, elapsed_ms, run_id),
+                (status, finished_at, elapsed_ms, trace_id),
             )
 
     def record_event(
         self,
-        run_id: str,
-        node_id: str,
+        trace_id: str,
+        span_id: str,
         event_type: str,
         occurred_at: float,
         elapsed_ms: float,
@@ -308,12 +308,12 @@ class TraceStore:
             connection.execute(
                 """
                 INSERT INTO trace_events(
-                    run_id, node_id, event_type, occurred_at, elapsed_ms, payload_json
+                    trace_id, span_id, event_type, occurred_at, elapsed_ms, payload_json
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    run_id,
-                    node_id,
+                    trace_id,
+                    span_id,
                     event_type,
                     occurred_at,
                     elapsed_ms,
@@ -321,7 +321,7 @@ class TraceStore:
                 ),
             )
 
-    def list_runs(
+    def list_traces(
         self,
         limit: int = 200,
         *,
@@ -330,8 +330,8 @@ class TraceStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT run_id, session_id, started_at, finished_at, elapsed_ms, status
-                FROM trace_runs
+                SELECT trace_id, session_id, started_at, finished_at, elapsed_ms, status
+                FROM traces
                 WHERE (? IS NULL OR session_id = ?)
                 ORDER BY started_at DESC
                 LIMIT ?
@@ -340,43 +340,43 @@ class TraceStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_tree(self, run_id: str) -> list[dict[str, Any]]:
+    def get_tree(self, trace_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT node_id, run_id, parent_id, kind, label, status, started_at,
+                SELECT span_id, trace_id, parent_id, kind, label, status, started_at,
                        ended_at, elapsed_ms, approval_wait_ms, details_json
-                FROM trace_nodes
-                WHERE run_id = ?
+                FROM trace_spans
+                WHERE trace_id = ?
                 ORDER BY started_at, rowid
                 """,
-                (run_id,),
+                (trace_id,),
             ).fetchall()
-        nodes: dict[str, dict[str, Any]] = {}
+        spans: dict[str, dict[str, Any]] = {}
         for row in rows:
-            node = dict(row)
-            node["details"] = json.loads(node.pop("details_json"))
-            node["children"] = []
-            nodes[node["node_id"]] = node
+            span = dict(row)
+            span["details"] = json.loads(span.pop("details_json"))
+            span["children"] = []
+            spans[span["span_id"]] = span
         roots: list[dict[str, Any]] = []
-        for node in nodes.values():
-            parent = nodes.get(node["parent_id"])
+        for span in spans.values():
+            parent = spans.get(span["parent_id"])
             if parent is None:
-                roots.append(node)
+                roots.append(span)
             else:
-                parent["children"].append(node)
+                parent["children"].append(span)
         return roots
 
-    def get_node_events(self, run_id: str, node_id: str) -> list[TraceEventRecord]:
+    def get_span_events(self, trace_id: str, span_id: str) -> list[TraceEventRecord]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
                 SELECT event_type, occurred_at, elapsed_ms, payload_json
                 FROM trace_events
-                WHERE run_id = ? AND node_id = ?
+                WHERE trace_id = ? AND span_id = ?
                 ORDER BY event_id
                 """,
-                (run_id, node_id),
+                (trace_id, span_id),
             ).fetchall()
         return [
             TraceEventRecord(
@@ -388,14 +388,14 @@ class TraceStore:
             for row in rows
         ]
 
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
+    def get_trace(self, trace_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT run_id, session_id, started_at, finished_at, elapsed_ms, status
-                FROM trace_runs WHERE run_id = ?
+                SELECT trace_id, session_id, started_at, finished_at, elapsed_ms, status
+                FROM traces WHERE trace_id = ?
                 """,
-                (run_id,),
+                (trace_id,),
             ).fetchone()
         return None if row is None else dict(row)
 
@@ -549,19 +549,19 @@ def _model_trace_payload(value: Any) -> Any:
 
 @dataclass
 class TraceRecorder:
-    """Translate observed Run events into a bounded, non-chat trace tree."""
+    """Translate observed Trace events into a bounded, non-chat trace tree."""
 
     store: TraceStore
-    run_id: str
+    trace_id: str
     session_id: str
     started_at: float = field(default_factory=time.time)
     started_ns: int = field(default_factory=time.monotonic_ns)
-    turn_nodes: dict[str, str] = field(default_factory=dict)
-    tool_nodes: dict[str, str] = field(default_factory=dict)
-    approval_nodes: dict[str, str] = field(default_factory=dict)
-    model_nodes: dict[str, str] = field(default_factory=dict)
-    model_attempt_nodes: dict[tuple[str, int], str] = field(default_factory=dict)
-    retry_nodes: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    turn_spans: dict[str, str] = field(default_factory=dict)
+    tool_spans: dict[str, str] = field(default_factory=dict)
+    approval_spans: dict[str, str] = field(default_factory=dict)
+    model_spans: dict[str, str] = field(default_factory=dict)
+    model_attempt_spans: dict[tuple[str, int], str] = field(default_factory=dict)
+    retry_spans: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
     approval_started_ns: dict[str, int] = field(default_factory=dict)
     tool_started_ns: dict[str, int] = field(default_factory=dict)
     generic_retry_started_ns: dict[str, list[int]] = field(default_factory=dict)
@@ -572,63 +572,63 @@ class TraceRecorder:
     turn_number: int = 0
 
     def __post_init__(self) -> None:
-        self.store.start_run(self.run_id, self.session_id, self.started_at)
+        self.store.start_trace(self.trace_id, self.session_id, self.started_at)
 
     def _clock(self) -> tuple[float, float]:
         return time.time(), (time.monotonic_ns() - self.started_ns) / 1_000_000
 
     def _turn(self, turn_id: str | None = None) -> str:
         key = turn_id or self.current_turn_id or f"observed-{self.turn_number or 1}"
-        node_id = self.turn_nodes.get(key)
-        if node_id is None:
+        span_id = self.turn_spans.get(key)
+        if span_id is None:
             self.turn_number += 1
             wall = self.pending_turn_started_at or time.time()
             started_ns = self.pending_turn_started_ns or time.monotonic_ns()
-            node_id = self.store.create_node(
-                self.run_id,
-                self.run_id,
+            span_id = self.store.create_span(
+                self.trace_id,
+                self.trace_id,
                 "turn",
                 f"轮次 {self.turn_number}",
                 wall,
                 details={"turn_id": key},
             )
-            self.turn_nodes[key] = node_id
+            self.turn_spans[key] = span_id
             self.turn_started_ns[key] = started_ns
             self.current_turn_id = key
             self.pending_turn_started_at = None
             self.pending_turn_started_ns = None
-        return node_id
+        return span_id
 
     def _tool(self, call_id: str, name: str, wall: float) -> str:
-        node_id = self.tool_nodes.get(call_id)
-        if node_id is None:
-            node_id = self.store.create_node(
-                self.run_id,
+        span_id = self.tool_spans.get(call_id)
+        if span_id is None:
+            span_id = self.store.create_span(
+                self.trace_id,
                 self._turn(),
                 "tool",
                 f"工具 · {name}",
                 wall,
                 details={"tool_call_id": call_id, "tool_name": name},
             )
-            self.tool_nodes[call_id] = node_id
-        return node_id
+            self.tool_spans[call_id] = span_id
+        return span_id
 
     def _record(
         self,
-        node_id: str,
+        span_id: str,
         event_type: str,
         wall: float,
         elapsed: float,
         payload: dict[str, Any],
     ) -> None:
         self.store.record_event(
-            self.run_id, node_id, event_type, wall, elapsed, payload,
+            self.trace_id, span_id, event_type, wall, elapsed, payload,
         )
 
     def record(self, event: object) -> None:
         wall, elapsed = self._clock()
         event_type = getattr(event, "type", type(event).__name__)
-        node_id = self.run_id
+        span_id = self.trace_id
         payload: dict[str, Any] = {}
 
         if isinstance(event, EmptySessionEvent) and event.type == "turn_start":
@@ -637,16 +637,16 @@ class TraceRecorder:
             self.pending_turn_started_ns = time.monotonic_ns()
             payload = {"type": "turn_start"}
         elif isinstance(event, ModelRequestStartEvent):
-            for retry_node, started_ns in self.retry_nodes.pop("provider-retry", []):
-                self.store.update_node(
-                    retry_node,
+            for retry_span, started_ns in self.retry_spans.pop("provider-retry", []):
+                self.store.update_span(
+                    retry_span,
                     status="completed",
                     ended_at=event.started_at,
                     elapsed_ms=(time.monotonic_ns() - started_ns) / 1_000_000,
                 )
             key = (event.request_id, event.attempt)
-            node_id = self.store.create_node(
-                self.run_id,
+            span_id = self.store.create_span(
+                self.trace_id,
                 self._turn(event.turn_id),
                 "model",
                 f"模型调用 · {'上下文压缩 · ' if event.purpose == 'compaction' else ''}"
@@ -660,8 +660,8 @@ class TraceRecorder:
                     "input": _model_trace_payload(event.input),
                 },
             )
-            self.model_attempt_nodes[key] = node_id
-            self.model_nodes[f"{event.turn_id}:{event.request_id}:{event.attempt}"] = node_id
+            self.model_attempt_spans[key] = span_id
+            self.model_spans[f"{event.turn_id}:{event.request_id}:{event.attempt}"] = span_id
             payload = {
                 "request_id": event.request_id,
                 "attempt": event.attempt,
@@ -669,7 +669,7 @@ class TraceRecorder:
             }
         elif isinstance(event, ModelRequestEndEvent):
             key = (event.request_id, event.attempt)
-            node_id = self.model_attempt_nodes[key]
+            span_id = self.model_attempt_spans[key]
             details: dict[str, Any] = {"error": event.error}
             label = None
             if event.response is not None:
@@ -694,8 +694,8 @@ class TraceRecorder:
                 if event.purpose == "compaction":
                     label += " · 上下文压缩"
                 label += f" · 第 {event.attempt} 次"
-            self.store.update_node(
-                node_id,
+            self.store.update_span(
+                span_id,
                 label=label,
                 status=event.status,
                 ended_at=event.ended_at,
@@ -715,23 +715,23 @@ class TraceRecorder:
             metadata = getattr(message, "metadata", {})
             raw_turn_id = metadata.get("turn_id") if isinstance(metadata, dict) else None
             turn_id = raw_turn_id if isinstance(raw_turn_id, str) else None
-            turn_node = self._turn(turn_id)
-            node_id = turn_node
+            turn_span = self._turn(turn_id)
+            span_id = turn_span
             payload = {"role": role, "turn_id": turn_id}
             if role == "assistant":
-                observed_node = next(
+                observed_span = next(
                     (
                         candidate
-                        for key, candidate in reversed(list(self.model_nodes.items()))
+                        for key, candidate in reversed(list(self.model_spans.items()))
                         if key.startswith(f"{turn_id or self.current_turn_id}:")
-                        and candidate in self.model_attempt_nodes.values()
+                        and candidate in self.model_attempt_spans.values()
                     ),
                     None,
                 )
-                if observed_node is not None:
-                    self._record(observed_node, event_type, wall, elapsed, payload)
+                if observed_span is not None:
+                    self._record(observed_span, event_type, wall, elapsed, payload)
                     return
-                model_key = f"{turn_id or self.current_turn_id}:{len(self.model_nodes)}"
+                model_key = f"{turn_id or self.current_turn_id}:{len(self.model_spans)}"
                 if event.type == "message_start":
                     usage = _usage_data(getattr(message, "usage", None))
                     provider = getattr(message, "provider", None)
@@ -743,7 +743,7 @@ class TraceRecorder:
                         "model": model,
                         "api": api,
                         "response_model": response_model,
-                        "input": "未记录：桌面 Run 事件不暴露 Provider 请求输入。",
+                        "input": "未记录：桌面 Trace 事件不暴露 Provider 请求输入。",
                         "output": "未记录：为避免复制聊天内容，Trace 不保存模型文本。",
                         "usage": usage,
                     }
@@ -752,53 +752,53 @@ class TraceRecorder:
                         label += " · " + "/".join(
                             str(part) for part in (provider, model) if part
                         )
-                    model_node = self.store.create_node(
-                        self.run_id,
-                        turn_node,
+                    model_span = self.store.create_span(
+                        self.trace_id,
+                        turn_span,
                         "model",
                         label,
                         wall,
                         status="completed",
                         details=details,
                     )
-                    self.model_nodes[model_key] = model_node
-                    node_id = model_node
+                    self.model_spans[model_key] = model_span
+                    span_id = model_span
                 else:
-                    model_node = next(
+                    model_span = next(
                         (
                             candidate
-                            for key, candidate in reversed(list(self.model_nodes.items()))
+                            for key, candidate in reversed(list(self.model_spans.items()))
                             if key.startswith(f"{turn_id or self.current_turn_id}:")
                         ),
-                        turn_node,
+                        turn_span,
                     )
                     if hasattr(message, "usage"):
-                        self.store.update_node(
-                            model_node,
+                        self.store.update_span(
+                            model_span,
                             details={"usage": _usage_data(message.usage)},
                         )
-                    node_id = model_node
-            self._record(node_id, event_type, wall, elapsed, payload)
+                    span_id = model_span
+            self._record(span_id, event_type, wall, elapsed, payload)
             return
         elif isinstance(event, ToolExecutionStartEvent):
-            node_id = self._tool(event.tool_call_id, event.tool_name, wall)
+            span_id = self._tool(event.tool_call_id, event.tool_name, wall)
             self.tool_started_ns[event.tool_call_id] = time.monotonic_ns()
             payload = {
                 "tool_call_id": event.tool_call_id,
                 "tool_name": event.tool_name,
                 "input": event.args,
             }
-            self.store.update_node(node_id, details={"input": event.args})
+            self.store.update_span(span_id, details={"input": event.args})
         elif isinstance(event, ToolExecutionUpdateEvent):
-            node_id = self._tool(event.tool_call_id, event.tool_name, wall)
+            span_id = self._tool(event.tool_call_id, event.tool_name, wall)
             payload = {
                 "tool_call_id": event.tool_call_id,
                 "tool_name": event.tool_name,
                 "partial_result": event.partial_result,
             }
-            self.store.update_node(node_id, details={"partial_output": event.partial_result})
+            self.store.update_span(span_id, details={"partial_output": event.partial_result})
         elif isinstance(event, ToolExecutionEndEvent):
-            node_id = self._tool(event.tool_call_id, event.tool_name, wall)
+            span_id = self._tool(event.tool_call_id, event.tool_name, wall)
             payload = {
                 "tool_call_id": event.tool_call_id,
                 "tool_name": event.tool_name,
@@ -811,24 +811,24 @@ class TraceRecorder:
                 if started is not None
                 else None
             )
-            self.store.update_node(
-                node_id,
+            self.store.update_span(
+                span_id,
                 status="failed" if event.is_error else "completed",
                 ended_at=wall,
                 elapsed_ms=duration,
                 details={"output": event.result, "is_error": event.is_error},
             )
         elif isinstance(event, ToolApprovalRequestedEvent):
-            tool_node = self._tool(event.tool_call_id, event.tool_name, wall)
-            node_id = self.store.create_node(
-                self.run_id,
-                tool_node,
+            tool_span = self._tool(event.tool_call_id, event.tool_name, wall)
+            span_id = self.store.create_span(
+                self.trace_id,
+                tool_span,
                 "approval",
                 f"审批 · {event.tool_name}",
                 wall,
                 details={"tool_call_id": event.tool_call_id},
             )
-            self.approval_nodes[event.tool_call_id] = node_id
+            self.approval_spans[event.tool_call_id] = span_id
             self.approval_started_ns[event.tool_call_id] = time.monotonic_ns()
             payload = {
                 "tool_call_id": event.tool_call_id,
@@ -837,7 +837,7 @@ class TraceRecorder:
                 "reason": event.reason,
             }
         elif isinstance(event, ToolApprovalResolvedEvent):
-            node_id = self.approval_nodes.get(
+            span_id = self.approval_spans.get(
                 event.tool_call_id,
                 self._tool(event.tool_call_id, event.tool_name, wall),
             )
@@ -853,8 +853,8 @@ class TraceRecorder:
                 "outcome": event.outcome,
                 "reason": event.reason,
             }
-            self.store.update_node(
-                node_id,
+            self.store.update_span(
+                span_id,
                 status=event.outcome,
                 ended_at=wall,
                 elapsed_ms=wait_ms,
@@ -863,8 +863,8 @@ class TraceRecorder:
             )
         elif isinstance(event, ToolRetryStartEvent):
             parent = self._tool(event.tool_call_id, event.tool_name, wall)
-            node_id = self.store.create_node(
-                self.run_id,
+            span_id = self.store.create_span(
+                self.trace_id,
                 parent,
                 "retry",
                 f"工具重试 · 第 {event.attempt:g} 次",
@@ -876,8 +876,8 @@ class TraceRecorder:
                     "error": event.error_message,
                 },
             )
-            self.retry_nodes.setdefault(event.tool_call_id, []).append(
-                (node_id, time.monotonic_ns()),
+            self.retry_spans.setdefault(event.tool_call_id, []).append(
+                (span_id, time.monotonic_ns()),
             )
             payload = {
                 "tool_call_id": event.tool_call_id,
@@ -887,12 +887,12 @@ class TraceRecorder:
                 "error": event.error_message,
             }
         elif isinstance(event, ToolRetryEndEvent):
-            retries = self.retry_nodes.get(event.tool_call_id, [])
+            retries = self.retry_spans.get(event.tool_call_id, [])
             if retries:
-                node_id, started = retries.pop()
+                span_id, started = retries.pop()
                 duration = (time.monotonic_ns() - started) / 1_000_000
-                self.store.update_node(
-                    node_id,
+                self.store.update_span(
+                    span_id,
                     status="completed" if event.success else "failed",
                     ended_at=wall,
                     elapsed_ms=duration,
@@ -903,7 +903,7 @@ class TraceRecorder:
                     },
                 )
             else:
-                node_id = self._tool(event.tool_call_id, event.tool_name, wall)
+                span_id = self._tool(event.tool_call_id, event.tool_name, wall)
             payload = {
                 "tool_call_id": event.tool_call_id,
                 "success": event.success,
@@ -912,8 +912,8 @@ class TraceRecorder:
             }
         elif isinstance(event, RetryStartEvent):
             key = "provider-retry"
-            node_id = self.store.create_node(
-                self.run_id,
+            span_id = self.store.create_span(
+                self.trace_id,
                 self._turn(),
                 "retry",
                 f"模型重试 · 第 {event.attempt:g} 次",
@@ -925,7 +925,7 @@ class TraceRecorder:
                     "error": event.error_message,
                 },
             )
-            self.retry_nodes.setdefault(key, []).append((node_id, time.monotonic_ns()))
+            self.retry_spans.setdefault(key, []).append((span_id, time.monotonic_ns()))
             payload = {
                 "attempt": event.attempt,
                 "max_attempts": event.max_attempts,
@@ -933,12 +933,12 @@ class TraceRecorder:
                 "error": event.error_message,
             }
         elif isinstance(event, AutoRetryEndEvent):
-            retries = self.retry_nodes.get("provider-retry", [])
+            retries = self.retry_spans.get("provider-retry", [])
             if retries:
-                node_id, started = retries.pop()
+                span_id, started = retries.pop()
                 duration = (time.monotonic_ns() - started) / 1_000_000
-                self.store.update_node(
-                    node_id,
+                self.store.update_span(
+                    span_id,
                     status=(
                         "completed" if event.success
                         else "cancelled" if event.final_error == "cancelled"
@@ -958,7 +958,7 @@ class TraceRecorder:
                 "final_error": event.final_error,
             }
         elif isinstance(event, TurnEndEvent):
-            node_id = self._turn()
+            span_id = self._turn()
             turn_key = self.current_turn_id or ""
             turn_started = self.turn_started_ns.get(turn_key)
             turn_duration = (
@@ -966,8 +966,8 @@ class TraceRecorder:
                 if turn_started is not None
                 else None
             )
-            self.store.update_node(
-                node_id,
+            self.store.update_span(
+                span_id,
                 status="completed",
                 ended_at=wall,
                 elapsed_ms=turn_duration,
@@ -981,7 +981,7 @@ class TraceRecorder:
             }
         elif isinstance(event, DelegationEvent):
             payload = {
-                "parent_run_id": event.parent_run_id, "child_run_id": event.child_run_id,
+                "parent_trace_id": event.parent_trace_id, "child_trace_id": event.child_trace_id,
                 "child_session_id": event.child_session_id,
                 "agent_id": event.agent_id, "status": event.status,
             }
@@ -1010,19 +1010,19 @@ class TraceRecorder:
             if inner.type in {"done", "error"}:
                 message = inner.message if inner.type == "done" else inner.error
                 turn_id = getattr(message, "metadata", {}).get("turn_id")
-                model_node = next(
+                model_span = next(
                     (
                         candidate
-                        for key, candidate in reversed(list(self.model_nodes.items()))
+                        for key, candidate in reversed(list(self.model_spans.items()))
                         if key.startswith(f"{turn_id or self.current_turn_id}:")
                     ),
                     None,
                 )
-                if model_node is not None:
-                    node_id = model_node
-                    if model_node not in self.model_attempt_nodes.values():
-                        self.store.update_node(
-                            model_node,
+                if model_span is not None:
+                    span_id = model_span
+                    if model_span not in self.model_attempt_spans.values():
+                        self.store.update_span(
+                            model_span,
                             status="failed" if inner.type == "error" else "completed",
                             details={"usage": _usage_data(event.usage)},
                         )
@@ -1038,13 +1038,13 @@ class TraceRecorder:
         else:
             return
 
-        self._record(node_id, event_type, wall, elapsed, payload)
+        self._record(span_id, event_type, wall, elapsed, payload)
 
     def finish(self, status: str) -> None:
         finished_at = time.time()
         elapsed_ms = (time.monotonic_ns() - self.started_ns) / 1_000_000
-        self.store.finish_run(
-            self.run_id,
+        self.store.finish_trace(
+            self.trace_id,
             finished_at=finished_at,
             elapsed_ms=elapsed_ms,
             status=status,

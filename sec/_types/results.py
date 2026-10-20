@@ -1,15 +1,16 @@
-"""定义单次 Run 的结果和用量数据。"""
+"""定义单次 Trace 的结果和用量数据。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from .messages import AssistantMessage, Message
+from .trajectory import Trajectory, trajectory_from_messages
 
 
 @dataclass(frozen=True)
-class RunUsage:
-    """汇总单次 Run 的用量，并记录无法确认的 Provider 计量。"""
+class TraceUsage:
+    """汇总单次 Trace 的用量，并记录无法确认的 Provider 计量。"""
 
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -31,8 +32,8 @@ class RunUsage:
 
 
 @dataclass(frozen=True)
-class RunResult:
-    """表示成功完成的 Run；执行失败会作为异常抛给调用方。"""
+class TraceResult:
+    """表示成功完成的 Trace；执行失败会作为异常抛给调用方。"""
 
     final_message: AssistantMessage
     messages: tuple[Message, ...]
@@ -42,7 +43,7 @@ class RunResult:
     retries: int = 0
     tool_attempts: int = 0
     tool_retries: int = 0
-    usage: RunUsage = field(default_factory=RunUsage)
+    usage: TraceUsage = field(default_factory=TraceUsage)
 
     @property
     def text(self) -> str:
@@ -55,3 +56,8 @@ class RunResult:
         if isinstance(self.final_message, AssistantMessage):
             return self.final_message.stop_reason
         return None
+
+    @property
+    def trajectory(self) -> Trajectory:
+        """返回本次 Trace 新增消息拍平后的行为序列。"""
+        return trajectory_from_messages(self.messages)

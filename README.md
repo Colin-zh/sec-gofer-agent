@@ -65,7 +65,7 @@ pip 安装则使用 `pip install 'sec-gofer-agent[desktop,opengauss]'`。
 Extension 安装到同一 `.venv` 后，可通过 `--extension <name>` 显式启用；
 交互 CLI 也支持 `/reload` 查看已安装扩展，并用 `/reload enable <name...>` /
 `/reload disable <name...>` 在当前 Client 生命周期内切换启用集合。
-进程内扩展启停仅影响后续 Run；需要工具代码热更新时使用显式 tools-only
+进程内扩展启停仅影响后续 Trace；需要工具代码热更新时使用显式 tools-only
 worker 模式。AgentCard、Skill 和 MCP 管理通过共享核心资源 API 实现。
 详细说明见[桌面应用](sec/apps/desktop/README.md)。
 
@@ -82,13 +82,13 @@ worker 模式。AgentCard、Skill 和 MCP 管理通过共享核心资源 API 实
 │ ◉  Tool mode           normal
 │ ✦  Resources           1 Skills · 1 Prompts
 │
-│ Ctrl+C cancel Run · Ctrl+D exit · Tab complete · /help commands
+│ Ctrl+C cancel Trace · Ctrl+D exit · Tab complete · /help commands
 │ Press Ctrl+O for full startup help and loaded resources.
 ╰
 you >
 ```
 
-发出消息后，Sec 会显示流式回答和 Run/工具状态。工具需要审批时，会显示工具名称、参数和策略原因，等待输入 `y` 或 `n`；默认拒绝。交互终端支持多行编辑和命令补全：Enter 发送，Alt+Enter 换行，Run 运行中按 Alt+S steer 当前 Run，按 Alt+F 将当前输入排到 Run 之后，Tab 补全命令。Run 运行中直接发送普通文本也会排为 follow-up。
+发出消息后，Sec 会显示流式回答和 Trace/工具状态。工具需要审批时，会显示工具名称、参数和策略原因，等待输入 `y` 或 `n`；默认拒绝。交互终端支持多行编辑和命令补全：Enter 发送，Alt+Enter 换行，Trace 运行中按 Alt+S steer 当前 Trace，按 Alt+F 将当前输入排到 Trace 之后，Tab 补全命令。Trace 运行中直接发送普通文本也会排为 follow-up。
 
 终端不支持原始按键输入时会退回逐行输入界面；非交互式管道输入没有审批提示界面，需确认的工具调用会拒绝。详见[CLI 界面与操作指南](docs/tutorials/03-use-the-cli.md)。
 
@@ -108,7 +108,7 @@ with SecClient("assistant", "遵循用户指令。") as client:
     print(second.text)
 ```
 
-需要 asyncio、流式事件、Session 恢复或精细 Run 控制时使用 `AsyncSecClient`。两类 Client 都应使用上下文管理器；失败通过异常传播，成功的 `RunResult` 提供文本、调用次数和用量信息。SDK Client 默认不附加 CLI 的内置文件/Bash 工具；通过 `tools=` 或 Extension 显式提供工具。完整示例见[同步 Client](docs/tutorials/07-build-a-sync-client.md)、[异步与流式 Client](docs/tutorials/08-build-an-async-streaming-client.md)和[Run 控制](docs/tutorials/09-control-runs-and-consume-events.md)。
+需要 asyncio、流式事件、Session 恢复或精细 Trace 控制时使用 `AsyncSecClient`。两类 Client 都应使用上下文管理器；失败通过异常传播，成功的 `TraceResult` 提供文本、调用次数和用量信息。SDK Client 默认不附加 CLI 的内置文件/Bash 工具；通过 `tools=` 或 Extension 显式提供工具。完整示例见[同步 Client](docs/tutorials/07-build-a-sync-client.md)、[异步与流式 Client](docs/tutorials/08-build-an-async-streaming-client.md)和[Trace 控制](docs/tutorials/09-control-traces-and-consume-events.md)。
 
 ## 选择使用方式
 
@@ -120,16 +120,17 @@ with SecClient("assistant", "遵循用户指令。") as client:
 
 ## 当前功能
 
-- **CLI**：交互式与管道式对话、命令补全、Run 控制、权限模式、Session 分支和便携式导入/导出。
-- **Python SDK**：同步和异步 Client、流式响应、工具调用、Run 事件与运行控制。
+- **CLI**：交互式与管道式对话、命令补全、Trace 控制、权限模式、Session 分支和便携式导入/导出。
+- **Python SDK**：同步和异步 Client、流式响应、工具调用、Trace 事件与运行控制。
 - **工具与策略**：类型化工具定义、参数校验、工作区内置文件工具、工具审批及可替换 Policy/Executor。
 - **AgentCard 与能力目录**：选择和恢复智能体身份；Skills 支持模型原生发现、按需加载和确定性必用规则；Prompts 保留为输入模板。
 - **会话内刷新**：原子发布能力 generation，进行中的模型请求和完整工具批次保留旧绑定，后续请求使用新版本。
 - **MCP 与工具 worker**：MCP 连接、发现和调用沿用核心工具审批链；显式工具 worker 支持无需重启宿主的代码更新。
 - **多 Agent 委派**：子任务使用独立 Session，继承能力上限、共享每轮预算、审批和取消控制。
-- **Extensions**：通过 Python entry point 显式启用，可注册工具、Provider、Policy、SessionStore、UI handler、CLI 命令和 Run hooks。
+- **Extensions**：通过 Python entry point 显式启用，可注册工具、Provider、Policy、SessionStore、UI handler、CLI 命令和 Trace hooks。
 - **Session 与存储**：进程内或 SQLite SessionStore、会话恢复和分支操作；提供可实现的 ObjectStore 协议。
 - **运行可靠性**：模型及安全声明工具的有限重试、可控的工具错误反馈、每轮调用预算、用量统计和可选上下文压缩。
+- **可观测模型**：一次执行是一棵 Trace（其原子步骤为 Span）；`Trajectory` 提供跨多轮对话拍扁后的扁平行为序列（用户/助手/工具步骤），与技术细节解耦，便于检索和展示。
 
 ## 安全与支持边界
 

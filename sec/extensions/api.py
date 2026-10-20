@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from sec.apps.extension_ui import ExtensionUIRequest, ExtensionUIResponse
-from sec._types.extensions import AfterRunHook, BeforeRunHook, RunEventHook
+from sec._types.hooks import HOOK_NAMES, HookHandler, HookName
 from sec._types.policy import PolicyEngine
 from sec._types.providers import ModelProvider, StreamingModelProvider
 from sec._types.storage import SessionStoreProtocol
@@ -39,9 +38,9 @@ class ExtensionCatalog:
         self._storage_backends: dict[str, StorageFactory] = {}
         self._ui_handlers: dict[str, UIHandler] = {}
         self._commands: dict[str, SlashCommand] = {}
-        self._before_run: list[BeforeRunHook] = []
-        self._after_run: list[AfterRunHook] = []
-        self._run_events: list[RunEventHook] = []
+        self._hooks: dict[HookName, list[HookHandler]] = {
+            name: [] for name in HOOK_NAMES
+        }
         self._owners: dict[tuple[str, str], str] = {}
 
     @property
@@ -69,16 +68,10 @@ class ExtensionCatalog:
         return tuple(self._commands.values())
 
     @property
-    def before_run_hooks(self) -> tuple[BeforeRunHook, ...]:
-        return tuple(self._before_run)
-
-    @property
-    def after_run_hooks(self) -> tuple[AfterRunHook, ...]:
-        return tuple(self._after_run)
-
-    @property
-    def run_event_hooks(self) -> tuple[RunEventHook, ...]:
-        return tuple(self._run_events)
+    def hooks(self) -> Mapping[HookName, tuple[HookHandler, ...]]:
+        return MappingProxyType(
+            {name: tuple(handlers) for name, handlers in self._hooks.items()}
+        )
 
     def owner_of(self, category: str, name: str) -> str | None:
         """Return the extension that registered a named contribution."""
@@ -158,16 +151,18 @@ class ExtensionAPI:
         self._catalog._claim("command", command.name, self.name)
         self._catalog._commands[command.name] = command
 
-    def register_before_run_hook(self, hook: BeforeRunHook) -> None:
-        self._register_hook(hook, self._catalog._before_run, "before-run hook")
+    def register_hook(self, name: HookName, handler: HookHandler) -> None:
+        """注册一个变换型 hook（对应 pi-main 的 on()）。
 
-    def register_after_run_hook(self, hook: AfterRunHook) -> None:
-        self._register_hook(hook, self._catalog._after_run, "after-run hook")
-
-    def register_run_event_hook(self, hook: RunEventHook) -> None:
-        if inspect.iscoroutinefunction(hook):
-            raise TypeError("Run event hooks must be synchronous and non-blocking")
-        self._register_hook(hook, self._catalog._run_events, "Run event hook")
+        handler 接收 (event, HookContext)，可同步或异步，返回对应 hook 的
+        result 类型或 None；聚合语义由 sec._runtime.hooks.HookExecutor 施加。
+        """
+        self._ensure_active()
+        if name not in HOOK_NAMES:
+            raise ValueError(f"unknown hook name {name!r}")
+        if not callable(handler):
+            raise TypeError("hook handler must be callable")
+        self._catalog._hooks[name].append(handler)
 
     def _register_named(
         self,
@@ -186,12 +181,6 @@ class ExtensionAPI:
             raise TypeError("policy must implement decide()")
         self._catalog._claim(category, name, self.name)
         target[name] = value
-
-    def _register_hook(self, hook: Callable[..., Any], target: list[Any], label: str) -> None:
-        self._ensure_active()
-        if not callable(hook):
-            raise TypeError(f"{label} must be callable")
-        target.append(hook)
 
     def _ensure_active(self) -> None:
         if not self._active:

@@ -35,7 +35,7 @@ def build_interrupted_tool_result_message(
             content=[
                 TextContent(
                     text=(
-                        "The previous Run ended before this tool result was committed. "
+                        "The previous Trace ended before this tool result was committed. "
                         "Its outcome is unknown; the tool was not replayed during recovery."
                     )
                 )

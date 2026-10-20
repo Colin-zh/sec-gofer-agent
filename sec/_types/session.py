@@ -15,6 +15,7 @@ from .content import (
 from .json import JSONValue
 from .messages import Message, SystemMessage, Usage
 from .models import Model, ThinkingLevel
+from .trajectory import Trajectory, trajectory_from_messages
 
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
@@ -246,6 +247,11 @@ class SessionSnapshot:
             if isinstance(entry, MessageEntry)
         )
 
+    @property
+    def trajectory(self) -> Trajectory:
+        """返回活动路径消息拍平后的行为序列。"""
+        return trajectory_from_messages(self.messages)
+
 
 @dataclass(frozen=True)
 class SessionSummary:
@@ -314,7 +320,7 @@ class SessionTokens:
 
 @dataclass(frozen=True)
 class SessionStats:
-    """表示整段会话聚合统计，与单次 Run 的用量结果相互独立。"""
+    """表示整段会话聚合统计，与单次 Trace 的用量结果相互独立。"""
 
     session_id: str
     user_messages: float

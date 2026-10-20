@@ -29,6 +29,7 @@ from sec._types.messages import (
 from sec.config import ProviderSettings
 from sec.exceptions import ProviderProtocolError, RetryableProviderError
 from sec.providers._errors import retryable_status_error
+from sec._types.providers import ModelRequestOptions
 from sec._types.streaming import ModelResponseCompleted, ModelStreamEvent, ModelTextDelta
 from sec.tools.tool import ToolDefinition
 
@@ -60,10 +61,11 @@ class OpenAIProvider:
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AssistantMessage:
         """请求完整响应，并消费流直到 Provider 收尾。"""
         response: AssistantMessage | None = None
-        async for item in self.stream(messages, tools):
+        async for item in self.stream(messages, tools, options):
             if isinstance(item, ModelResponseCompleted):
                 response = item.message
         if response is None:
@@ -74,10 +76,12 @@ class OpenAIProvider:
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AsyncIterator[ModelStreamEvent]:
         """逐步发送文本增量，结束时产出完整消息及组装后的工具调用。"""
         wire_messages = _to_openai_messages(messages)
         wire_tools = _to_openai_tools(tools)
+        stream_options = {**{"include_usage": True}, **options.stream_options}
         try:
             response_stream = await self._client.chat.completions.create(
                 model=self._settings.model,
@@ -85,7 +89,7 @@ class OpenAIProvider:
                 tools=wire_tools,
                 max_completion_tokens=self._settings.max_output_tokens,
                 stream=True,
-                stream_options={"include_usage": True},
+                stream_options=stream_options,
             )
         except APIConnectionError as exc:
             raise RetryableProviderError(

@@ -27,6 +27,7 @@ from sec._types.messages import (
 from sec.config import ProviderSettings
 from sec.exceptions import ProviderProtocolError, RetryableProviderError
 from sec.providers._errors import retryable_status_error
+from sec._types.providers import ModelRequestOptions
 from sec.tools.tool import ToolDefinition
 from sec._types.streaming import ModelResponseCompleted, ModelStreamEvent, ModelTextDelta
 
@@ -49,10 +50,11 @@ class AnthropicProvider:
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AssistantMessage:
         """请求完整响应，并消费流直到 Provider 收尾。"""
         response: AssistantMessage | None = None
-        async for item in self.stream(messages, tools):
+        async for item in self.stream(messages, tools, options):
             if isinstance(item, ModelResponseCompleted):
                 response = item.message
         if response is None:
@@ -63,6 +65,7 @@ class AnthropicProvider:
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AsyncIterator[ModelStreamEvent]:
         """逐步发送文本增量，最后返回已完整组装的 assistant 消息。"""
         system, wire_messages = _to_anthropic_messages(messages)
@@ -76,6 +79,7 @@ class AnthropicProvider:
         wire_tools = _to_anthropic_tools(tools)
         if wire_tools:
             request["tools"] = wire_tools
+        request.update(options.stream_options)
 
         try:
             async with self._client.messages.stream(**request) as response_stream:

@@ -51,5 +51,7 @@ dist/
 PLAN.md
 TODO.md
 ARCHITECTURE.md
+tests/
+/docs/*.md
 /extensions/
 /examples/

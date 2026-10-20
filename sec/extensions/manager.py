@@ -9,6 +9,7 @@ from importlib.metadata import EntryPoint, entry_points
 from typing import Iterable, Mapping
 
 from sec._types.extensions import Extension
+from sec._types.hooks import HOOK_NAMES
 from sec.extensions.api import ExtensionAPI, ExtensionCatalog
 
 ENTRY_POINT_GROUP = "sec.extensions"
@@ -323,9 +324,8 @@ def _merge_catalogs(
                     target[name] = value
                 else:
                     target.append(value)
-        merged._before_run.extend(source.before_run_hooks)
-        merged._after_run.extend(source.after_run_hooks)
-        merged._run_events.extend(source.run_event_hooks)
+        for hook_name in HOOK_NAMES:
+            merged._hooks[hook_name].extend(source._hooks[hook_name])
     return merged
 
 

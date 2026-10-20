@@ -10,11 +10,22 @@ RetryableProviderError 显式声明可重试的暂时性请求失败。
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
 
 from sec._types.messages import AssistantMessage, Message
 from sec._types.streaming import ModelStreamEvent
 from sec.tools.tool import ToolDefinition
+
+
+@dataclass(frozen=True)
+class ModelRequestOptions:
+    """可被 before_request hook 调整的单次模型请求选项。
+
+    Provider 适配器将其合并进自身硬编码的请求参数；未知键应被安全忽略。
+    """
+
+    stream_options: dict[str, Any] = field(default_factory=dict)
 
 
 class ModelProvider(Protocol):
@@ -24,6 +35,7 @@ class ModelProvider(Protocol):
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AssistantMessage:
         """返回完整消息；可重试的暂时性错误应抛出 RetryableProviderError。"""
 
@@ -36,6 +48,7 @@ class StreamingModelProvider(Protocol):
         self,
         messages: Sequence[Message],
         tools: Sequence[ToolDefinition],
+        options: ModelRequestOptions,
     ) -> AsyncIterator[ModelStreamEvent]:
         """返回文本增量和最终完整消息，并传播取消及 RetryableProviderError。"""
 

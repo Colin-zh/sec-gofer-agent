@@ -24,8 +24,8 @@ from sec.apps.cli.chat_commands import (
 )
 from sec.apps.cli.resources import CliResourceManager
 from sec.apps.cli.session_io import write_session_file
-from sec.agent import Run
-from sec.tools import create_builtin_tools
+from sec.agent import Trace
+from sec.tools import Tool, create_builtin_tools
 from sec.apps.desktop.settings import ExtensionSettings
 from sec.apps.desktop.tool_page import ToolEntry, ToolInventory
 from sec._types.session import CustomMessageEntry, MessageEntry
@@ -43,6 +43,26 @@ def _status_value(status: object, *names: str, default: object = "") -> object:
     )
 
 
+def _classify_tool(tool: Tool) -> tuple[bool, str | None, str | None, str]:
+    """按工具来源分类：内置只读，MCP/扩展可启停其来源。
+
+    返回 (builtin, origin_kind, origin_name, source_label)。
+    """
+    source = tool.source
+    if source == "sec.builtin.workspace":
+        return True, None, None, "内置工具"
+    if source.startswith("mcp/"):
+        server = source.split("/")[1]
+        return False, "mcp", server, f"MCP 服务 {server}"
+    if source.startswith("worker/"):
+        extension = source.split("/")[1]
+        return False, "worker", extension, f"插件 {extension}（worker）"
+    if source.startswith("extension/"):
+        extension = source.split("/")[1]
+        return False, "extension", extension, f"插件 {extension}"
+    return True, None, None, "由 Agent / 技能 提供"
+
+
 class SecRuntime(QObject):
     """Own an AsyncSecClient on a background asyncio event loop."""
 
@@ -51,6 +71,7 @@ class SecRuntime(QObject):
     text_delta = Signal(str)
     status_changed = Signal(str)
     approval_requested = Signal(str, str, str)
+    extension_ui_requested = Signal(str, object)
     command_result = Signal(str, str)
     command_completions = Signal(object)
     session_changed = Signal(str)
@@ -63,8 +84,8 @@ class SecRuntime(QObject):
     exit_requested = Signal()
     run_finished = Signal()
     run_failed = Signal(str)
-    trace_runs_updated = Signal(object, object, object)
-    trace_run_updated = Signal(str)
+    traces_updated = Signal(object, object, object)
+    trace_updated = Signal(str)
 
     def __init__(
         self,
@@ -92,12 +113,15 @@ class SecRuntime(QObject):
         self._resources: CliResourceManager | None = None
         self._extension_settings: ExtensionSettings | None = None
         self._configuring = False
-        self._active_run: Run | None = None
+        self._active_trace: Trace | None = None
         self._pending_approval_id: str | None = None
         self._approval_future: asyncio.Future[bool] | None = None
         self._pending_approval_name: str | None = None
         self._approval_writing = False
         self._approval_cancelled = False
+        self._pending_ui_id: str | None = None
+        self._ui_future: asyncio.Future[dict] | None = None
+        self._ui_cancelled = False
         self._queued_resource_inputs: list[tuple[str, str, frozenset[str]]] = []
         self._prompt_task: asyncio.Task[object] | None = None
         self._send_lock: asyncio.Lock | None = None
@@ -106,17 +130,17 @@ class SecRuntime(QObject):
     def trace_store(self) -> TraceStore:
         return self._trace_store
 
-    def _publish_trace_runs(self, preferred_run_id: str | None = None) -> None:
+    def _publish_traces(self, preferred_trace_id: str | None = None) -> None:
         try:
             session_id = self._client.session.id if self._client is not None else None
             runs = (
-                self._trace_store.list_runs(session_id=session_id)
+                self._trace_store.list_traces(session_id=session_id)
                 if session_id is not None
                 else []
             )
-            self.trace_runs_updated.emit(
+            self.traces_updated.emit(
                 runs,
-                preferred_run_id,
+                preferred_trace_id,
                 session_id,
             )
         except Exception as error:
@@ -143,10 +167,10 @@ class SecRuntime(QObject):
             async with self._send_lock:
                 task = self._prompt_task
                 if task is not None and not task.done():
-                    self._cancel_run()
+                    self._cancel_trace()
                     await asyncio.shield(task)
                 next_task = asyncio.create_task(self._handle_input(text))
-                # Let the new Run acquire its Session before another send can stop it.
+                # Let the new Trace acquire its Session before another send can stop it.
                 await asyncio.sleep(0)
             await next_task
         except Exception as error:
@@ -161,7 +185,7 @@ class SecRuntime(QObject):
 
     def cancel_run(self) -> None:
         loop = self._require_loop()
-        loop.call_soon_threadsafe(self._cancel_run)
+        loop.call_soon_threadsafe(self._cancel_trace)
 
     def configure_resource(self, kind: str, name: str, enabled: bool) -> None:
         loop = self._require_loop()
@@ -193,7 +217,7 @@ class SecRuntime(QObject):
             raise RuntimeError("Sec Client is not ready")
         if self._configuring:
             raise RuntimeError("配置正在更新，请稍后重试。")
-        if self._active_run is not None and not self._active_run.done:
+        if self._active_trace is not None and not self._active_trace.done:
             raise RuntimeError("请先停止或完成当前任务，再修改配置。")
         return client, commands
 
@@ -314,7 +338,7 @@ class SecRuntime(QObject):
             await client.select_agent(agent_id)
             pending = client.pending_agent_id
             message = (
-                f"Agent {agent_id} queued for the next Run."
+                f"Agent {agent_id} queued for the next Trace."
                 if pending == agent_id
                 else f"Agent {agent_id} selected."
             )
@@ -331,7 +355,7 @@ class SecRuntime(QObject):
 
     def submit_control(self, command: str, text: str) -> None:
         if command not in {"steer", "followup"}:
-            raise ValueError("unsupported Run control command")
+            raise ValueError("unsupported Trace control command")
         self.submit_input(f"/{command} {shlex.quote(text)}")
 
     def refresh_sessions(self) -> None:
@@ -448,7 +472,7 @@ class SecRuntime(QObject):
             self._resources = client.resources
             self._commands = create_chat_commands(
                 client,
-                get_active_run=lambda: self._active_run,
+                get_active_trace=lambda: self._active_trace,
                 permission_policy=self._policy,
                 on_session_change=self._on_session_changed,
                 resource_manager=self._resources,
@@ -459,13 +483,13 @@ class SecRuntime(QObject):
             self.session_changed.emit(client.session.id)
             self._publish_session_history()
             await self._refresh_sessions()
-            self._publish_trace_runs()
+            self._publish_traces()
             self.ready.emit(str(self.workspace))
             if self._shutdown_requested.is_set():
                 return
             await self._shutdown.wait()
-            if self._active_run is not None and not self._active_run.done:
-                self._active_run.cancel()
+            if self._active_trace is not None and not self._active_trace.done:
+                self._active_trace.cancel()
         self._client = None
         self._commands = None
 
@@ -494,7 +518,7 @@ class SecRuntime(QObject):
                 await self._refresh_sessions()
                 return
 
-        run = self._active_run
+        run = self._active_trace
         if run is not None and not run.done:
             if run.follow_up(text):
                 self.command_result.emit(
@@ -503,7 +527,7 @@ class SecRuntime(QObject):
                 )
             else:
                 self.command_result.emit(
-                    "The active Run no longer accepts follow-up input.",
+                    "The active Trace no longer accepts follow-up input.",
                     "error",
                 )
             return
@@ -521,11 +545,11 @@ class SecRuntime(QObject):
         if outcome.should_exit:
             self.exit_requested.emit()
         if outcome.run_prompt is not None:
-            run = self._active_run
+            run = self._active_trace
             if run is not None and not run.done:
                 if not run.follow_up(outcome.run_prompt):
                     self.command_result.emit(
-                        "The active Run no longer accepts follow-up input.",
+                        "The active Trace no longer accepts follow-up input.",
                         "error",
                     )
                 elif outcome.display_prompt is not None and self._client is not None:
@@ -557,12 +581,12 @@ class SecRuntime(QObject):
         if client is None:
             self.run_failed.emit("Sec Client is not ready.")
             return
-        if self._active_run is not None and not self._active_run.done:
-            self.run_failed.emit("A Sec Run is already active.")
+        if self._active_trace is not None and not self._active_trace.done:
+            self.run_failed.emit("A Sec Trace is already active.")
             return
 
         run = client.run(prompt)
-        self._active_run = run
+        self._active_trace = run
         self._prompt_task = asyncio.current_task()
         recorder: TraceRecorder | None = None
         trace_status = "failed"
@@ -570,22 +594,22 @@ class SecRuntime(QObject):
             recorder = TraceRecorder(self._trace_store, run.id, client.session.id)
         except Exception as error:
             self.command_result.emit(
-                f"Trace 未能开始记录（{type(error).__name__}）；Run 将继续。",
+                f"Trace 未能开始记录（{type(error).__name__}）；Trace 将继续。",
                 "error",
             )
-        self.trace_run_updated.emit(run.id)
-        self._publish_trace_runs(run.id)
+        self.trace_updated.emit(run.id)
+        self._publish_traces(run.id)
         self.status_changed.emit("正在运行")
         try:
             async for event in run.events():
                 if recorder is not None:
                     try:
                         recorder.record(event)
-                        self.trace_run_updated.emit(run.id)
+                        self.trace_updated.emit(run.id)
                     except Exception as error:
                         recorder = None
                         self.command_result.emit(
-                            f"Trace 写入失败（{type(error).__name__}）；后续事件未记录，Run 将继续。",
+                            f"Trace 写入失败（{type(error).__name__}）；后续事件未记录，Trace 将继续。",
                             "error",
                         )
                 if isinstance(event, AgentSettledEvent):
@@ -606,6 +630,13 @@ class SecRuntime(QObject):
                         event.tool_name,
                         event.args,
                         event.reason,
+                    )
+                elif event.type == "extension_ui_requested":
+                    await self._request_extension_ui(
+                        run,
+                        event.request_id,
+                        event.extension_name,
+                        event.request,
                     )
                 elif event.type == "tool_execution_start":
                     self.status_changed.emit(f"工具运行中：{event.tool_name}")
@@ -662,7 +693,7 @@ class SecRuntime(QObject):
                         "error",
                     )
             self._queued_resource_inputs.clear()
-            self._active_run = None
+            self._active_trace = None
             self._prompt_task = None
             self._pending_approval_id = None
             self._pending_approval_name = None
@@ -670,14 +701,14 @@ class SecRuntime(QObject):
             self._approval_cancelled = False
             self._publish_session_history()
             await self._refresh_sessions()
-            self.trace_run_updated.emit(run.id)
-            self._publish_trace_runs()
+            self.trace_updated.emit(run.id)
+            self._publish_traces()
             self.run_finished.emit()
 
     def _on_session_changed(self, session_id: str) -> None:
         self.session_changed.emit(session_id)
         self._publish_session_history()
-        self._publish_trace_runs()
+        self._publish_traces()
 
     def _publish_session_history(self) -> None:
         client = self._client
@@ -824,7 +855,7 @@ class SecRuntime(QObject):
             pending_agent = client.pending_agent_id
             for card in client.agent_cards:
                 state = (
-                    "Queued for the next Run."
+                    "Queued for the next Trace."
                     if card.id == pending_agent
                     else "Currently selected."
                     if card.id == selected_agent
@@ -832,7 +863,7 @@ class SecRuntime(QObject):
                 )
                 description = card.description
                 if card.id == pending_agent:
-                    description += " · 已排队，将在下一次 Run 生效"
+                    description += " · 已排队，将在下一次 Trace 生效"
                 entries.append(ToolEntry(
                     "agent",
                     card.id,
@@ -856,6 +887,23 @@ class SecRuntime(QObject):
                     f"{name} · {state}",
                     "\n".join(details),
                     bool(enabled_state),
+                ))
+
+            for tool in client.available_tools:
+                builtin, origin_kind, origin_name, source_label = _classify_tool(tool)
+                description = tool.definition.description or ""
+                content = f"{source_label} · 风险等级 {tool.risk_level}"
+                if description:
+                    content += f"\n\n{description}"
+                entries.append(ToolEntry(
+                    "tool",
+                    tool.definition.name,
+                    description,
+                    content,
+                    True,
+                    builtin=builtin,
+                    origin_kind=origin_kind,
+                    origin_name=origin_name,
                 ))
 
         if client is not None:
@@ -896,7 +944,7 @@ class SecRuntime(QObject):
         self.resources_updated.emit(ToolInventory(
             tuple(entries),
             self._policy.mode_name if self._policy is not None else "normal",
-            self._configuring or (self._active_run is not None and not self._active_run.done),
+            self._configuring or (self._active_trace is not None and not self._active_trace.done),
         ))
 
     async def _refresh_sessions(self) -> None:
@@ -923,7 +971,7 @@ class SecRuntime(QObject):
 
     async def _request_approval(
         self,
-        run: Run,
+        run: Trace,
         tool_call_id: str,
         tool_name: str,
         args: object,
@@ -978,14 +1026,18 @@ class SecRuntime(QObject):
         self._approval_future = None
         self._publish_session_history()
 
-    def _cancel_run(self) -> None:
+    def _cancel_trace(self) -> None:
         self._approval_cancelled = True
-        run = self._active_run
+        self._ui_cancelled = True
+        run = self._active_trace
         if run is not None and not self._approval_writing:
             run.cancel()
         future = self._approval_future
         if future is not None and not future.done():
             future.set_result(False)
+        ui_future = self._ui_future
+        if ui_future is not None and not ui_future.done():
+            ui_future.set_result({"type": "extension_ui_response", "cancelled": True})
 
     def _resolve_approval(self, tool_call_id: str, approved: bool) -> None:
         future = self._approval_future
@@ -996,3 +1048,44 @@ class SecRuntime(QObject):
         ):
             return
         future.set_result(approved)
+
+    async def _request_extension_ui(
+        self,
+        run: Trace,
+        request_id: str,
+        extension_name: str,
+        request: dict,
+    ) -> None:
+        if request.get("method") == "notify":
+            self.status_changed.emit(
+                f"扩展 {extension_name}：{request.get('message', '')}"
+            )
+            return
+        future = asyncio.get_running_loop().create_future()
+        self._pending_ui_id = request_id
+        self._ui_future = future
+        self._ui_cancelled = False
+        self.extension_ui_requested.emit(request_id, request)
+        self.status_changed.emit(f"等待扩展 UI 输入：{extension_name}")
+        response = await future
+        if run.done or self._ui_cancelled:
+            return
+        if response is None:
+            response = {"type": "extension_ui_response", "id": request_id, "cancelled": True}
+        run.respond_ui(request_id, response)
+        self._pending_ui_id = None
+        self._ui_future = None
+
+    def resolve_ui(self, request_id: str, response: dict) -> None:
+        loop = self._require_loop()
+        loop.call_soon_threadsafe(self._resolve_ui, request_id, response)
+
+    def _resolve_ui(self, request_id: str, response: dict) -> None:
+        future = self._ui_future
+        if (
+            request_id != self._pending_ui_id
+            or future is None
+            or future.done()
+        ):
+            return
+        future.set_result(response)

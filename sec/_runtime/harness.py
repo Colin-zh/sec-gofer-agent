@@ -1,4 +1,4 @@
-"""装配 Provider、策略和 Session，并启动 sec Run。
+"""装配 Provider、策略和 Session，并启动 sec Trace。
 
 Harness 为每次运行创建控制对象与事件流，将执行委托给内部循环，并负责
 汇总计量以及发布成功、失败、预算耗尽或取消等终态事件。
@@ -7,42 +7,45 @@ Harness 为每次运行创建控制对象与事件流，将执行委托给内部
 from __future__ import annotations
 
 import asyncio
-import inspect
+from collections.abc import Mapping, Sequence
+import json
 from uuid import uuid4
-from typing import Any
 
 from sec._runtime.budget import Budget
 from sec._runtime.capabilities import CapabilityBinding
-from sec._runtime.control import RunControl
-from sec._runtime.loop import run_loop
+from sec._runtime.control import TraceControl
+from sec._runtime.hooks import HookExecutor
+from sec._runtime.loop import trace_loop
+from sec._runtime.ui import HostBlockingUI
 from sec._runtime.event_stream import (
     DEFAULT_EVENT_BUFFER_SIZE,
-    RunEventStream,
+    TraceEventStream,
 )
-from sec._runtime.metrics import RunMetricsAccumulator
-from sec._runtime.state import RunState, RunTerminalStatus
-from sec._types.events import AgentSettledEvent
-from sec._types.extensions import (
-    AfterRunHook,
-    BeforeRunHook,
-    RunEventHook,
-    RunHookContext,
-    RunHookOutcome,
+from sec._runtime.metrics import TraceMetricsAccumulator
+from sec._runtime.state import TraceState, TraceTerminalStatus
+from sec._types.events import (
+    AgentSettledEvent,
+    MemoryConsolidationEvent,
+    MemoryIndexEvent,
 )
-from sec.agent import Agent, Run, Session
+from sec._types.hooks import HookContext, HookHandler, HookName
+from sec.agent import Agent, Trace, Session
 from sec.config import ConfigError, ContextSettings, RetrySettings, ToolRetrySettings
-from sec.exceptions import RunLimitExceeded
+from sec.exceptions import TraceLimitExceeded
 from sec.executors import LocalToolExecutor
 from sec._types.context import TokenEstimator
 from sec._types.execution import ToolExecutor
 from sec._types.policy import PolicyEngine
 from sec._types.providers import ModelProvider, StreamingModelProvider
 from sec.memory.context_builder import ContextBuilder
-from sec._types.results import RunResult
+from sec._types.memory import EpisodicKind, EpisodicRecord, MemoryConsolidationResult
+from sec._types.messages import AssistantMessage, Message, ToolResultMessage
+from sec._types.results import TraceResult
+from sec.memory.runtime import MemoryRuntime
 
 
 class Harness:
-    """装配模型 Provider 并启动由 Session 管理的 Run。"""
+    """装配模型 Provider 并启动由 Session 管理的 Trace。"""
 
     def __init__(
         self,
@@ -56,16 +59,14 @@ class Harness:
         context_settings: ContextSettings | None = None,
         token_estimator: TokenEstimator | None = None,
         max_output_tokens: int = 4096,
-        before_run_hooks: tuple[BeforeRunHook, ...] = (),
-        after_run_hooks: tuple[AfterRunHook, ...] = (),
-        run_event_hooks: tuple[RunEventHook, ...] = (),
+        hooks: Mapping[HookName, tuple[HookHandler, ...]] | None = None,
+        memory: MemoryRuntime | None = None,
     ) -> None:
         if event_buffer_size < 1:
             raise ValueError("event_buffer_size must be at least 1")
         self._provider = provider
-        self._before_run_hooks = before_run_hooks
-        self._after_run_hooks = after_run_hooks
-        self._run_event_hooks = run_event_hooks
+        self._memory = memory
+        self._hook_executor = HookExecutor(hooks if hooks is not None else {})
         if policy is not None and not callable(getattr(policy, "decide", None)):
             raise TypeError("policy must implement decide()")
         self._policy = policy
@@ -104,6 +105,52 @@ class Harness:
         if close is not None:
             await close()
 
+    async def _post_run_memory(
+        self,
+        session: Session,
+        result: TraceResult,
+        events: TraceEventStream,
+    ) -> None:
+        """post-run 阶段建 episodic 索引并抽取语义事实；失败仅发布事件。"""
+        memory = self._memory
+        if memory is None:
+            return
+        if memory.episodic is not None:
+            records = _build_episodic_records(session.id, result.messages)
+            if records:
+                try:
+                    await memory.episodic.index(records)
+                    events.publish(
+                        MemoryIndexEvent(status="ok", indexed=len(records))
+                    )
+                except Exception as exc:
+                    events.publish(
+                        MemoryIndexEvent(
+                            status="failed",
+                            indexed=0,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+            else:
+                events.publish(MemoryIndexEvent(status="empty", indexed=0))
+        if memory.consolidator is not None:
+            try:
+                consolidation = await memory.consolidator.consolidate(
+                    result.messages, session_id=session.id
+                )
+            except Exception as exc:
+                consolidation = MemoryConsolidationResult(
+                    status="failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            events.publish(
+                MemoryConsolidationEvent(
+                    status=consolidation.status,
+                    added_ids=consolidation.added_ids,
+                    error=consolidation.error,
+                )
+            )
+
     def run(
         self,
         agent: Agent,
@@ -111,22 +158,21 @@ class Harness:
         *,
         session: Session | None = None,
         capabilities: CapabilityBinding | None = None,
-    ) -> Run:
-        """在当前事件循环中启动 Run，并返回可观察、可控制的句柄。"""
+    ) -> Trace:
+        """在当前事件循环中启动 Trace，并返回可观察、可控制的句柄。"""
         loop = asyncio.get_running_loop()
         active_session = session if session is not None else Session()
-        event_stream = RunEventStream(
-            run_id=uuid4().hex,
+        event_stream = TraceEventStream(
+            trace_id=uuid4().hex,
             capacity=self._event_buffer_size,
-            event_hooks=self._run_event_hooks,
         )
-        metrics = RunMetricsAccumulator()
+        metrics = TraceMetricsAccumulator()
         budget = Budget(
             model_retries=self._retry_settings,
             tool_retries=self._tool_retry_settings,
         )
-        state = RunState()
-        control = active_session._begin_run()
+        state = TraceState()
+        control = active_session._begin_trace()
         try:
             task = loop.create_task(
                 self._execute(
@@ -138,48 +184,43 @@ class Harness:
                     metrics,
                     budget,
                     state,
-                    self._before_run_hooks,
-                    self._after_run_hooks,
                     capabilities,
                 ),
                 name=f"agent-run-{active_session.id}",
             )
         except BaseException:
-            active_session._finish_run(control)
+            active_session._finish_trace(control)
             raise
-        return Run(task, active_session, control, event_stream)
+        return Trace(task, active_session, control, event_stream)
 
     async def _execute(
         self,
         agent: Agent,
         prompt: str,
         session: Session,
-        control: RunControl,
-        event_stream: RunEventStream,
-        metrics: RunMetricsAccumulator,
+        control: TraceControl,
+        event_stream: TraceEventStream,
+        metrics: TraceMetricsAccumulator,
         budget: Budget,
-        state: RunState,
-        before_run_hooks: tuple[BeforeRunHook, ...],
-        after_run_hooks: tuple[AfterRunHook, ...],
+        state: TraceState,
         capabilities: CapabilityBinding | None = None,
-    ) -> RunResult:
-        """执行 Agent 循环，并在所有退出路径发布 Run 终态事件。"""
+    ) -> TraceResult:
+        """执行 Agent 循环，并在所有退出路径发布 Trace 终态事件。"""
         try:
-            hook_context = RunHookContext(
-                run_id=event_stream.run_id,
-                agent_name=agent.name,
+            hook_ctx = HookContext(
+                trace_id=event_stream.trace_id,
                 session_id=session.id,
-                prompt=prompt,
+                agent_name=agent.name,
+                ui=HostBlockingUI(control, event_stream, agent.name),
             )
-            result: RunResult | None = None
+            result: TraceResult | None = None
             error: BaseException | None = None
-            status: RunTerminalStatus
+            status: TraceTerminalStatus
             try:
                 if capabilities is not None and capabilities.initialize is not None:
                     await capabilities.initialize()
-                for hook in before_run_hooks:
-                    await _call_hook(hook, hook_context)
-                result = await run_loop(
+                injected = await self._hook_executor.before_trace(prompt, hook_ctx)
+                result = await trace_loop(
                     provider=self._provider,
                     agent=agent,
                     session=session,
@@ -191,84 +232,156 @@ class Harness:
                     budget=budget,
                     metrics=metrics,
                     prompt=prompt,
+                    hooks=self._hook_executor,
+                    hook_ctx=hook_ctx,
                     context_builder=self._context_builder,
                     capabilities=capabilities,
+                    gate=self._memory.gate if self._memory is not None else None,
+                    retriever=self._memory.retriever if self._memory is not None else None,
+                    initial_messages=injected,
                 )
-                hook_errors = event_stream.take_hook_errors()
-                if hook_errors:
-                    raise ExceptionGroup("Run event hooks failed", list(hook_errors))
                 status = "completed"
+                if self._memory is not None and self._memory.has_post_run:
+                    try:
+                        await self._post_run_memory(session, result, event_stream)
+                    except Exception:
+                        # post-run 记忆整理失败不改变已完成的 Trace 结果。
+                        pass
             except asyncio.CancelledError as exc:
-                hook_errors = event_stream.take_hook_errors()
-                error = (
-                    BaseExceptionGroup(
-                        "Run was cancelled and event hooks failed",
-                        [exc, *hook_errors],
-                    )
-                    if hook_errors
-                    else exc
-                )
+                error = exc
                 status = "cancelled"
             except Exception as exc:
-                hook_errors = event_stream.take_hook_errors()
-                error = (
-                    ExceptionGroup(
-                        "Run and event hooks failed",
-                        [exc, *hook_errors],
-                    )
-                    if hook_errors
-                    else exc
-                )
+                error = exc
                 status = (
                     "limit_reached"
-                    if isinstance(exc, RunLimitExceeded)
+                    if isinstance(exc, TraceLimitExceeded)
                     else "failed"
                 )
-            outcome = RunHookOutcome(
-                context=hook_context,
-                result=result if error is None else None,
-                error=error,
-                status=status,
-            )
-            hook_errors: list[Exception] = []
-            for hook in after_run_hooks:
-                try:
-                    await _call_hook(hook, outcome)
-                except Exception as exc:
-                    hook_errors.append(exc)
+            finalize_errors: list[Exception] = []
             if capabilities is not None and capabilities.finalize is not None:
                 try:
                     await capabilities.finalize()
                 except Exception as exc:
-                    hook_errors.append(exc)
-            if hook_errors:
+                    finalize_errors.append(exc)
+            if finalize_errors:
                 if error is None:
-                    error = ExceptionGroup("after-run hooks failed", hook_errors)
+                    error = ExceptionGroup("run finalization failed", finalize_errors)
                     status = "failed"
                     result = None
                 else:
                     error = BaseExceptionGroup(
-                        "Run and after-run hooks failed",
-                        [error, *hook_errors],
+                        "Trace and finalization failed",
+                        [error, *finalize_errors],
                     )
                     status = "failed" if status != "cancelled" else status
             state.finish(status)
-            event_stream.publish(
-                AgentSettledEvent(status=status),
-                notify_hooks=False,
-            )
+            event_stream.publish(AgentSettledEvent(status=status))
             if error is not None:
                 raise error
             if result is None:
-                raise RuntimeError("Run completed without a result")
+                raise RuntimeError("Trace completed without a result")
             return result
         finally:
             event_stream.close()
-            session._finish_run(control)
+            session._finish_trace(control)
 
 
-async def _call_hook(hook: Any, context: Any) -> None:
-    """Invoke a sync or async lifecycle callback without suppressing failures."""
-    result = hook(context)
-    if inspect.isawaitable(result):
-        await result
+_MAX_TOOL_TEXT = 2000
+
+
+def _build_episodic_records(
+    session_id: str,
+    messages: Sequence[Message],
+) -> list[EpisodicRecord]:
+    """把本次 Trace 新增的对话消息与工具活动转成情景索引记录。
+
+    - user/assistant 消息 → kind="message"；
+    - 助手消息内的工具调用 → kind="tool_call"（含工具名与参数）；
+    - 工具执行结果 → kind="tool_result"（含工具名、结果文本与错误标记）。
+
+    文件改动不单独立类：write/edit 等工具调用的路径已出现在工具调用参数与
+    结果文本中，可被同一关键字检索命中。
+    """
+    records: list[EpisodicRecord] = []
+    counter = 0
+    for message_index, message in enumerate(messages):
+        if isinstance(message, AssistantMessage):
+            text = message.text.strip()
+            if text:
+                records.append(
+                    _episode(session_id, message_index, counter, "message", text, message.timestamp)
+                )
+                counter += 1
+            for tool_use in message.tool_uses:
+                records.append(
+                    _episode(
+                        session_id,
+                        message_index,
+                        counter,
+                        "tool_call",
+                        _tool_call_text(tool_use.name, tool_use.arguments),
+                        message.timestamp,
+                    )
+                )
+                counter += 1
+            continue
+        if isinstance(message, ToolResultMessage):
+            text = message.text.strip()
+            if text:
+                records.append(
+                    _episode(
+                        session_id,
+                        message_index,
+                        counter,
+                        "tool_result",
+                        _tool_result_text(message.tool_name, text, message.is_error),
+                        message.timestamp,
+                    )
+                )
+                counter += 1
+            continue
+        text = message.text.strip()
+        if text and message.role in ("user", "assistant"):
+            records.append(
+                _episode(session_id, message_index, counter, "message", text, message.timestamp)
+            )
+            counter += 1
+    return records
+
+
+def _episode(
+    session_id: str,
+    message_index: int,
+    counter: int,
+    kind: EpisodicKind,
+    text: str,
+    timestamp: float,
+) -> EpisodicRecord:
+    """构造一条情景索引记录；id 用单调计数器保证唯一，entry_id 引用消息位置。"""
+    return EpisodicRecord(
+        id=f"epi:{session_id}:{counter}",
+        session_id=session_id,
+        entry_id=f"{session_id}:{message_index}",
+        text=text,
+        timestamp=timestamp,
+        kind=kind,
+    )
+
+
+def _tool_call_text(name: str, arguments: object) -> str:
+    try:
+        args_text = json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args_text = str(arguments)
+    return _truncate(f"tool call: {name} {args_text}")
+
+
+def _tool_result_text(name: str, text: str, is_error: bool) -> str:
+    suffix = " [error]" if is_error else ""
+    return _truncate(f"tool result: {name}: {text}{suffix}")
+
+
+def _truncate(text: str) -> str:
+    if len(text) <= _MAX_TOOL_TEXT:
+        return text
+    return text[:_MAX_TOOL_TEXT] + "…"

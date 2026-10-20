@@ -1,6 +1,6 @@
 """Stable public SDK entry points.
 
-Use a Client for normal application work. Session and Run are exported for
+Use a Client for normal application work. Session and Trace are exported for
 applications that need explicit persistence or live run control.
 """
 
@@ -8,6 +8,7 @@ from sec.apis.client import (
     AsyncSecClient,
     SecClient,
     create_database,
+    create_memory_store,
     create_session_store,
 )
 from sec.config import (
@@ -15,6 +16,8 @@ from sec.config import (
     Config,
     ConfigError,
     ContextSettings,
+    EmbeddingSettings,
+    MemorySettings,
     ProviderSettings,
     RetrySettings,
     RuntimeSettings,
@@ -24,6 +27,8 @@ from sec.config import (
 from sec.exceptions import (
     ContextBuildError,
     ContextWindowExceeded,
+    EmbedderError,
+    MemoryStoreError,
     ObjectNotFoundError,
     ObjectStoreError,
     RecoverableToolError,
@@ -35,7 +40,7 @@ from sec.exceptions import (
     SessionVersionConflictError,
     ToolExecutorProtocolError,
 )
-from sec.agent import Run, Session
+from sec.agent import Trace, Session
 from sec.agent.card import AgentCard
 from sec.resources.agents import AgentCatalog
 from sec._runtime.capabilities import ReloadReport
@@ -57,9 +62,26 @@ from sec._types.approvals import (
 )
 from sec._types.events import (
     CapabilitySnapshotEvent, DelegationEvent,
+    MemoryConsolidationEvent, MemoryGateEvent, MemoryIndexEvent,
+    MemoryRetrievalEvent,
     ModelRequestEndEvent, ModelRequestStartEvent, SessionEvent,
 )
+from sec._types.embedding import Embedder, Embedding
 from sec._types.limits import Limits, validate_timeout
+from sec._types.memory import (
+    EpisodicKind,
+    EpisodicRecord,
+    MemoryConsolidationResult,
+    MemoryEntry,
+    MemoryGateDecision,
+    MemoryKind,
+    MemoryOrigin,
+    MemoryRetrievalResult,
+    MemorySource,
+    ProceduralBlock,
+    ProceduralSource,
+    memory_dedup_key,
+)
 from sec._types.messages import (
     AgentMessage,
     AssistantMessage,
@@ -83,7 +105,13 @@ from sec._types.policy import (
     PolicyOutcome,
     PolicyRiskLevel,
 )
-from sec._types.results import RunResult, RunUsage
+from sec._types.results import TraceResult, TraceUsage
+from sec._types.trajectory import (
+    Trajectory,
+    TrajectoryRole,
+    TrajectoryStep,
+    trajectory_from_messages,
+)
 from sec._types.context import TokenEstimator
 from sec._types.execution import ToolExecutor
 from sec._types.policy import PolicyEngine
@@ -120,7 +148,16 @@ from sec.storage import (
     Database,
     DatabaseSessionStore,
     InMemorySessionStore,
+    MemoryStore,
     SessionStore,
+)
+from sec.memory import (
+    MemoryConsolidator,
+    MemoryGate,
+    MemoryRetriever,
+    MemoryRuntime,
+    SkillSource,
+    UserProfile,
 )
 from sec.tools import Tool, ToolRiskLevel, tool
 
@@ -152,11 +189,38 @@ __all__ = [
     "Database",
     "DatabaseSessionStore",
     "DenyAllPolicy",
+    "Embedder",
+    "EmbedderError",
+    "Embedding",
+    "EmbeddingSettings",
+    "EpisodicKind",
+    "EpisodicRecord",
     "FileContent",
     "InMemorySessionStore",
     "Limits",
     "Message",
     "MessageEntry",
+    "MemoryConsolidationEvent",
+    "MemoryConsolidationResult",
+    "MemoryConsolidator",
+    "MemoryEntry",
+    "MemoryGate",
+    "MemoryGateDecision",
+    "MemoryGateEvent",
+    "MemoryIndexEvent",
+    "MemoryKind",
+    "MemoryOrigin",
+    "MemoryRetrievalEvent",
+    "MemoryRetrievalResult",
+    "MemoryRetriever",
+    "MemoryRuntime",
+    "MemorySettings",
+    "MemorySource",
+    "MemoryStore",
+    "MemoryStoreError",
+    "ProceduralBlock",
+    "ProceduralSource",
+    "memory_dedup_key",
     "ModelResponseCompleted",
     "ModelStreamEvent",
     "ModelTextDelta",
@@ -179,12 +243,16 @@ __all__ = [
     "RetryableProviderError",
     "RetryableToolError",
     "RetrySettings",
-    "Run",
-    "RunUsage",
+    "Trace",
+    "TraceUsage",
     "SessionEvent",
     "ModelRequestStartEvent",
     "ModelRequestEndEvent",
-    "RunResult",
+    "TraceResult",
+    "Trajectory",
+    "TrajectoryRole",
+    "TrajectoryStep",
+    "trajectory_from_messages",
     "RuntimeSettings",
     "Session",
     "SessionEntry",
@@ -217,10 +285,13 @@ __all__ = [
     "ToolRetrySettings",
     "TokenEstimator",
     "ToolExecutor",
+    "SkillSource",
     "UserMessage",
+    "UserProfile",
     "content_from_dict",
     "content_to_dict",
     "create_database",
+    "create_memory_store",
     "create_session_store",
     "merge_text",
     "message_from_dict",

@@ -1,4 +1,4 @@
-"""累积单个 sec Run 的模型请求、尝试、工具调用和 Provider 用量。
+"""累积单个 sec Trace 的模型请求、尝试、工具调用和 Provider 用量。
 
 调用次数由运行时准确统计；token 用量只汇总 Provider 明确报告的数值。
 失败尝试及缺失用量单独标记，不推测未返回的账单数据。
@@ -7,11 +7,11 @@
 from __future__ import annotations
 
 from sec._types.messages import AssistantMessage, Message
-from sec._types.results import RunUsage, RunResult
+from sec._types.results import TraceUsage, TraceResult
 
 
-class RunMetricsAccumulator:
-    """在一次 Run 内累计调用计数及可验证的 token 用量。"""
+class TraceMetricsAccumulator:
+    """在一次 Trace 内累计调用计数及可验证的 token 用量。"""
 
     def __init__(self) -> None:
         self.model_calls = 0
@@ -64,9 +64,9 @@ class RunMetricsAccumulator:
         if output_tokens is not None:
             self._output_tokens = (self._output_tokens or 0) + output_tokens
 
-    def usage(self) -> RunUsage:
+    def usage(self) -> TraceUsage:
         """返回不可变的当前用量快照。"""
-        return RunUsage(
+        return TraceUsage(
             input_tokens=self._input_tokens,
             output_tokens=self._output_tokens,
             reported_responses=self._reported_responses,
@@ -74,7 +74,7 @@ class RunMetricsAccumulator:
             unreported_attempts=self._unreported_attempts,
         )
 
-    def merge_child(self, result: RunResult) -> None:
+    def merge_child(self, result: TraceResult) -> None:
         self.model_calls += result.model_calls
         self.model_attempts += result.model_attempts
         self.retries += result.retries

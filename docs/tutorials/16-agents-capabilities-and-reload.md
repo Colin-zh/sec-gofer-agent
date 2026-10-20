@@ -64,8 +64,8 @@ max_depth = 1
 `default` 为保留 ID，代表使用原 SDK 指令和工具的默认智能体。
 Card 的显示名称不影响稳定 ID；内容摘要用于记录实际执行版本。
 
-切换智能体保留 Session 和历史。活动 Run 中选择新智能体会排队至下一个
-Run，不会把一个尚未结束的模型请求突然变成另一个角色。选择写入会话树，
+切换智能体保留 Session 和历史。活动 Trace 中选择新智能体会排队至下一个
+Trace，不会把一个尚未结束的模型请求突然变成另一个角色。选择写入会话树，
 分支、复制、导出/导入和恢复沿用活动分支上的选择；原 Card 缺失时明确报错。
 这是本地 Sec AgentCard，不是 A2A 网络协议。
 
@@ -160,14 +160,14 @@ MCP 服务端。不要把凭据放进命令行参数或 URL；`env` 和认证 he
 | 资源变化 | 生效边界 |
 |---|---|
 | Skill、MCP、工具目录 | 下一次安全的模型请求 |
-| AgentCard 身份和指令 | 下一个 Run |
+| AgentCard 身份和指令 | 下一个 Trace |
 | 已发出的模型请求、该响应中的整个工具批次 | 保持原 generation |
-| 进程内 Extension 的 Provider/Policy/hooks | 空闲 Run 边界 |
+| 进程内 Extension 的 Provider/Policy/hooks | 空闲 Trace 边界 |
 | SessionStore 更换 | 单独迁移，不属于普通刷新 |
 
 解析、连接或注册失败时，候选被关闭，当前已发布版本保留；异常和结构化
 刷新报告用于区分失败、已生效和等待边界，不能仅根据 UI 已更新判断成功。
-旧连接和 worker 在占用它们的根 Run 完成后释放；关闭失败会明确传播。
+旧连接和 worker 在占用它们的根 Trace 完成后释放；关闭失败会明确传播。
 
 紧急撤权与普通卸载不同：`await client.revoke_capability(tool_name)`
 立即阻止尚未执行的调用，包括等待审批的调用；已经开始的外部副作用无法
@@ -190,7 +190,7 @@ worker 模式只接受可序列化的工具贡献。Provider、SessionStore、UI
 进程内和 worker 两条路径启用。子进程隔离不是安全沙箱，仍只应启用可信代码。
 
 Desktop 的“插件”页面可在停用状态选择 worker 或进程内执行方式；
-已启用插件先停用再切换。worker 工具可在 Run 期间配置，并在下一安全请求
+已启用插件先停用再切换。worker 工具可在 Trace 期间配置，并在下一安全请求
 边界使用新版本；进程内扩展和全局权限仍需等待空闲。CLI 使用
 `/plugins enable <name>` / `/plugins disable <name>` 管理 worker 插件，
 `/reload enable <name>` / `/reload disable <name>` 保留进程内兼容语义。
@@ -202,7 +202,7 @@ Desktop 的“插件”页面可在停用状态选择 worker 或进程内执行�
 - [worker_host.py](../../sec/extensions/worker_host.py)：子进程入口，加载插件
   entry point、限制只注册工具、执行工具并返回结果。
 - [client.py](../../sec/apis/client.py)：`_reload_resources()` 校验完整候选并
-  切换能力快照；保留活动根 Run 使用的旧管理器，之后负责回收。
+  切换能力快照；保留活动根 Trace 使用的旧管理器，之后负责回收。
 - [test_extension_workers.py](../../tests/test_extension_workers.py)：真实 worker
   子进程测试，包括同会话更新、旧绑定保留、失败回退和不支持的贡献。
 
@@ -223,12 +223,12 @@ PYTHONPATH=. .venv/bin/python examples/worker-hot-reload/demo.py
 - 使用独立 Session，只收到明确任务文本，不默认复制父会话。
 - 同时受自身和祖先能力范围约束。
 - 与父任务 turn 共用模型/工具调用总额度，并受最大深度限制；
-  根 Run 的 follow-up 开启新 turn，保持既有每轮预算语义。
-- 工具继续走相同 Policy；需要审批时转发给父 Run 的宿主。
-- 接收父 Run 取消，结束后只返回结果文本。
+  根 Trace 的 follow-up 开启新 turn，保持既有每轮预算语义。
+- 工具继续走相同 Policy；需要审批时转发给父 Trace 的宿主。
+- 接收父 Trace 取消，结束后只返回结果文本。
 
-父事件流记录父子 Run、Session、Agent 关联，并转发子工具和模型请求事件；
-子正文不作为父助手的流式回答展示。根结果计量包含成功子 Run 的用量。
+父事件流记录父子 Trace、Session、Agent 关联，并转发子工具和模型请求事件；
+子正文不作为父助手的流式回答展示。根结果计量包含成功子 Trace 的用量。
 不支持多个 Agent 并发写同一个 Session，也不包含网络 A2A 或自动 swarm。
 
 ## 验收建议

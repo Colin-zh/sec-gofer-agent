@@ -8,7 +8,7 @@ from sec.extensions.api import (
     UIHandler,
 )
 from sec.extensions.manager import ENTRY_POINT_GROUP, ExtensionLoadError, ExtensionManager
-from sec._types.extensions import Extension, RunHookContext, RunHookOutcome
+from sec._types.extensions import Extension
 
 __all__ = [
     "ENTRY_POINT_GROUP",
@@ -18,8 +18,6 @@ __all__ = [
     "ExtensionLoadError",
     "ExtensionManager",
     "ProviderFactory",
-    "RunHookContext",
-    "RunHookOutcome",
     "StorageFactory",
     "UIHandler",
 ]

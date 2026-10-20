@@ -14,11 +14,13 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
@@ -324,11 +326,54 @@ class FloatingWindow(QMainWindow):
         self._scheduled_tasks.setEnabled(False)
         layout.addWidget(self._scheduled_tasks)
 
-        self._memory_button = QPushButton("记忆管理")
+        self._memory_button = QPushButton("知识与记忆")
         self._memory_button.setIcon(control_icon("memory"))
-        self._memory_button.setToolTip("记忆管理 · 三层记忆功能预留")
-        self._memory_button.clicked.connect(self._show_memory)
+        self._memory_button.setCheckable(True)
+        self._memory_button.setToolTip("展开知识与记忆分类")
+        self._memory_button.setStyleSheet(
+            "QPushButton { padding-right: 34px; }"
+            "QPushButton:checked { background: #e6e9ed; }"
+        )
+        memory_content = QHBoxLayout(self._memory_button)
+        memory_content.setContentsMargins(0, 0, 10, 0)
+        memory_content.addStretch()
+        self._memory_more = QLabel()
+        self._memory_more.setPixmap(control_icon("more").pixmap(16, 16))
+        self._memory_more.setFixedSize(16, 16)
+        self._memory_more.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        memory_content.addWidget(self._memory_more)
+        self._memory_button.toggled.connect(self._toggle_memory)
         layout.addWidget(self._memory_button)
+
+        self._memory_resources = QTreeWidget()
+        self._memory_resources.setHeaderHidden(True)
+        self._memory_resources.setRootIsDecorated(False)
+        self._memory_resources.setColumnCount(1)
+        self._memory_resources.setIndentation(0)
+        self._memory_resources.setExpandsOnDoubleClick(False)
+        self._memory_resources.itemClicked.connect(
+            lambda item, _column: self._open_memory(
+                item.data(0, Qt.ItemDataRole.UserRole)
+            )
+        )
+        self._memory_resources.setFixedHeight(80)
+        self._memory_resources.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._memory_resources.setStyleSheet(
+            "QTreeWidget { background: #e9edf2; color: #333a45; border: 0;"
+            "border-radius: 8px; padding: 4px 0 4px 22px; }"
+            "QTreeWidget::item { padding: 8px 10px; }"
+            "QTreeWidget::item:hover { background: #e0e6ee; }"
+            "QTreeWidget::item:selected { background: #dce5f0; color: #202124; }"
+        )
+        self._memory_resources.setToolTip("选择知识或长期记忆管理")
+        for kind, title in (("knowledge", "知识管理"), ("memory", "长期记忆")):
+            item = QTreeWidgetItem([title])
+            item.setData(0, Qt.ItemDataRole.UserRole, kind)
+            self._memory_resources.addTopLevelItem(item)
+        layout.addWidget(self._memory_resources)
+        self._memory_resources.hide()
 
         self._tools_button = QPushButton("扩展能力")
         self._tools_button.setIcon(control_icon("components"))
@@ -486,7 +531,7 @@ class FloatingWindow(QMainWindow):
         self._trace_button.setFixedSize(36, 36)
         self._trace_button.setCheckable(True)
         self._trace_button.setStyleSheet(_ICON_TOGGLE_STYLE)
-        self._trace_button.setToolTip("观测 · 查看当前与历史 Run 的本地执行 Trace")
+        self._trace_button.setToolTip("观测 · 查看当前与历史 Trace")
         self._trace_button.setAccessibleName("打开执行 Trace")
         self._trace_button.clicked.connect(self._toggle_trace)
         header.addWidget(self._trace_button)
@@ -517,32 +562,26 @@ class FloatingWindow(QMainWindow):
         self._commands_page.back_requested.connect(self._show_chat)
         self._commands_page.command_selected.connect(self._insert_command)
         self._pages.addWidget(self._commands_page)
-        self._memory_page = QWidget()
-        memory_layout = QVBoxLayout(self._memory_page)
-        memory_layout.setSpacing(14)
-        back = QPushButton("返回对话")
-        back.clicked.connect(self._show_chat)
-        memory_layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
-        title = QLabel("记忆管理")
-        title.setStyleSheet("font-size: 18px; font-weight: 600; color: #202124;")
-        memory_layout.addWidget(title)
-        description = QLabel("三层记忆管理预留页，暂未接入读取、编辑与删除能力。")
-        description.setObjectName("subtle")
-        description.setWordWrap(True)
-        memory_layout.addWidget(description)
-        for name, detail in (
-            ("情景记忆 · Episodic", "预留：任务经历、历史事件与结果回溯。"),
-            ("语义记忆 · Semantic", "预留：事实、偏好与长期知识。"),
-            ("程序记忆 · Procedural", "预留：可复用的方法、流程与经验。"),
-        ):
-            card = QLabel(f"{name}\n\n{detail}")
-            card.setWordWrap(True)
-            card.setStyleSheet(
-                "background: white; color: #414854; border: 1px solid #e1e4e8;"
-                "border-radius: 10px; padding: 16px;"
-            )
-            memory_layout.addWidget(card)
-        memory_layout.addStretch()
+        self._knowledge_page = self._build_memory_subpage(
+            "知识管理",
+            "为 Agent 提供外部数据来源与工作区知识库配置。",
+            (
+                ("数据源", "预留：配置知识管理的数据源。"),
+                ("datalink", "预留：连接外部数据源（数据库 / 文件 / API），为知识管理供数。"),
+                ("工作区知识库配置", "预留：配置当前工作区的知识管理目录、索引与同步策略。"),
+            ),
+        )
+        self._pages.addWidget(self._knowledge_page)
+        self._memory_page = self._build_memory_subpage(
+            "长期记忆",
+            "按三层架构组织的长期记忆：语义记忆（知道什么）、情景记忆（经历过什么）、"
+            "程序性记忆（应该怎么做）。",
+            (
+                ("情景记忆 · Episodic", "预留：任务经历、历史事件与结果回溯。"),
+                ("语义记忆 · Semantic", "预留：事实、偏好与长期知识。"),
+                ("程序记忆 · Procedural", "预留：可复用的方法、流程与经验。"),
+            ),
+        )
         self._pages.addWidget(self._memory_page)
         self._trace_page = TracePage(self._runtime.trace_store)
         self._pages.addWidget(self._trace_page)
@@ -561,9 +600,53 @@ class FloatingWindow(QMainWindow):
         self._sidebar_toggle.setToolTip(label)
         self._sidebar_toggle.setAccessibleName(label)
 
-    def _show_memory(self) -> None:
-        self._pages.setCurrentWidget(self._memory_page)
+    def _toggle_memory(self, expanded: bool) -> None:
+        self._memory_resources.setVisible(expanded)
+        self._memory_button.setToolTip(
+            "收起知识与记忆分类" if expanded else "展开知识与记忆分类"
+        )
+
+    def _open_memory(self, kind: str) -> None:
+        self._memory_button.setChecked(True)
+        if kind == "knowledge":
+            self._pages.setCurrentWidget(self._knowledge_page)
+        else:
+            self._pages.setCurrentWidget(self._memory_page)
         self._resources.clearSelection()
+        for index in range(self._memory_resources.topLevelItemCount()):
+            item = self._memory_resources.topLevelItem(index)
+            if item.data(0, Qt.ItemDataRole.UserRole) == kind:
+                self._memory_resources.setCurrentItem(item)
+
+    def _build_memory_subpage(
+        self,
+        title: str,
+        description: str,
+        sections: tuple[tuple[str, str], ...],
+    ) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(14)
+        back = QPushButton("返回对话")
+        back.clicked.connect(self._show_chat)
+        layout.addWidget(back, 0, Qt.AlignmentFlag.AlignLeft)
+        heading = QLabel(title)
+        heading.setStyleSheet("font-size: 18px; font-weight: 600; color: #202124;")
+        layout.addWidget(heading)
+        subtitle = QLabel(description)
+        subtitle.setObjectName("subtle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+        for name, detail in sections:
+            card = QLabel(f"{name}\n\n{detail}")
+            card.setWordWrap(True)
+            card.setStyleSheet(
+                "background: white; color: #414854; border: 1px solid #e1e4e8;"
+                "border-radius: 10px; padding: 16px;"
+            )
+            layout.addWidget(card)
+        layout.addStretch()
+        return page
 
     def _build_welcome(self) -> QWidget:
         welcome = QWidget()
@@ -628,7 +711,7 @@ class FloatingWindow(QMainWindow):
         help_button.clicked.connect(lambda: self._submit_command("/help"))
         self._agent_button = ComposerButton("agent")
         self._agent_button.setEnabled(False)
-        self._agent_button.setToolTip("选择当前 Agent；运行期间的选择会在下一次 Run 生效")
+        self._agent_button.setToolTip("选择当前 Agent；运行期间的选择会在下一次 Trace 生效")
         self._agent_button.setAccessibleName("智能体选择")
         self._agent_button.clicked.connect(lambda: self._open_tools("agent"))
         self._mode_button = ComposerButton("mode · 普通")
@@ -777,6 +860,7 @@ class FloatingWindow(QMainWindow):
         self._runtime.text_delta.connect(self._append_delta)
         self._runtime.status_changed.connect(self._update_status)
         self._runtime.approval_requested.connect(self._approve_tool)
+        self._runtime.extension_ui_requested.connect(self._handle_extension_ui)
         self._runtime.command_result.connect(self._show_command_result)
         self._runtime.command_completions.connect(self._set_command_completions)
         self._runtime.session_changed.connect(self._set_session_id)
@@ -792,8 +876,8 @@ class FloatingWindow(QMainWindow):
         self._runtime.exit_requested.connect(self.close)
         self._runtime.run_failed.connect(self._show_error)
         self._runtime.run_finished.connect(self._run_finished)
-        self._runtime.trace_runs_updated.connect(self._trace_page.refresh_runs)
-        self._runtime.trace_run_updated.connect(self._trace_page.refresh_run)
+        self._runtime.traces_updated.connect(self._trace_page.refresh_traces)
+        self._runtime.trace_updated.connect(self._trace_page.refresh_trace)
 
     def _runtime_ready(self, workspace: str) -> None:
         self._workspace.setText(workspace)
@@ -850,8 +934,8 @@ class FloatingWindow(QMainWindow):
     def _show_trace(self) -> None:
         self._pages.setCurrentWidget(self._trace_page)
         self._resources.clearSelection()
-        self._trace_page.refresh_runs(
-            self._runtime.trace_store.list_runs(session_id=self._session_id)
+        self._trace_page.refresh_traces(
+            self._runtime.trace_store.list_traces(session_id=self._session_id)
             if self._session_id is not None
             else [],
             session_id=self._session_id,
@@ -871,7 +955,7 @@ class FloatingWindow(QMainWindow):
         )
         self._trace_button.setToolTip(
             "观测 · 返回对话" if active
-            else "观测 · 查看当前与历史 Run 的本地执行 Trace"
+            else "观测 · 查看当前与历史 Trace"
         )
 
     def _toggle_tools(self, expanded: bool) -> None:
@@ -981,8 +1065,8 @@ class FloatingWindow(QMainWindow):
         self._session_caption.setText(f"SessionID: {session_id}")
         self._session_caption.setToolTip(session_id)
         self._select_active_session()
-        self._trace_page.refresh_runs(
-            self._runtime.trace_store.list_runs(session_id=session_id),
+        self._trace_page.refresh_traces(
+            self._runtime.trace_store.list_traces(session_id=session_id),
             session_id=session_id,
         )
 
@@ -1154,6 +1238,64 @@ class FloatingWindow(QMainWindow):
             self.show_focus_mode()
         self._welcome.hide()
         self._transcript.add_approval(tool_call_id, tool_name, arguments)
+
+    def _handle_extension_ui(self, request_id: str, request: dict) -> None:
+        self._show_chat()
+        if self._ball.isVisible():
+            self.show_focus_mode()
+        method = request.get("method")
+        title = request.get("title", "扩展")
+        cancelled: dict = {
+            "type": "extension_ui_response",
+            "id": request_id,
+            "cancelled": True,
+        }
+        if method == "select":
+            options = request.get("options", [])
+            value, ok = QInputDialog.getItem(
+                self, title, "请选择：", options, 0, False
+            )
+            response = (
+                {"type": "extension_ui_response", "id": request_id, "value": value}
+                if ok
+                else cancelled
+            )
+        elif method == "confirm":
+            confirmed = (
+                QMessageBox.question(
+                    self,
+                    title,
+                    request.get("message", ""),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                == QMessageBox.StandardButton.Yes
+            )
+            response = {
+                "type": "extension_ui_response",
+                "id": request_id,
+                "confirmed": confirmed,
+            }
+        elif method == "input":
+            value, ok = QInputDialog.getText(
+                self, title, request.get("placeholder", "")
+            )
+            response = (
+                {"type": "extension_ui_response", "id": request_id, "value": value}
+                if ok
+                else cancelled
+            )
+        elif method == "editor":
+            value, ok = QInputDialog.getMultiLineText(
+                self, title, request.get("prefill", "")
+            )
+            response = (
+                {"type": "extension_ui_response", "id": request_id, "value": value}
+                if ok
+                else cancelled
+            )
+        else:
+            response = cancelled
+        self._runtime.resolve_ui(request_id, response)
 
     def _show_error(self, message: str) -> None:
         if self._ball.isVisible():
